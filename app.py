@@ -9,6 +9,8 @@ Serves three CPU-resident models behind a Gradio interface:
 Run with:  python app.py   (then open http://127.0.0.1:7860)
 """
 
+import argparse
+import glob
 import os
 import time
 import traceback
@@ -18,36 +20,63 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Mirror the training script: use every core available on this CPU box.
-NUM_CORES = os.cpu_count() or 4
-torch.set_num_threads(NUM_CORES)
-
 STUDENT_MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
 TEACHER_MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
-# Prefer the scaled 300-step adapter; fall back to the 50-step PoC if it is absent.
-# Override with:  set KD_ADAPTER_PATH=./some/other/final_adapter
+
+# Adapter search order, most recent training layout first. Any directory produced by
+# train_scaled.py is picked up automatically; the glob catches custom --output dirs.
 ADAPTER_CANDIDATES = [
-    "./distilled_smollm_scaled/final_adapter",
-    "./distilled_smollm_poc/final_adapter",
+    "./distilled_output/final_adapter",         # distill.sh default
+    "./distilled_smollm_mac/final_adapter",     # configs/mac.yaml
+    "./distilled_smollm_scaled/final_adapter",  # configs/default.yaml
+    "./distilled_smollm_poc/final_adapter",     # original 50-step PoC
 ]
-
-
-def _resolve_adapter_path():
-    override = os.environ.get("KD_ADAPTER_PATH")
-    if override:
-        return override
-    for candidate in ADAPTER_CANDIDATES:
-        if os.path.isfile(os.path.join(candidate, "adapter_config.json")):
-            return candidate
-    return ADAPTER_CANDIDATES[0]
-
-
-ADAPTER_PATH = _resolve_adapter_path()
 
 DEVICE = "cpu"
 COMPUTE_DTYPE = torch.float32
 SERVER_NAME = "127.0.0.1"
 SERVER_PORT = 7860
+ADAPTER_PATH = None
+
+
+def _is_adapter(path):
+    return bool(path) and os.path.isfile(os.path.join(path, "adapter_config.json"))
+
+
+def _resolve_adapter_path(explicit=None):
+    """Find an adapter: explicit path, then KD_ADAPTER_PATH, then known output dirs."""
+    for candidate in (explicit, os.environ.get("KD_ADAPTER_PATH")):
+        if candidate:
+            return candidate
+    for candidate in ADAPTER_CANDIDATES:
+        if _is_adapter(candidate):
+            return candidate
+    # Last resort: any */final_adapter in the working directory, newest first.
+    found = [p for p in glob.glob("./*/final_adapter") if _is_adapter(p)]
+    if found:
+        return max(found, key=os.path.getmtime).replace("\\", "/")
+    return ADAPTER_CANDIDATES[0]
+
+
+def configure(adapter=None, student=None, teacher=None, host=None, port=None, threads=None):
+    """Bind runtime settings before models are loaded."""
+    global ADAPTER_PATH, STUDENT_MODEL_ID, TEACHER_MODEL_ID, SERVER_NAME, SERVER_PORT
+
+    ADAPTER_PATH = _resolve_adapter_path(adapter)
+    STUDENT_MODEL_ID = student or os.environ.get("KD_STUDENT_MODEL") or STUDENT_MODEL_ID
+    TEACHER_MODEL_ID = teacher or os.environ.get("KD_TEACHER_MODEL") or TEACHER_MODEL_ID
+    SERVER_NAME = host or os.environ.get("KD_UI_HOST") or SERVER_NAME
+    SERVER_PORT = int(port or os.environ.get("KD_UI_PORT") or SERVER_PORT)
+
+    # Mirror the training script: use every core available on this CPU box.
+    torch.set_num_threads(int(threads or os.cpu_count() or 4))
+    return ADAPTER_PATH
+
+
+# Resolve at import time so `import app` in a notebook or test keeps working.
+ADAPTER_PATH = _resolve_adapter_path()
+NUM_CORES = os.cpu_count() or 4
+torch.set_num_threads(NUM_CORES)
 
 # Prompts where the base model fails and the distilled model succeeds in 3/3 runs.
 # The measured difference is instruction-shape compliance: the baseline cannot suppress
@@ -404,17 +433,74 @@ def build_ui():
     return demo
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Side-by-side comparison UI: original vs distilled student vs teacher."
+    )
+    parser.add_argument("-a", "--adapter", default=None, metavar="DIR",
+                        help="Path to a final_adapter directory. Default: newest of "
+                             + ", ".join(ADAPTER_CANDIDATES))
+    parser.add_argument("-s", "--student", default=None, help="Student base model id")
+    parser.add_argument("-t", "--teacher", default=None, help="Teacher model id")
+    parser.add_argument("--config", default=None, metavar="PATH",
+                        help="Read student/teacher from a training YAML config, so the UI "
+                             "compares exactly what was trained.")
+    parser.add_argument("--host", default=None, help=f"Bind address (default {SERVER_NAME})")
+    parser.add_argument("-p", "--port", type=int, default=None,
+                        help=f"Port (default {SERVER_PORT})")
+    parser.add_argument("--share", action="store_true",
+                        help="Create a public Gradio share link.")
+    parser.add_argument("--open", action="store_true",
+                        help="Open the UI in a browser on launch.")
+    parser.add_argument("--list-adapters", action="store_true",
+                        help="List discoverable adapters and exit.")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
+    if args.list_adapters:
+        found = sorted(
+            {p.replace("\\", "/") for p in ADAPTER_CANDIDATES + glob.glob("./*/final_adapter")
+             if _is_adapter(p)}
+        )
+        if not found:
+            print("No adapters found. Train one first:  python train_scaled.py")
+        else:
+            print("Discoverable adapters:")
+            for path in found:
+                marker = " <- default" if path == _resolve_adapter_path() else ""
+                print(f"  {path}{marker}")
+        return
+
+    student, teacher = args.student, args.teacher
+    if args.config:
+        # Reuse the training config so the UI never drifts from what was trained.
+        import kd_config
+        cfg = kd_config.load_config(args.config)
+        student = student or cfg["models"]["student"]
+        teacher = teacher or cfg["models"]["teacher"]
+
+    configure(adapter=args.adapter, student=student, teacher=teacher,
+              host=args.host, port=args.port)
+
+    if not _is_adapter(ADAPTER_PATH):
+        print(f" !! No adapter at '{ADAPTER_PATH}'. The distilled column will show an error.")
+        print("    Train one with:  python train_scaled.py --config configs/default.yaml")
+        print("    Or point at one: python app.py --adapter ./path/to/final_adapter\n")
+
     load_all_models()
     demo = build_ui()
     print(f"Launching Gradio on http://{SERVER_NAME}:{SERVER_PORT}\n")
     demo.queue(default_concurrency_limit=1).launch(
         server_name=SERVER_NAME,
         server_port=SERVER_PORT,
+        share=args.share,
         theme=gr.themes.Ocean(),
         css=CUSTOM_CSS,
         show_error=True,
-        inbrowser=False,
+        inbrowser=args.open,
     )
 
 

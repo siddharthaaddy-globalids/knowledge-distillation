@@ -37,6 +37,11 @@ LMBDA="${KD_LMBDA:-}"
 CONFIG_PROFILE=""                    # blank = auto (Apple Silicon -> mac)
 MODE="train"
 
+UI_PORT="${KD_UI_PORT:-7860}"
+UI_HOST="${KD_UI_HOST:-127.0.0.1}"
+UI_SHARE=0
+ADAPTER_DIR="${KD_ADAPTER_PATH:-}"
+
 REPO_URL="__REPO_URL__"
 REPO_REF="__SHA__"
 WORKDIR="${KD_WORKDIR:-$HOME/.cache/kd-runner}"
@@ -89,9 +94,18 @@ MODES
       --check             Resolve config and hardware, print, and exit.
                           Run this first - it is instant and catches typos.
       --smoke             2-step end-to-end validation (~1 min)
+      --ui                Launch the side-by-side comparison web UI
+                          (original vs distilled vs teacher) instead of training
       --shell             Open a shell with the environment activated
   -h, --help              Show this help
   -V, --version           Show the pinned build revision
+
+UI OPTIONS (with --ui)
+      --port N            Port to serve on (default: 7860)
+      --host ADDR         Bind address (default: 127.0.0.1)
+      --share             Create a public Gradio share link
+      --adapter DIR       Compare a specific adapter directory
+                          (default: the newest one found under --output)
 
 EXAMPLES
   # See what would run, without running it
@@ -109,6 +123,13 @@ EXAMPLES
 
   # Force CPU on a Mac (slow, for comparison)
   ./distill.sh --device cpu --steps 50
+
+  # Train, then inspect the result in the browser
+  ./distill.sh --teacher HuggingFaceTB/SmolLM2-1.7B-Instruct
+  ./distill.sh --ui
+
+  # Serve the UI on the LAN so others can try it
+  ./distill.sh --ui --host 0.0.0.0 --port 8080
 
 ENVIRONMENT
   Every flag has a KD_* equivalent, applied when the flag is absent:
@@ -164,8 +185,17 @@ while [ $# -gt 0 ]; do
     -p|--profile)     need_val "$1" $#; CONFIG_PROFILE="$2"; shift 2 ;;
     --profile=*)      CONFIG_PROFILE="${1#*=}"; shift ;;
 
+    --port)           need_val "$1" $#; UI_PORT="$2"; shift 2 ;;
+    --port=*)         UI_PORT="${1#*=}"; shift ;;
+    --host)           need_val "$1" $#; UI_HOST="$2"; shift 2 ;;
+    --host=*)         UI_HOST="${1#*=}"; shift ;;
+    --share)          UI_SHARE=1; shift ;;
+    --adapter)        need_val "$1" $#; ADAPTER_DIR="$2"; shift 2 ;;
+    --adapter=*)      ADAPTER_DIR="${1#*=}"; shift ;;
+
     --check)          MODE="check"; shift ;;
     --smoke)          MODE="smoke"; shift ;;
+    --ui)             MODE="ui"; shift ;;
     --shell)          MODE="shell"; shift ;;
     -h|--help)        usage; exit 0 ;;
     -V|--version)     echo "distill.sh pinned to __REPO__@__SHA_SHORT__ (built __BUILT_AT__)"; exit 0 ;;
@@ -182,6 +212,7 @@ done
 case "$DEVICE" in auto|cpu|mps|cuda) ;; *) die "--device must be auto|cpu|mps|cuda (got '$DEVICE')" ;; esac
 case "$DTYPE"  in auto|float32|bfloat16|float16) ;; *) die "--dtype must be auto|float32|bfloat16|float16 (got '$DTYPE')" ;; esac
 case "$MAX_STEPS" in ''|*[!0-9]*) die "--steps must be a positive integer (got '$MAX_STEPS')" ;; esac
+case "$UI_PORT"  in ''|*[!0-9]*) die "--port must be a positive integer (got '$UI_PORT')" ;; esac
 [ -n "$CONFIG_PROFILE" ] && case "$CONFIG_PROFILE" in
   default|mac|smoke) ;; *) die "--profile must be default|mac|smoke (got '$CONFIG_PROFILE')" ;;
 esac
@@ -277,6 +308,19 @@ case "$MODE" in
   check)
     log "Resolving configuration (no training)"
     uv run python train_scaled.py --config "$CONFIG_FILE" --print-config
+    ;;
+  ui)
+    # Default to the adapter this runner would have written, so --ui right after a
+    # training run just works. app.py falls back to its own search if it is absent.
+    [ -z "$ADAPTER_DIR" ] && ADAPTER_DIR="${OUTPUT_DIR}/final_adapter"
+    UI_ARGS="--host $UI_HOST --port $UI_PORT --teacher $TEACHER_MODEL --student $STUDENT_MODEL"
+    [ -d "$ADAPTER_DIR" ] && UI_ARGS="$UI_ARGS --adapter $ADAPTER_DIR"
+    [ "$UI_SHARE" -eq 1 ] && UI_ARGS="$UI_ARGS --share"
+    log "Launching comparison UI on http://$UI_HOST:$UI_PORT"
+    log "  adapter : $ADAPTER_DIR"
+    log "  (loads three models - first start takes a minute; Ctrl+C to stop)"
+    # shellcheck disable=SC2086  # UI_ARGS is intentionally word-split into flags
+    uv run python app.py $UI_ARGS
     ;;
   shell)
     log "Entering a shell with the environment active. Exit to return."

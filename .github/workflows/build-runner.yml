@@ -64,6 +64,13 @@ jobs:
           echo "$out" | grep -q 'acme/teacher-x' || { echo "teacher override failed: $out"; exit 1; }
           echo "override precedence OK"
 
+      - name: Verify the comparison UI entrypoint
+        run: |
+          uv run python app.py --help | grep -q -- '--adapter'
+          uv run python app.py --help | grep -q -- '--port'
+          uv run python app.py --list-adapters
+          echo "UI entrypoint OK"
+
   # ---------------------------------------------------------------------------
   # Generate the runner artifact.
   # ---------------------------------------------------------------------------
@@ -137,6 +144,9 @@ jobs:
           echo "student=$STUDENT_MODEL"
           echo "dataset=$DATASET"
           echo "steps=$MAX_STEPS"
+          echo "mode=$MODE"
+          echo "port=$UI_PORT"
+          echo "host=$UI_HOST"
           EOF
 
           expect() { echo "$1" | grep -qx "$2" || { echo "FAIL: expected '$2' in:"; echo "$1"; exit 1; }; }
@@ -156,6 +166,11 @@ jobs:
           expect "$out" "teacher=env/T"; expect "$out" "steps=123"
           out=$(KD_TEACHER_MODEL=env/T KD_MAX_STEPS=123 bash /tmp/parsecheck.sh --teacher cli/T --steps 777)
           expect "$out" "teacher=cli/T"; expect "$out" "steps=777"
+
+          # UI mode and its options
+          out=$(bash /tmp/parsecheck.sh); expect "$out" "mode=train"
+          out=$(bash /tmp/parsecheck.sh --ui --port 8080 --host 0.0.0.0)
+          expect "$out" "mode=ui"; expect "$out" "port=8080"; expect "$out" "host=0.0.0.0"
           echo "parsing + precedence OK"
 
       - name: Verify bad input is rejected
@@ -173,6 +188,7 @@ jobs:
           fails --teacher
           fails --bogus
           fails stray-arg
+          fails --ui --port abc
           echo "validation OK"
 
       - name: Upload runner artifact
