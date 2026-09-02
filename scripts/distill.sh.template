@@ -18,14 +18,19 @@ set -euo pipefail
 #  Defaults. Override with CLI flags (preferred) or KD_* environment variables.
 #  Precedence: CLI flag  >  KD_* env var  >  these defaults.
 # ---------------------------------------------------------------------------
-TEACHER_MODEL="${KD_TEACHER_MODEL:-HuggingFaceTB/SmolLM2-360M-Instruct}"
-STUDENT_MODEL="${KD_STUDENT_MODEL:-HuggingFaceTB/SmolLM2-135M-Instruct}"
-DATASET="${KD_DATASET:-HuggingFaceTB/smoltalk}"
+# IMPORTANT: empty means "not specified", and the selected profile's YAML value is used.
+# These must NOT carry hardcoded model defaults: they are exported as KD_* variables,
+# which outrank the config file, so a non-empty default here would silently override
+# whatever the profile specifies (e.g. clobbering configs/finance.yaml with SmolLM2).
+# A KD_* variable set by the caller still counts as an explicit choice.
+TEACHER_MODEL="${KD_TEACHER_MODEL:-}"
+STUDENT_MODEL="${KD_STUDENT_MODEL:-}"
+DATASET="${KD_DATASET:-}"
 
-DEVICE="${KD_DEVICE:-auto}"          # auto | cpu | mps | cuda
-DTYPE="${KD_DTYPE:-auto}"            # auto | float32 | bfloat16 | float16
-MAX_STEPS="${KD_MAX_STEPS:-300}"
-OUTPUT_DIR="${KD_OUTPUT_DIR:-./distilled_output}"
+DEVICE="${KD_DEVICE:-}"              # auto | cpu | mps | cuda
+DTYPE="${KD_DTYPE:-}"                # auto | float32 | bfloat16 | float16
+MAX_STEPS="${KD_MAX_STEPS:-}"
+OUTPUT_DIR="${KD_OUTPUT_DIR:-}"
 
 BATCH_SIZE="${KD_BATCH_SIZE:-}"      # blank = profile default
 GRAD_ACCUM="${KD_GRAD_ACCUM:-}"
@@ -63,22 +68,22 @@ USAGE
 
 MODELS AND DATA
   -t, --teacher MODEL     Teacher model id or local path
-                          (default: $TEACHER_MODEL)
+                          (default: from the selected profile)
   -s, --student MODEL     Student model id or local path
-                          (default: $STUDENT_MODEL)
+                          (default: from the selected profile)
   -d, --dataset NAME      Training dataset
-                          (default: $DATASET)
+                          (default: from the selected profile)
 
   NOTE: teacher and student must share a tokenizer vocabulary for standard GKD.
 
 HARDWARE
-      --device DEV        auto | cpu | mps | cuda   (default: $DEVICE)
+      --device DEV        auto | cpu | mps | cuda   (default: from profile)
                           auto detects Apple Silicon (MPS) and CUDA
-      --dtype TYPE        auto | float32 | bfloat16 | float16  (default: $DTYPE)
+      --dtype TYPE        auto | float32 | bfloat16 | float16  (default: from profile)
                           bfloat16 on MPS requires macOS 14.0 or newer
 
 TRAINING
-      --steps N           Optimizer steps (default: $MAX_STEPS)
+      --steps N           Optimizer steps (default: from profile)
       --batch-size N      Per-device batch size
       --grad-accum N      Gradient accumulation steps
       --lr RATE           Learning rate (e.g. 3e-4)
@@ -86,7 +91,7 @@ TRAINING
       --lora-alpha N      LoRA alpha
       --lmbda F           On-policy fraction 0.0-1.0; raise toward 1.0 for
                           more student rollouts corrected by the teacher
-  -o, --output DIR        Output directory (default: $OUTPUT_DIR)
+  -o, --output DIR        Output directory (default: from profile)
   -p, --profile NAME      Config profile: default | mac | smoke | finance
                           (default: auto-selected from platform)
 
@@ -209,9 +214,10 @@ done
 # ---------------------------------------------------------------------------
 #  Validate
 # ---------------------------------------------------------------------------
-case "$DEVICE" in auto|cpu|mps|cuda) ;; *) die "--device must be auto|cpu|mps|cuda (got '$DEVICE')" ;; esac
-case "$DTYPE"  in auto|float32|bfloat16|float16) ;; *) die "--dtype must be auto|float32|bfloat16|float16 (got '$DTYPE')" ;; esac
-case "$MAX_STEPS" in ''|*[!0-9]*) die "--steps must be a positive integer (got '$MAX_STEPS')" ;; esac
+# An empty value means "inherit from the profile", so it is always valid.
+case "$DEVICE" in ''|auto|cpu|mps|cuda) ;; *) die "--device must be auto|cpu|mps|cuda (got '$DEVICE')" ;; esac
+case "$DTYPE"  in ''|auto|float32|bfloat16|float16) ;; *) die "--dtype must be auto|float32|bfloat16|float16 (got '$DTYPE')" ;; esac
+[ -n "$MAX_STEPS" ] && case "$MAX_STEPS" in *[!0-9]*) die "--steps must be a positive integer (got '$MAX_STEPS')" ;; esac
 case "$UI_PORT"  in ''|*[!0-9]*) die "--port must be a positive integer (got '$UI_PORT')" ;; esac
 [ -n "$CONFIG_PROFILE" ] && case "$CONFIG_PROFILE" in
   default|mac|smoke|finance) ;; *) die "--profile must be default|mac|smoke|finance (got '$CONFIG_PROFILE')" ;;
@@ -284,13 +290,15 @@ uv sync --quiet || die "uv sync failed"
 # ---------------------------------------------------------------------------
 #  5. Hand the resolved settings to the pipeline as KD_* overrides
 # ---------------------------------------------------------------------------
-export KD_TEACHER_MODEL="$TEACHER_MODEL"
-export KD_STUDENT_MODEL="$STUDENT_MODEL"
-export KD_DATASET="$DATASET"
-export KD_DEVICE="$DEVICE"
-export KD_DTYPE="$DTYPE"
-export KD_OUTPUT_DIR="$OUTPUT_DIR"
-export KD_MAX_STEPS="$MAX_STEPS"
+# Export ONLY what was explicitly requested. Anything left empty falls through to the
+# profile's YAML value - exporting a default here would override the config file.
+[ -n "$TEACHER_MODEL" ] && export KD_TEACHER_MODEL="$TEACHER_MODEL"
+[ -n "$STUDENT_MODEL" ] && export KD_STUDENT_MODEL="$STUDENT_MODEL"
+[ -n "$DATASET" ]       && export KD_DATASET="$DATASET"
+[ -n "$DEVICE" ]        && export KD_DEVICE="$DEVICE"
+[ -n "$DTYPE" ]         && export KD_DTYPE="$DTYPE"
+[ -n "$OUTPUT_DIR" ]    && export KD_OUTPUT_DIR="$OUTPUT_DIR"
+[ -n "$MAX_STEPS" ]     && export KD_MAX_STEPS="$MAX_STEPS"
 [ -n "$BATCH_SIZE" ]    && export KD_BATCH_SIZE="$BATCH_SIZE"
 [ -n "$GRAD_ACCUM" ]    && export KD_GRAD_ACCUM="$GRAD_ACCUM"
 [ -n "$LEARNING_RATE" ] && export KD_LEARNING_RATE="$LEARNING_RATE"
@@ -307,17 +315,47 @@ CONFIG_FILE="configs/${CONFIG_PROFILE}.yaml"
 case "$MODE" in
   check)
     log "Resolving configuration (no training)"
-    uv run python train_scaled.py --config "$CONFIG_FILE" --print-config
+    set +e
+    CHECK_OUT="$(uv run python train_scaled.py --config "$CONFIG_FILE" --print-config 2>&1)"
+    CHECK_RC=$?
+    set -e
+    printf '%s
+' "$CHECK_OUT"
+    if [ $CHECK_RC -ne 0 ]; then
+      banner_bad "configuration did not resolve (exit $CHECK_RC)"
+      exit $CHECK_RC
+    fi
+    C_DEV="$(field "$CHECK_OUT" device)"
+    C_TCH="$(field "$CHECK_OUT" teacher)"
+    C_STU="$(field "$CHECK_OUT" student)"
+    C_DS="$(field "$CHECK_OUT" dataset)"
+    banner_ok "configuration resolved"
+    ok "   profile : $CONFIG_PROFILE"
+    ok "   teacher : $C_TCH"
+    ok "   student : $C_STU"
+    ok "   dataset : $C_DS"
+    ok "   device  : $C_DEV"
+    case "$C_DEV" in
+      mps*)  ok "   Apple GPU (MPS) in use." ;;
+      cuda*) ok "   CUDA GPU in use." ;;
+      cpu*)  [ "$IS_APPLE_SILICON" -eq 1 ]                && warn "Running on CPU despite Apple Silicon - MPS was not detected."                || ok "   Running on CPU." ;;
+    esac
+    echo
+    ok "   Next: ./distill.sh --profile $CONFIG_PROFILE --smoke"
+    echo
     ;;
   ui)
     # Default to the adapter this runner would have written, so --ui right after a
     # training run just works. app.py falls back to its own search if it is absent.
-    [ -z "$ADAPTER_DIR" ] && ADAPTER_DIR="${OUTPUT_DIR}/final_adapter"
-    UI_ARGS="--host $UI_HOST --port $UI_PORT --teacher $TEACHER_MODEL --student $STUDENT_MODEL"
-    [ -d "$ADAPTER_DIR" ] && UI_ARGS="$UI_ARGS --adapter $ADAPTER_DIR"
+    # With no explicit --output, let app.py discover the newest adapter itself.
+    [ -z "$ADAPTER_DIR" ] && [ -n "$OUTPUT_DIR" ] && ADAPTER_DIR="${OUTPUT_DIR}/final_adapter"
+    UI_ARGS="--host $UI_HOST --port $UI_PORT --config $CONFIG_FILE"
+    [ -n "$TEACHER_MODEL" ] && UI_ARGS="$UI_ARGS --teacher $TEACHER_MODEL"
+    [ -n "$STUDENT_MODEL" ] && UI_ARGS="$UI_ARGS --student $STUDENT_MODEL"
+    [ -n "$ADAPTER_DIR" ] && [ -d "$ADAPTER_DIR" ] && UI_ARGS="$UI_ARGS --adapter $ADAPTER_DIR"
     [ "$UI_SHARE" -eq 1 ] && UI_ARGS="$UI_ARGS --share"
     log "Launching comparison UI on http://$UI_HOST:$UI_PORT"
-    log "  adapter : $ADAPTER_DIR"
+    log "  adapter : ${ADAPTER_DIR:-(auto-discovered)}"
     log "  (loads three models - first start takes a minute; Ctrl+C to stop)"
     # shellcheck disable=SC2086  # UI_ARGS is intentionally word-split into flags
     uv run python app.py $UI_ARGS
@@ -328,17 +366,59 @@ case "$MODE" in
     ;;
   smoke)
     log "Smoke test - 2 steps end to end"
-    uv run python train_scaled.py --config "$CONFIG_FILE" --dry-run
+    set +e
+    SMOKE_LOG="$(mktemp -t kd-smoke.XXXXXX)"
+    uv run python train_scaled.py --config "$CONFIG_FILE" --dry-run 2>&1 | tee "$SMOKE_LOG"
+    SMOKE_RC=${PIPESTATUS[0]}
+    set -e
+    if [ "$SMOKE_RC" -ne 0 ]; then
+      banner_bad "smoke test did not complete (exit $SMOKE_RC)"
+      rm -f "$SMOKE_LOG"
+      exit "$SMOKE_RC"
+    fi
+    S_PARAMS="$(grep -m1 'trainable params' "$SMOKE_LOG" || true)"
+    S_STEP="$(grep -o '[0-9.]\+s/step' "$SMOKE_LOG" | tail -1 || true)"
+    S_EVAL="$(grep -o 'held-out loss = [0-9.]\+' "$SMOKE_LOG" | tail -1 || true)"
+    S_TRAIN="$(grep -c '^ \[step' "$SMOKE_LOG" || true)"
+    rm -f "$SMOKE_LOG"
+    banner_ok "pipeline runs end to end"
+    ok "   profile        : $CONFIG_PROFILE"
+    [ -n "$S_PARAMS" ] && ok "   ${S_PARAMS# }"
+    ok "   training steps : ${S_TRAIN:-0} completed"
+    [ -n "$S_EVAL" ] && ok "   $S_EVAL"
+    if [ -n "$S_STEP" ]; then
+      ok "   speed          : $S_STEP"
+      SPS="${S_STEP%s/step}"
+      EST="$(awk -v s="$SPS" -v n="${MAX_STEPS:-300}" 'BEGIN{printf "%d", s*n/60}' 2>/dev/null || echo '')"
+      [ -n "$EST" ] && ok "   est. full run  : ~${EST} min for ${MAX_STEPS:-300} steps"
+    fi
+    echo
+    ok "   Next: ./distill.sh --profile $CONFIG_PROFILE"
+    echo
     ;;
   train)
     log "Starting distillation"
-    log "  teacher : $TEACHER_MODEL"
-    log "  student : $STUDENT_MODEL"
-    log "  dataset : $DATASET"
-    log "  steps   : $MAX_STEPS"
+    log "  profile : $CONFIG_PROFILE"
+    log "  teacher : ${TEACHER_MODEL:-(from profile)}"
+    log "  student : ${STUDENT_MODEL:-(from profile)}"
+    log "  dataset : ${DATASET:-(from profile)}"
+    log "  steps   : ${MAX_STEPS:-(from profile)}"
+    set +e
     uv run python train_scaled.py --config "$CONFIG_FILE"
-    ABS_OUT="$SRC_DIR/${OUTPUT_DIR#./}"
-    log "Done. Adapter written to:"
-    log "  $ABS_OUT/final_adapter"
+    TRAIN_RC=$?
+    set -e
+    if [ "$TRAIN_RC" -ne 0 ]; then
+      banner_bad "training did not complete (exit $TRAIN_RC)"
+      exit "$TRAIN_RC"
+    fi
+    # OUTPUT_DIR may be empty (inherited from the profile), so resolve it for the banner.
+    RESOLVED_OUT="$OUTPUT_DIR"
+    [ -z "$RESOLVED_OUT" ] && RESOLVED_OUT="$(field         "$(uv run python train_scaled.py --config "$CONFIG_FILE" --print-config 2>/dev/null)" output)"
+    ABS_OUT="$SRC_DIR/${RESOLVED_OUT#./}"
+    banner_ok "training complete"
+    ok "   adapter : $ABS_OUT/final_adapter"
+    echo
+    ok "   Next: ./distill.sh --profile $CONFIG_PROFILE --ui"
+    echo
     ;;
 esac

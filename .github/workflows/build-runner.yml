@@ -62,6 +62,11 @@ jobs:
           out=$(uv run python train_scaled.py --config configs/default.yaml \
                   --teacher acme/teacher-x --print-config | grep -E '^ teacher')
           echo "$out" | grep -q 'acme/teacher-x' || { echo "teacher override failed: $out"; exit 1; }
+
+          # Each profile must actually surface its own models, not a global default.
+          out=$(uv run python train_scaled.py --config configs/finance.yaml --print-config)
+          echo "$out" | grep -q 'Qwen/Qwen3.5-0.8B' || { echo "finance student wrong: $out"; exit 1; }
+          echo "$out" | grep -q 'gbharti/finance-alpaca' || { echo "finance dataset wrong: $out"; exit 1; }
           echo "override precedence OK"
 
       - name: Verify the comparison UI entrypoint
@@ -166,6 +171,14 @@ jobs:
           expect "$out" "teacher=env/T"; expect "$out" "steps=123"
           out=$(KD_TEACHER_MODEL=env/T KD_MAX_STEPS=123 bash /tmp/parsecheck.sh --teacher cli/T --steps 777)
           expect "$out" "teacher=cli/T"; expect "$out" "steps=777"
+
+          # REGRESSION: with no flags the runner must leave these EMPTY, so the
+          # selected profile's YAML values win. Non-empty defaults here get exported
+          # as KD_* variables, which outrank the config file and silently override it
+          # (this clobbered configs/finance.yaml with the SmolLM2 defaults).
+          out=$(bash /tmp/parsecheck.sh)
+          expect "$out" "teacher="; expect "$out" "student="
+          expect "$out" "dataset="; expect "$out" "steps="
 
           # UI mode and its options
           out=$(bash /tmp/parsecheck.sh); expect "$out" "mode=train"
