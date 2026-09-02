@@ -87,7 +87,7 @@ TRAINING
       --lmbda F           On-policy fraction 0.0-1.0; raise toward 1.0 for
                           more student rollouts corrected by the teacher
   -o, --output DIR        Output directory (default: $OUTPUT_DIR)
-  -p, --profile NAME      Config profile: default | mac | smoke
+  -p, --profile NAME      Config profile: default | mac | smoke | finance
                           (default: auto-selected from platform)
 
 MODES
@@ -214,7 +214,7 @@ case "$DTYPE"  in auto|float32|bfloat16|float16) ;; *) die "--dtype must be auto
 case "$MAX_STEPS" in ''|*[!0-9]*) die "--steps must be a positive integer (got '$MAX_STEPS')" ;; esac
 case "$UI_PORT"  in ''|*[!0-9]*) die "--port must be a positive integer (got '$UI_PORT')" ;; esac
 [ -n "$CONFIG_PROFILE" ] && case "$CONFIG_PROFILE" in
-  default|mac|smoke) ;; *) die "--profile must be default|mac|smoke (got '$CONFIG_PROFILE')" ;;
+  default|mac|smoke|finance) ;; *) die "--profile must be default|mac|smoke|finance (got '$CONFIG_PROFILE')" ;;
 esac
 
 # ---------------------------------------------------------------------------

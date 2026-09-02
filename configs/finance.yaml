@@ -1,0 +1,108 @@
+# ---------------------------------------------------------------------------
+# Finance distillation - Qwen3.5-2B (finance-tuned) -> Qwen3.5-0.8B
+#
+#   python train_scaled.py --config configs/finance.yaml
+#   ./distill.sh --profile finance          (via the generated runner)
+#
+# Verified before writing this file:
+#   * Both models exist and share vocab_size 248320, so GKD's identical-vocabulary
+#     requirement is satisfied.
+#   * The teacher repo is a MERGED model (model.safetensors + config.json, no
+#     adapter_config.json) despite the "-lora" suffix in its name, so it loads
+#     directly with AutoModelForCausalLM - no PEFT wrapping needed.
+#   * gbharti/finance-alpaca is Alpaca-format (instruction/input/output), NOT
+#     conversational, hence `format: alpaca` below.
+# ---------------------------------------------------------------------------
+
+project:
+  name: qwen35-finance-distillation
+  output_dir: ./distilled_qwen_finance
+  seed: 42
+
+models:
+  teacher: siddhartha-addy-globalids-labs/qwen3.5-2b-finance-alpaca-lora
+  student: Qwen/Qwen3.5-0.8B
+  # The teacher is the finance-tuned model, but both share the Qwen3.5 tokenizer.
+  # Using the student's keeps the chat template aligned with what we generate from.
+  tokenizer: student
+
+hardware:
+  device: auto
+  # A 2B teacher plus a 0.8B student is ~11 GB of float32 weights before activations.
+  # On macOS 14+ set this to bfloat16 to roughly halve that; on CPU it stays float32.
+  dtype: auto
+  threads: 0
+  mps_fallback: true
+  mps_high_watermark_ratio: 0.0
+
+dataset:
+  source: gbharti/finance-alpaca
+  # Measured over 3,000 rows: prompts are short (median 25 tokens, max 52) but answers
+  # are long (median 199, p90 488). prompt<128 + total<=512 passes 91.2% of rows.
+  max_prompt_tokens: 128
+  max_total_tokens: 512
+  validation_size: 50
+  # The built-in synthetic prompts are general science/maths/logic and would dilute a
+  # finance-specific run. Set true to blend them back in for format retention.
+  include_synthetic: false
+  domains:
+    - name: finance-alpaca
+      config: null              # single-config dataset
+      format: alpaca            # instruction / input / output -> chat turns
+      instruction_column: instruction
+      input_column: input
+      output_column: output
+      quota: 1800
+      pool: 2400                # 91% pass rate, so this comfortably clears quota
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  # Qwen3.5 is a HYBRID architecture, not a Llama-style decoder. Verified against the
+  # loaded model, its 24 layers split as:
+  #     18 x linear attention  -> linear_attn.{in_proj_qkv, in_proj_z, out_proj}
+  #      6 x standard attention -> self_attn.{q_proj, k_proj, v_proj, o_proj}
+  #     24 x MLP               -> mlp.{gate_proj, up_proj, down_proj}
+  #
+  # The default SmolLM2 target list (q/k/v/o + gate/up/down) would miss the attention
+  # in 18 of the 24 layers entirely, so the linear_attn projections are added here.
+  # AutoModelForCausalLM drops the checkpoint's vision tower and MTP head, so these
+  # plain suffixes cannot leak adapters into them.
+  target_modules:
+    - in_proj_qkv     # linear-attn fused Q/K/V   (18 layers)
+    - in_proj_z       # linear-attn gate          (18 layers)
+    - out_proj        # linear-attn output        (18 layers)
+    - q_proj          # standard attention        (6 layers)
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj       # MLP                       (24 layers)
+    - up_proj
+    - down_proj
+
+training:
+  max_steps: 300
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4        # lower than the 135M run; larger model, longer answers
+  lr_scheduler_type: cosine
+  warmup: 0.05
+  max_grad_norm: 1.0
+  logging_steps: 1
+  save_steps: 100
+  save_total_limit: 2
+  eval_enabled: true
+  benchmark_every: 100
+
+gkd:
+  lmbda: 0.5
+  beta: 0.5
+  temperature: 0.7
+  max_new_tokens: 40
+  seq_kd: false
+
+benchmark_prompts:
+  - What is the difference between a Roth IRA and a traditional IRA?
+  - How does compound interest work? Explain briefly.
+  - What does it mean when a stock is described as having a high P/E ratio?

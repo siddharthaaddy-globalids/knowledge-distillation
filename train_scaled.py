@@ -411,8 +411,32 @@ def select_exchange(tokenizer, messages):
     return None
 
 
-def collect_smoltalk_domain(tokenizer, spec, seen_prompts):
-    """Pull `quota` length-filtered single-turn samples from one smoltalk config."""
+def alpaca_to_turns(row, spec):
+    """Convert one Alpaca-style row (instruction / input / output) into chat turns.
+
+    Alpaca datasets such as gbharti/finance-alpaca carry no `messages` column, so the
+    prompt is assembled here. A non-empty `input` is appended to the instruction, which
+    is the convention those datasets were written against.
+    """
+    instruction = str(row.get(spec.get("instruction_column", "instruction")) or "").strip()
+    context = str(row.get(spec.get("input_column", "input")) or "").strip()
+    output = str(row.get(spec.get("output_column", "output")) or "").strip()
+    if not instruction or not output:
+        return None
+    user = f"{instruction}\n\n{context}" if context else instruction
+    return [
+        {"role": "user", "content": user},
+        {"role": "assistant", "content": output},
+    ]
+
+
+def collect_domain(tokenizer, spec, seen_prompts):
+    """Pull `quota` length-filtered samples from one dataset config.
+
+    Handles two source layouts, selected by `format` in the domain spec:
+      messages (default) - conversational datasets like smoltalk
+      alpaca             - instruction/input/output datasets like finance-alpaca
+    """
     name, config, quota, pool = spec["name"], spec.get("config"), spec["quota"], spec["pool"]
     label = f"{DATASET_SOURCE.split('/')[-1]}/{config}" if config else DATASET_SOURCE
     print(f"  - {name:24} ({label}) target={quota} ...", end=" ", flush=True)
@@ -426,17 +450,31 @@ def collect_smoltalk_domain(tokenizer, spec, seen_prompts):
         print(f"SKIPPED ({type(exc).__name__}: {str(exc)[:80]})")
         return []
 
-    column = spec.get("messages_column", "messages")
-    if column not in raw.column_names:
-        print(f"SKIPPED (no '{column}' column; found {raw.column_names})")
-        return []
+    fmt = str(spec.get("format", "messages")).lower()
+    if fmt == "alpaca":
+        required = spec.get("instruction_column", "instruction")
+        if required not in raw.column_names:
+            print(f"SKIPPED (no '{required}' column; found {raw.column_names})")
+            return []
+        rows = raw
+    else:
+        column = spec.get("messages_column", "messages")
+        if column not in raw.column_names:
+            print(f"SKIPPED (no '{column}' column; found {raw.column_names})")
+            return []
+        rows = raw[column]
 
     kept, scanned = [], 0
-    for messages in raw[column]:
+    for row in rows:
         scanned += 1
         if len(kept) >= quota:
             break
-        turns = select_exchange(tokenizer, messages)
+        if fmt == "alpaca":
+            turns = alpaca_to_turns(row, spec)
+            if turns is not None and not within_budget(tokenizer, turns):
+                turns = None
+        else:
+            turns = select_exchange(tokenizer, row)
         if turns is None:
             continue
         key = turns[-2]["content"].strip()[:200]
@@ -458,7 +496,7 @@ def build_datasets(tokenizer):
     records = []
 
     for spec in DATASET_DOMAINS:
-        records.extend(collect_smoltalk_domain(tokenizer, spec, seen_prompts))
+        records.extend(collect_domain(tokenizer, spec, seen_prompts))
 
     if INCLUDE_SYNTHETIC:
         print("  - synthetic-reasoning     (generated)             ...", end=" ", flush=True)
@@ -744,13 +782,23 @@ def run(args):
         STUDENT_MODEL_ID, dtype=COMPUTE_DTYPE, low_cpu_mem_usage=True
     ).to(DEVICE)
 
-    lora_config = LoraConfig(
+    # target_modules may be a list of suffixes (Llama-style models) or a single regex
+    # string. The regex form matters for hybrid architectures such as Qwen3.5, whose
+    # checkpoint also contains a vision tower and an MTP head that share module names
+    # with the language model - a plain suffix list would inject adapters into those too.
+    targets = lora_cfg["target_modules"]
+    targets = targets if isinstance(targets, str) else list(targets)
+    lora_kwargs = dict(
         task_type=TaskType.CAUSAL_LM,
         r=int(lora_cfg["r"]),
         lora_alpha=int(lora_cfg["alpha"]),
         lora_dropout=float(lora_cfg["dropout"]),
-        target_modules=list(lora_cfg["target_modules"]),
+        target_modules=targets,
     )
+    if lora_cfg.get("exclude_modules"):
+        excludes = lora_cfg["exclude_modules"]
+        lora_kwargs["exclude_modules"] = excludes if isinstance(excludes, str) else list(excludes)
+    lora_config = LoraConfig(**lora_kwargs)
     student_model = get_peft_model(student_model, lora_config)
     student_model.print_trainable_parameters()
 
