@@ -1,0 +1,102 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Virtual environments (uv)
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+# NOTE: uv.lock and .python-version are intentionally NOT ignored - they pin the
+# environment and belong in version control for reproducible installs.
+
+# ---------------------------------------------------------------------------
+# Trained model artifacts
+# ---------------------------------------------------------------------------
+# Training checkpoints carry full optimizer state (~116 MB each) and are pure
+# resumable scratch - never commit these.
+distilled_smollm_poc/checkpoint-*/
+distilled_smollm_scaled/checkpoint-*/
+
+# Final LoRA adapters (~20 MB and ~39 MB). Ignored by default to keep the repo a
+# code repo and avoid permanent git history bloat. Regenerate with:
+#     python train_scaled.py
+# To ship an adapter instead, delete the two lines below and track it with
+# Git LFS:  git lfs track "*.safetensors"
+distilled_smollm_poc/
+distilled_smollm_scaled/
+
+# Loose weight files anywhere in the tree
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.onnx
+
+# ---------------------------------------------------------------------------
+# Hugging Face / datasets caches
+# ---------------------------------------------------------------------------
+.cache/
+hf_cache/
+wandb/
+runs/
+outputs/
+
+# ---------------------------------------------------------------------------
+# Gradio
+# ---------------------------------------------------------------------------
+.gradio/
+flagged/
+gradio_cached_examples/
+
+# ---------------------------------------------------------------------------
+# Secrets and local config
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# ---------------------------------------------------------------------------
+# Editors / IDEs
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------------------------------------------------------------------------
+# OS
+# ---------------------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# ---------------------------------------------------------------------------
+# Logs / scratch
+# ---------------------------------------------------------------------------
+*.log
+nohup.out
+scratch/
+tmp/
