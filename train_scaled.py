@@ -9,10 +9,18 @@ Upgrades the 50-step PoC in main.py to a production-shaped run:
   * live console logging of step time / running JSD loss / grad norm / LR
   * benchmark generations every 100 steps so quality drift is visible during training
 
-CPU-only, float32. Usage:
-    python train_scaled.py                 # full run
-    python train_scaled.py --dry-run       # dataset build + 2 steps, no checkpointing
-    python train_scaled.py --max-steps 50  # short run
+Fully config-driven: models, dataset, LoRA, schedule and hardware all come from a YAML
+file, so retargeting to a different teacher/student/dataset never requires a code edit.
+
+    python train_scaled.py --config configs/default.yaml    # Windows / Linux CPU
+    python train_scaled.py --config configs/mac.yaml        # Apple Silicon (MPS)
+    python train_scaled.py --config configs/mac.yaml --print-config   # resolve only
+    python train_scaled.py --dry-run                        # dataset build + 2 steps
+
+Retarget without touching YAML, via CLI or KD_* environment variables:
+
+    python train_scaled.py --teacher HuggingFaceTB/SmolLM2-1.7B-Instruct
+    KD_TEACHER_MODEL=... KD_MAX_STEPS=600 python train_scaled.py
 """
 
 import argparse
@@ -21,52 +29,81 @@ import random
 import time
 
 import torch
-from datasets import Dataset, concatenate_datasets, load_dataset
+import yaml
+from datasets import Dataset, load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
+
+import kd_config
 
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 from trl.experimental.gkd import GKDConfig, GKDTrainer  # noqa: E402
 
 # --------------------------------------------------------------------------- #
-# Environment
+# Runtime state, populated from the YAML config by apply_config().
+#
+# These stay module-level globals so the dataset helpers below remain importable and
+# unit-testable in isolation; nothing here is read before apply_config() has run.
 # --------------------------------------------------------------------------- #
-NUM_CORES = os.cpu_count() or 4
-torch.set_num_threads(NUM_CORES)
+CONFIG = None
+HARDWARE = None
 
-STUDENT_MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
-TEACHER_MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
-OUTPUT_DIR = "./distilled_smollm_scaled"
-ADAPTER_DIR = f"{OUTPUT_DIR}/final_adapter"
+STUDENT_MODEL_ID = None
+TEACHER_MODEL_ID = None
+TOKENIZER_SOURCE = None
+OUTPUT_DIR = None
+ADAPTER_DIR = None
 
 DEVICE = "cpu"
 COMPUTE_DTYPE = torch.float32
 SEED = 42
 
 # Prompt-length budget. The collator builds the prompt from messages[:-1]; keeping it
-# short is what keeps on-policy CPU rollouts affordable.
+# short is what keeps on-policy rollouts affordable.
 MAX_PROMPT_TOKENS = 128
 MAX_TOTAL_TOKENS = 384
-
 VALIDATION_SIZE = 50
 
-# Domain quotas. `pool` oversamples the source because the 128-token prompt filter is
-# aggressive on the long-document domains (only ~6% of smol-summarize prompts survive).
-SMOLTALK_DOMAINS = [
-    {"name": "everyday-conversations", "config": "everyday-conversations", "quota": 320, "pool": 1800},
-    # Only ~2% of summarize prompts survive the 128-token cap (long source documents),
-    # so this pool is deliberately oversampled to reach quota.
-    {"name": "summarization",          "config": "smol-summarize",         "quota": 240, "pool": 14000},
-    {"name": "rewriting",              "config": "smol-rewrite",           "quota": 240, "pool": 2500},
-    {"name": "constraints",            "config": "smol-constraints",       "quota": 320, "pool": 900},
-    {"name": "factual-qa",             "config": "openhermes-100k",        "quota": 380, "pool": 1500},
-]
+DATASET_SOURCE = "HuggingFaceTB/smoltalk"
+DATASET_DOMAINS = []
+INCLUDE_SYNTHETIC = True
+BENCHMARK_PROMPTS = []
 
-BENCHMARK_PROMPTS = [
-    "Explain why the sky looks blue to human eyes in two sentences.",
-    "Solve for x: 3x + 12 = 27.",
-    "Name two renewable energy sources and explain them briefly.",
-]
+
+def apply_config(config, hardware):
+    """Bind the resolved config and hardware onto the module globals."""
+    global CONFIG, HARDWARE, STUDENT_MODEL_ID, TEACHER_MODEL_ID, TOKENIZER_SOURCE
+    global OUTPUT_DIR, ADAPTER_DIR, DEVICE, COMPUTE_DTYPE, SEED
+    global MAX_PROMPT_TOKENS, MAX_TOTAL_TOKENS, VALIDATION_SIZE
+    global DATASET_SOURCE, DATASET_DOMAINS, INCLUDE_SYNTHETIC, BENCHMARK_PROMPTS
+
+    CONFIG, HARDWARE = config, hardware
+
+    STUDENT_MODEL_ID = config["models"]["student"]
+    TEACHER_MODEL_ID = config["models"]["teacher"]
+
+    tokenizer_choice = str(config["models"].get("tokenizer", "teacher"))
+    TOKENIZER_SOURCE = {
+        "teacher": TEACHER_MODEL_ID,
+        "student": STUDENT_MODEL_ID,
+    }.get(tokenizer_choice, tokenizer_choice)
+
+    OUTPUT_DIR = config["project"]["output_dir"]
+    ADAPTER_DIR = os.path.join(OUTPUT_DIR, "final_adapter")
+    SEED = int(config["project"]["seed"])
+
+    DEVICE = hardware["device"]
+    COMPUTE_DTYPE = hardware["dtype"]
+
+    dataset_cfg = config["dataset"]
+    MAX_PROMPT_TOKENS = int(dataset_cfg["max_prompt_tokens"])
+    MAX_TOTAL_TOKENS = int(dataset_cfg["max_total_tokens"])
+    VALIDATION_SIZE = int(dataset_cfg["validation_size"])
+    DATASET_SOURCE = dataset_cfg["source"]
+    DATASET_DOMAINS = list(dataset_cfg.get("domains") or [])
+    INCLUDE_SYNTHETIC = bool(dataset_cfg.get("include_synthetic", True))
+
+    BENCHMARK_PROMPTS = list(config.get("benchmark_prompts") or [])
 
 
 # --------------------------------------------------------------------------- #
@@ -376,16 +413,26 @@ def select_exchange(tokenizer, messages):
 
 def collect_smoltalk_domain(tokenizer, spec, seen_prompts):
     """Pull `quota` length-filtered single-turn samples from one smoltalk config."""
-    name, config, quota, pool = spec["name"], spec["config"], spec["quota"], spec["pool"]
-    print(f"  - {name:24} (smoltalk/{config}) target={quota} ...", end=" ", flush=True)
+    name, config, quota, pool = spec["name"], spec.get("config"), spec["quota"], spec["pool"]
+    label = f"{DATASET_SOURCE.split('/')[-1]}/{config}" if config else DATASET_SOURCE
+    print(f"  - {name:24} ({label}) target={quota} ...", end=" ", flush=True)
     try:
-        raw = load_dataset("HuggingFaceTB/smoltalk", config, split=f"train[:{pool}]")
+        split = spec.get("split", f"train[:{pool}]")
+        if config:
+            raw = load_dataset(DATASET_SOURCE, config, split=split)
+        else:
+            raw = load_dataset(DATASET_SOURCE, split=split)
     except Exception as exc:
         print(f"SKIPPED ({type(exc).__name__}: {str(exc)[:80]})")
         return []
 
+    column = spec.get("messages_column", "messages")
+    if column not in raw.column_names:
+        print(f"SKIPPED (no '{column}' column; found {raw.column_names})")
+        return []
+
     kept, scanned = [], 0
-    for messages in raw["messages"]:
+    for messages in raw[column]:
         scanned += 1
         if len(kept) >= quota:
             break
@@ -410,21 +457,22 @@ def build_datasets(tokenizer):
     seen_prompts = set()
     records = []
 
-    for spec in SMOLTALK_DOMAINS:
+    for spec in DATASET_DOMAINS:
         records.extend(collect_smoltalk_domain(tokenizer, spec, seen_prompts))
 
-    print("  - synthetic-reasoning     (generated)             ...", end=" ", flush=True)
-    synthetic_kept = []
-    for sample in build_synthetic_samples(rng):
-        if not within_budget(tokenizer, sample["messages"]):
-            continue
-        key = sample["messages"][-2]["content"].strip()[:200]
-        if key in seen_prompts:
-            continue
-        seen_prompts.add(key)
-        synthetic_kept.append(sample)
-    records.extend(synthetic_kept)
-    print(f"kept {len(synthetic_kept)}")
+    if INCLUDE_SYNTHETIC:
+        print("  - synthetic-reasoning     (generated)             ...", end=" ", flush=True)
+        synthetic_kept = []
+        for sample in build_synthetic_samples(rng):
+            if not within_budget(tokenizer, sample["messages"]):
+                continue
+            key = sample["messages"][-2]["content"].strip()[:200]
+            if key in seen_prompts:
+                continue
+            seen_prompts.add(key)
+            synthetic_kept.append(sample)
+        records.extend(synthetic_kept)
+        print(f"kept {len(synthetic_kept)}")
 
     if not records:
         raise RuntimeError("Dataset construction produced zero samples.")
@@ -593,32 +641,83 @@ def generate_sample(model, tokenizer, prompt, max_new_tokens=48):
 # Main
 # --------------------------------------------------------------------------- #
 def parse_args():
-    parser = argparse.ArgumentParser(description="Scaled GKD distillation for SmolLM2-135M")
-    parser.add_argument("--max-steps", type=int, default=300)
+    parser = argparse.ArgumentParser(
+        description="Config-driven GKD distillation (CPU / Apple Silicon MPS / CUDA)"
+    )
+    parser.add_argument("--config", default=None, metavar="PATH",
+                        help="YAML config file, e.g. configs/default.yaml or configs/mac.yaml")
+    parser.add_argument("--print-config", action="store_true",
+                        help="Resolve and print the effective config, then exit.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Build the dataset and run 2 steps to validate the pipeline.")
+
+    # Ad-hoc overrides. Anything left as None does not override the config file.
+    parser.add_argument("--student", default=None, help="Override models.student")
+    parser.add_argument("--teacher", default=None, help="Override models.teacher")
+    parser.add_argument("--dataset", default=None, help="Override dataset.source")
+    parser.add_argument("--output-dir", default=None, help="Override project.output_dir")
+    parser.add_argument("--device", default=None, choices=["auto", "cpu", "mps", "cuda"],
+                        help="Override hardware.device")
+    parser.add_argument("--dtype", default=None,
+                        choices=["auto", "float32", "bfloat16", "float16"],
+                        help="Override hardware.dtype")
+    parser.add_argument("--max-steps", type=int, default=None, help="Override training.max_steps")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override training.batch_size")
     parser.add_argument("--no-eval", action="store_true",
-                        help="Disable held-out validation loss (saves CPU time).")
-    parser.add_argument("--eval-every", type=int, default=100)
+                        help="Disable held-out validation loss (saves time).")
+    parser.add_argument("--eval-every", type=int, default=None,
+                        help="Override training.benchmark_every")
     return parser.parse_args()
 
 
-def run(args):
-    max_steps = 2 if args.dry_run else args.max_steps
-    eval_every = 1 if args.dry_run else args.eval_every
-    use_eval = not args.no_eval
+def build_overrides(args):
+    """Translate CLI flags into a nested override mapping for load_config()."""
+    overrides = {}
 
-    print("=" * 78)
-    print(f" Scaled CPU distillation | {NUM_CORES} threads | {COMPUTE_DTYPE}")
-    print(f" Student: {STUDENT_MODEL_ID}")
-    print(f" Teacher: {TEACHER_MODEL_ID}")
+    def put(section, key, value):
+        if value is not None:
+            overrides.setdefault(section, {})[key] = value
+
+    put("models", "student", args.student)
+    put("models", "teacher", args.teacher)
+    put("dataset", "source", args.dataset)
+    put("project", "output_dir", args.output_dir)
+    put("hardware", "device", args.device)
+    put("hardware", "dtype", args.dtype)
+    put("training", "max_steps", args.max_steps)
+    put("training", "batch_size", args.batch_size)
+    put("training", "benchmark_every", args.eval_every)
+    if args.no_eval:
+        put("training", "eval_enabled", False)
+    return overrides
+
+
+def run(args):
+    config = kd_config.load_config(args.config, build_overrides(args))
+    hardware = kd_config.resolve_device(config)
+    apply_config(config, hardware)
+
+    print(kd_config.describe(config, hardware))
+
+    if args.print_config:
+        printable = {k: v for k, v in config.items() if k != "_meta"}
+        print("\n--- effective config ---")
+        print(yaml.safe_dump(printable, sort_keys=False, default_flow_style=False))
+        return
+
+    training_cfg = config["training"]
+    gkd_cfg = config["gkd"]
+    lora_cfg = config["lora"]
+
+    max_steps = 2 if args.dry_run else int(training_cfg["max_steps"])
+    eval_every = 1 if args.dry_run else int(training_cfg["benchmark_every"])
+    use_eval = bool(training_cfg["eval_enabled"])
     if args.dry_run:
         print(" MODE: DRY RUN (2 steps, no final save)")
-    print("=" * 78)
 
-    # 1. Tokenizer (shared 49,152-token vocabulary)
-    print("\n[Phase 1] Loading shared tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL_ID)
+    # 1. Tokenizer. Student and teacher must share a vocabulary for standard GKD.
+    print(f"\n[Phase 1] Loading tokenizer from {TOKENIZER_SOURCE}...")
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_SOURCE)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     print(f" -> vocab size {len(tokenizer)}")
@@ -647,11 +746,10 @@ def run(args):
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        r=32,
-        lora_alpha=64,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
+        r=int(lora_cfg["r"]),
+        lora_alpha=int(lora_cfg["alpha"]),
+        lora_dropout=float(lora_cfg["dropout"]),
+        target_modules=list(lora_cfg["target_modules"]),
     )
     student_model = get_peft_model(student_model, lora_config)
     student_model.print_trainable_parameters()
@@ -664,31 +762,34 @@ def run(args):
     # 6. Training configuration
     # NOTE: transformers 5.x removed `warmup_ratio`; `warmup_steps` accepts a float in
     # [0, 1) and is interpreted as a ratio of total steps (see TrainingArguments.get_warmup_steps).
-    save_steps = 1 if args.dry_run else 100
+    save_steps = 1 if args.dry_run else int(training_cfg["save_steps"])
     config_kwargs = dict(
         output_dir=OUTPUT_DIR,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
-        learning_rate=3e-4,
-        lr_scheduler_type="cosine",
-        warmup_steps=0.05,
+        per_device_train_batch_size=int(training_cfg["batch_size"]),
+        gradient_accumulation_steps=int(training_cfg["gradient_accumulation_steps"]),
+        learning_rate=float(training_cfg["learning_rate"]),
+        lr_scheduler_type=str(training_cfg["lr_scheduler_type"]),
+        warmup_steps=training_cfg["warmup"],
         max_steps=max_steps,
-        logging_steps=1,
+        logging_steps=int(training_cfg["logging_steps"]),
         save_steps=save_steps,
         save_strategy="steps",
-        save_total_limit=2,
-        max_grad_norm=1.0,
+        save_total_limit=int(training_cfg["save_total_limit"]),
+        max_grad_norm=float(training_cfg["max_grad_norm"]),
         seed=SEED,
-        lmbda=0.5,
-        beta=0.5,
-        temperature=0.7,
-        max_new_tokens=40,
+        lmbda=float(gkd_cfg["lmbda"]),
+        beta=float(gkd_cfg["beta"]),
+        temperature=float(gkd_cfg["temperature"]),
+        max_new_tokens=int(gkd_cfg["max_new_tokens"]),
         max_length=MAX_TOTAL_TOKENS,
-        seq_kd=False,
+        seq_kd=bool(gkd_cfg["seq_kd"]),
         disable_dropout=True,
-        fp16=False,
-        bf16=False,
-        use_cpu=True,
+        # Device and precision flags come from the resolved hardware layer, so the same
+        # config runs unchanged on CPU, Apple Silicon MPS and CUDA.
+        fp16=HARDWARE["fp16"],
+        bf16=HARDWARE["bf16"],
+        use_cpu=HARDWARE["use_cpu"],
+        dataloader_pin_memory=HARDWARE["pin_memory"],
         report_to=[],
         dataloader_num_workers=0,
     )
@@ -696,7 +797,7 @@ def run(args):
         config_kwargs.update(
             eval_strategy="steps",
             eval_steps=save_steps,
-            per_device_eval_batch_size=1,
+            per_device_eval_batch_size=int(training_cfg["batch_size"]),
         )
 
     training_args = GKDConfig(**config_kwargs)

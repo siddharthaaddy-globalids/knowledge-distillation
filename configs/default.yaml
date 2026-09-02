@@ -1,0 +1,96 @@
+# ---------------------------------------------------------------------------
+# Default distillation config - Windows / Linux, CPU.
+#
+#   python train_scaled.py --config configs/default.yaml
+#
+# Every value here can also be overridden by a KD_* environment variable
+# (see kd_config.ENV_OVERRIDES) without editing this file.
+# ---------------------------------------------------------------------------
+
+project:
+  name: smollm2-distillation
+  output_dir: ./distilled_smollm_scaled
+  seed: 42
+
+models:
+  # Swap these two lines to retarget the whole run.
+  # Student and teacher MUST share a tokenizer vocabulary for standard GKD.
+  student: HuggingFaceTB/SmolLM2-135M-Instruct
+  teacher: HuggingFaceTB/SmolLM2-360M-Instruct
+  # "teacher" | "student" | an explicit hub id or local path
+  tokenizer: teacher
+
+hardware:
+  device: auto        # auto | cpu | mps | cuda
+  dtype: auto         # auto | float32 | bfloat16 | float16
+  threads: 0          # 0 = all cores (CPU only)
+
+dataset:
+  source: HuggingFaceTB/smoltalk
+  max_prompt_tokens: 128
+  max_total_tokens: 384
+  validation_size: 50
+  include_synthetic: true
+  # `quota` is how many samples to keep; `pool` is how many rows to scan to find them.
+  # Long-document domains need a large pool because the prompt-length filter is strict:
+  # only ~2% of smol-summarize prompts fit under 128 tokens.
+  domains:
+    - name: everyday-conversations
+      config: everyday-conversations
+      quota: 320
+      pool: 1800
+    - name: summarization
+      config: smol-summarize
+      quota: 240
+      pool: 14000
+    - name: rewriting
+      config: smol-rewrite
+      quota: 240
+      pool: 2500
+    - name: constraints
+      config: smol-constraints
+      quota: 320
+      pool: 900
+    - name: factual-qa
+      config: openhermes-100k
+      quota: 380
+      pool: 1500
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+training:
+  max_steps: 300
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 3.0e-4
+  lr_scheduler_type: cosine
+  warmup: 0.05          # float < 1 = ratio of total steps; int >= 1 = exact steps
+  max_grad_norm: 1.0
+  logging_steps: 1
+  save_steps: 100
+  save_total_limit: 2
+  eval_enabled: true
+  benchmark_every: 100
+
+gkd:
+  lmbda: 0.5            # on-policy fraction; raise toward 1.0 for more student rollouts
+  beta: 0.5             # generalized JSD interpolation
+  temperature: 0.7
+  max_new_tokens: 40
+  seq_kd: false
+
+benchmark_prompts:
+  - List three states of matter. Use a numbered list.
+  - "Solve for x: 3x + 12 = 27."
+  - Explain why the sky looks blue to human eyes in two sentences.

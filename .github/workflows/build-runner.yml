@@ -1,0 +1,209 @@
+name: Build distillation runner
+
+# Produces `distill.sh` - a self-contained, downloadable runner artifact pinned to the
+# commit it was built from. Download it, edit the teacher/student/dataset at the top,
+# and run it on any machine (Apple Silicon, Linux, CUDA box).
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validate that the configs actually resolve before shipping a runner for them.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate configs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Byte-compile sources
+        run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py
+
+      - name: Resolve every config profile
+        run: |
+          for cfg in configs/*.yaml; do
+            echo "::group::$cfg"
+            uv run python train_scaled.py --config "$cfg" --print-config
+            echo "::endgroup::"
+          done
+
+      - name: Verify CLI and env overrides take effect
+        run: |
+          set -e
+          out=$(KD_MAX_STEPS=777 uv run python train_scaled.py \
+                  --config configs/default.yaml --print-config | grep -E '^ steps')
+          echo "$out" | grep -q 777 || { echo "env override failed: $out"; exit 1; }
+
+          out=$(KD_MAX_STEPS=777 uv run python train_scaled.py \
+                  --config configs/default.yaml --max-steps 55 --print-config | grep -E '^ steps')
+          echo "$out" | grep -q 55 || { echo "CLI precedence failed: $out"; exit 1; }
+
+          out=$(uv run python train_scaled.py --config configs/default.yaml \
+                  --teacher acme/teacher-x --print-config | grep -E '^ teacher')
+          echo "$out" | grep -q 'acme/teacher-x' || { echo "teacher override failed: $out"; exit 1; }
+          echo "override precedence OK"
+
+  # ---------------------------------------------------------------------------
+  # Generate the runner artifact.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build distill.sh
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      sha_short: ${{ steps.meta.outputs.sha_short }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect build metadata
+        id: meta
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Render distill.sh from template
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          SHA_SHORT: ${{ steps.meta.outputs.sha_short }}
+          BUILT_AT: ${{ steps.meta.outputs.built_at }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib
+          template = pathlib.Path("scripts/distill.sh.template").read_text(encoding="utf-8")
+          subs = {
+              "__REPO_URL__":  os.environ["REPO_URL"],
+              "__REPO__":      os.environ["REPO"],
+              "__SHA__":       os.environ["SHA"],
+              "__SHA_SHORT__": os.environ["SHA_SHORT"],
+              "__BUILT_AT__":  os.environ["BUILT_AT"],
+          }
+          for key, value in subs.items():
+              template = template.replace(key, value)
+          missing = [k for k in subs if k in template]
+          if missing:
+              raise SystemExit(f"Unsubstituted placeholders remain: {missing}")
+          out = pathlib.Path("distill.sh")
+          out.write_text(template, encoding="utf-8")
+          out.chmod(0o755)
+          print(f"rendered distill.sh ({out.stat().st_size} bytes)")
+          PY
+
+      - name: Shellcheck the rendered runner
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC2086: intentional word splitting is not used here; keep the check strict
+          # but allow "info"-level style notes so the build is not blocked by nits.
+          shellcheck --severity=warning distill.sh
+
+      - name: Verify it parses, and --help / --version work
+        run: |
+          bash -n distill.sh
+          ./distill.sh --help | grep -q -- '--teacher'
+          ./distill.sh --version | grep -q "${{ github.sha }}" \
+            || ./distill.sh --version | grep -q "${{ steps.meta.outputs.sha_short }}"
+          echo "help/version OK"
+
+      - name: Verify CLI parsing and precedence
+        run: |
+          set -e
+          # Truncate the runner just before it touches the network, then assert on the
+          # values the argument parser resolved.
+          awk '/^#  1\. Platform detection/{exit} {print}' distill.sh > /tmp/parsecheck.sh
+          cat >> /tmp/parsecheck.sh <<'EOF'
+          echo "teacher=$TEACHER_MODEL"
+          echo "student=$STUDENT_MODEL"
+          echo "dataset=$DATASET"
+          echo "steps=$MAX_STEPS"
+          EOF
+
+          expect() { echo "$1" | grep -qx "$2" || { echo "FAIL: expected '$2' in:"; echo "$1"; exit 1; }; }
+
+          out=$(bash /tmp/parsecheck.sh --teacher a/T --student a/S --dataset a/D --steps 600)
+          expect "$out" "teacher=a/T"; expect "$out" "student=a/S"
+          expect "$out" "dataset=a/D"; expect "$out" "steps=600"
+
+          out=$(bash /tmp/parsecheck.sh -t s/T -s s/S -d s/D)
+          expect "$out" "teacher=s/T"; expect "$out" "student=s/S"; expect "$out" "dataset=s/D"
+
+          out=$(bash /tmp/parsecheck.sh --teacher=eq/T --steps=42)
+          expect "$out" "teacher=eq/T"; expect "$out" "steps=42"
+
+          # CLI must win over the KD_* environment fallback
+          out=$(KD_TEACHER_MODEL=env/T KD_MAX_STEPS=123 bash /tmp/parsecheck.sh)
+          expect "$out" "teacher=env/T"; expect "$out" "steps=123"
+          out=$(KD_TEACHER_MODEL=env/T KD_MAX_STEPS=123 bash /tmp/parsecheck.sh --teacher cli/T --steps 777)
+          expect "$out" "teacher=cli/T"; expect "$out" "steps=777"
+          echo "parsing + precedence OK"
+
+      - name: Verify bad input is rejected
+        run: |
+          set -e
+          fails() {
+            if ./distill.sh "$@" >/dev/null 2>&1; then
+              echo "FAIL: '$*' should have been rejected"; exit 1
+            fi
+          }
+          fails --device gpu
+          fails --dtype int8
+          fails --steps abc
+          fails --profile nope
+          fails --teacher
+          fails --bogus
+          fails stray-arg
+          echo "validation OK"
+
+      - name: Upload runner artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: distill-runner-${{ steps.meta.outputs.sha_short }}
+          path: |
+            distill.sh
+            configs/
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Attach runner to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: distill.sh
+
+      - name: Job summary
+        run: |
+          {
+            echo "### Distillation runner built"
+            echo
+            echo "**Artifact:** \`distill-runner-${{ steps.meta.outputs.sha_short }}\`"
+            echo "**Pinned to:** \`${{ github.sha }}\`"
+            echo
+            echo '```bash'
+            echo "unzip distill-runner-${{ steps.meta.outputs.sha_short }}.zip"
+            echo "chmod +x distill.sh"
+            echo "./distill.sh --help      # all options"
+            echo "./distill.sh --check     # verify hardware + resolved config"
+            echo "./distill.sh --teacher HuggingFaceTB/SmolLM2-1.7B-Instruct"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
