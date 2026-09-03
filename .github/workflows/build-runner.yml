@@ -188,6 +188,29 @@ jobs:
 
       - name: Verify the comparison UI entrypoint
         run: |
+          # A function-local import of a name already imported at module scope makes
+          # that name local to the WHOLE function, so any earlier use in the same
+          # function raises UnboundLocalError. This shipped once and broke the
+          # distilled-student column while the teacher column loaded fine.
+          uv run python - <<'PY'
+          import ast
+          tree = ast.parse(open("app.py", encoding="utf-8").read())
+          module_names = set()
+          for n in tree.body:
+              if isinstance(n, (ast.Import, ast.ImportFrom)):
+                  for a in n.names:
+                      module_names.add(a.asname or a.name.split(".")[0])
+          bad = []
+          for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+              for n in ast.walk(fn):
+                  if isinstance(n, (ast.Import, ast.ImportFrom)):
+                      for a in n.names:
+                          name = a.asname or a.name.split(".")[0]
+                          if name in module_names:
+                              bad.append(f"{fn.name}() re-imports module-level {name!r}")
+          assert not bad, bad
+          print("no shadowing local imports")
+          PY
           uv run python app.py --help | grep -q -- '--adapter'
           uv run python app.py --help | grep -q -- '--port'
           uv run python app.py --list-adapters

@@ -241,7 +241,9 @@ def load_all_models():
             # here means the reference column shows the fine-tuned teacher that
             # was actually distilled from, not the generic base.
             print(f" -> merging teacher adapter: {TEACHER_ADAPTER_PATH}")
-            from peft import PeftModel
+            # PeftModel is imported at module scope. Re-importing it here would
+            # make the name function-local for the WHOLE function, so the earlier
+            # student-adapter call above would raise UnboundLocalError.
             teacher = PeftModel.from_pretrained(teacher, TEACHER_ADAPTER_PATH)
             teacher = teacher.merge_and_unload()
             teacher.eval()
