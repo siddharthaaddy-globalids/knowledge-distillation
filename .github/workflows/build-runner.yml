@@ -38,7 +38,7 @@ jobs:
         run: uv sync
 
       - name: Byte-compile sources
-        run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py check_teacher.py fix_teacher.py convert_mlx_adapter.py
+        run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py check_teacher.py fix_teacher.py convert_mlx_adapter.py publish_model.py
 
       - name: Verify apply_config binds every name it assigns
         run: |
@@ -401,6 +401,7 @@ jobs:
           fails --profile nope
           fails --teacher
           fails --teacher-adapter
+          fails --publish
           fails --bogus
           fails stray-arg
           fails --ui --port abc

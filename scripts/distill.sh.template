@@ -42,6 +42,7 @@ LMBDA="${KD_LMBDA:-}"
 
 CONFIG_PROFILE=""                    # blank = auto (Apple Silicon -> mac)
 PROFILE_EXPLICIT=0                   # 1 once --profile is given on the CLI
+PUBLISH_REPO=""                      # target repo for --publish
 MODE="train"
 
 UI_PORT="${KD_UI_PORT:-7860}"
@@ -150,6 +151,12 @@ MODES
                           adapter into PEFT format so --teacher-adapter can
                           load it. Needs --teacher-adapter to name the MLX
                           adapter. Renames and transposes only; no retraining.
+      --publish REPO      Publish the trained adapter to REPO-lora and a merged
+                          ready-to-run model to REPO on the Hugging Face Hub.
+                          The merge is done by transformers, so the checkpoint
+                          uses canonical tensor names. Verifies the merged model
+                          generates language before uploading anything.
+                          Needs `hf auth login` or HF_TOKEN.
       --smoke             2-step end-to-end validation (~1 min)
       --ui                Launch the side-by-side comparison web UI
                           (original vs distilled vs teacher) instead of training
@@ -272,6 +279,8 @@ while [ $# -gt 0 ]; do
     --check)          MODE="check"; shift ;;
     --check-teacher)  MODE="check-teacher"; shift ;;
     --fix-teacher)    MODE="fix-teacher"; shift ;;
+    --publish)        need_val "$1" $#; MODE="publish"; PUBLISH_REPO="$2"; shift 2 ;;
+    --publish=*)      MODE="publish"; PUBLISH_REPO="${1#*=}"; shift ;;
     --convert-adapter) MODE="convert-adapter"; shift ;;
     --smoke)          MODE="smoke"; shift ;;
     --ui)             MODE="ui"; shift ;;
@@ -449,6 +458,25 @@ case "$MODE" in
     ok "   Verify it against the base model, then train:"
     ok "     ./distill.sh --teacher <base> --teacher-adapter $CONV_OUT --check-teacher"
     ok "     ./distill.sh --teacher <base> --teacher-adapter $CONV_OUT"
+    echo
+    ;;
+  publish)
+    log "Publishing to the Hugging Face Hub: $PUBLISH_REPO"
+    PUB_ARGS="--repo $PUBLISH_REPO --config $CONFIG_FILE"
+    [ -n "$ADAPTER_DIR" ] && PUB_ARGS="$PUB_ARGS --adapter $ADAPTER_DIR"
+    [ -n "$DTYPE" ] && [ "$DTYPE" != "auto" ] && PUB_ARGS="$PUB_ARGS --dtype $DTYPE"
+    set +e
+    # shellcheck disable=SC2086  # PUB_ARGS is intentionally word-split into flags
+    uv run python publish_model.py $PUB_ARGS
+    PUB_RC=$?
+    set -e
+    if [ "$PUB_RC" -ne 0 ]; then
+      banner_bad "publish failed (exit $PUB_RC)"
+      exit "$PUB_RC"
+    fi
+    banner_ok "published to the Hugging Face Hub"
+    ok "   adapter : $PUBLISH_REPO-lora"
+    ok "   merged  : $PUBLISH_REPO"
     echo
     ;;
   fix-teacher)
