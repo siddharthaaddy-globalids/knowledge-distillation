@@ -137,6 +137,10 @@ MODES
                           and whether its output is actually language.
                           A broken teacher yields a broken student, because GKD
                           trains the student to match the teacher's distribution.
+      --fix-teacher       Repair a merged checkpoint whose tensor keys do not
+                          match its architecture, by renaming them to what the
+                          model asks for. No retraining and no GPU. Writes a
+                          repaired copy and prints the --teacher flag to use.
       --smoke             2-step end-to-end validation (~1 min)
       --ui                Launch the side-by-side comparison web UI
                           (original vs distilled vs teacher) instead of training
@@ -157,6 +161,9 @@ EXAMPLES
 
   # Verify the teacher before spending a training budget on it
   ./distill.sh --profile finance --check-teacher
+
+  # Teacher failed --check-teacher because its keys are mislabelled? Repair it
+  ./distill.sh --profile finance --fix-teacher
 
   # Teacher as base + LoRA adapter, instead of a merged checkpoint
   ./distill.sh --teacher Qwen/Qwen3.5-2B --teacher-adapter ./lora_model
@@ -248,6 +255,7 @@ while [ $# -gt 0 ]; do
 
     --check)          MODE="check"; shift ;;
     --check-teacher)  MODE="check-teacher"; shift ;;
+    --fix-teacher)    MODE="fix-teacher"; shift ;;
     --smoke)          MODE="smoke"; shift ;;
     --ui)             MODE="ui"; shift ;;
     --shell)          MODE="shell"; shift ;;
@@ -394,6 +402,31 @@ case "$MODE" in
     ok "   Next: ./distill.sh --profile $CONFIG_PROFILE --check-teacher"
     echo
     ;;
+  fix-teacher)
+    # The repaired copy lives beside the checkout so it survives across runs and
+    # is addressable by absolute path from anywhere.
+    FIXED_DIR="$WORKDIR/teacher-fixed"
+    log "Repairing the teacher checkpoint into $FIXED_DIR"
+    log "  (renames tensors to match the architecture; no retraining, no GPU)"
+    set +e
+    uv run python fix_teacher.py --config "$CONFIG_FILE" --out "$FIXED_DIR" --force
+    FIX_RC=$?
+    set -e
+    if [ "$FIX_RC" -ne 0 ]; then
+      banner_bad "could not repair the checkpoint (exit $FIX_RC)"
+      bad "   The weights may genuinely be incomplete rather than mislabelled."
+      bad "   If you still have the LoRA adapter from training, use it instead:"
+      bad "     ./distill.sh --teacher <base-model> --teacher-adapter <adapter> --check-teacher"
+      exit "$FIX_RC"
+    fi
+    banner_ok "teacher checkpoint repaired"
+    ok "   output : $FIXED_DIR"
+    echo
+    ok "   Verify it, then train against it:"
+    ok "     ./distill.sh --profile $CONFIG_PROFILE --teacher $FIXED_DIR --check-teacher"
+    ok "     ./distill.sh --profile $CONFIG_PROFILE --teacher $FIXED_DIR"
+    echo
+    ;;
   check-teacher)
     log "Verifying the teacher (loads the teacher only, not the student)"
     CT_ARGS="--config $CONFIG_FILE"
@@ -407,6 +440,8 @@ case "$MODE" in
     if [ "$CT_RC" -ne 0 ]; then
       banner_bad "teacher is not fit to distil from (exit $CT_RC)"
       bad "   Distilling from it would produce a broken student."
+      bad "   If the weights are present but mislabelled, repair them:"
+      bad "     ./distill.sh --profile $CONFIG_PROFILE --fix-teacher"
       bad "   If the teacher was trained as a LoRA adapter, point at the base model"
       bad "   and merge the adapter instead of using a merged export:"
       bad "     ./distill.sh --teacher <base> --teacher-adapter <adapter> --check-teacher"

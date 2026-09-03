@@ -38,7 +38,7 @@ jobs:
         run: uv sync
 
       - name: Byte-compile sources
-        run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py check_teacher.py
+        run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py check_teacher.py fix_teacher.py
 
       - name: Resolve every config profile
         run: |
@@ -79,6 +79,32 @@ jobs:
           out=$(uv run python train_scaled.py --config configs/finance.yaml                   --teacher-adapter cli/A --print-config)
           echo "$out" | grep -q 'cli/A' || { echo "adapter CLI override failed"; exit 1; }
           echo "teacher checker OK"
+
+      - name: Verify the checkpoint repair tool
+        run: |
+          uv run python fix_teacher.py --help | grep -q -- '--dry-run'
+          # The key remapping must reconcile a VL-style export against a
+          # text-only architecture without touching the network.
+          uv run python - <<'PY'
+          import importlib.util as u
+          spec = u.spec_from_file_location("ft", "fix_teacher.py")
+          m = u.module_from_spec(spec); spec.loader.exec_module(m)
+          have, want = set(), set()
+          for i in range(24):
+              have.add(f"language_model.model.layers.{i}.mlp.up_proj.weight")
+              want.add(f"model.layers.{i}.mlp.up_proj.weight")
+              have.add(f"vision_tower.blocks.{i}.attn.qkv.weight")
+          have.add("language_model.model.embed_tokens.weight")
+          want.add("model.embed_tokens.weight")
+          want.add("lm_head.weight")
+          mapping, label = m.build_mapping(have, want)
+          assert mapping, label
+          mapped = set(mapping.values())
+          assert mapped & want == want - {"lm_head.weight"}, sorted(want - mapped)
+          assert not [k for k in mapping if k.startswith(m.DROP_PREFIXES)], "vision kept"
+          print("remap OK:", label)
+          PY
+          echo "repair tool OK"
 
       - name: Verify the comparison UI entrypoint
         run: |
@@ -233,6 +259,8 @@ jobs:
           # Teacher verification mode and the adapter flag
           out=$(bash /tmp/parsecheck.sh --check-teacher)
           expect "$out" "mode=check-teacher"
+          out=$(bash /tmp/parsecheck.sh --fix-teacher)
+          expect "$out" "mode=fix-teacher"
           out=$(bash /tmp/parsecheck.sh --teacher Q/B --teacher-adapter ./lora)
           expect "$out" "teacher=Q/B"; expect "$out" "adapter=./lora"
           out=$(bash /tmp/parsecheck.sh --teacher-adapter=eq/A)
@@ -294,6 +322,7 @@ jobs:
             echo "./distill.sh --help      # all options"
             echo "./distill.sh --check          # verify hardware + resolved config"
             echo "./distill.sh --check-teacher  # verify the teacher is fit to distil from"
+            echo "./distill.sh --fix-teacher    # repair a mislabelled checkpoint"
             echo "./distill.sh --teacher HuggingFaceTB/SmolLM2-1.7B-Instruct"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
