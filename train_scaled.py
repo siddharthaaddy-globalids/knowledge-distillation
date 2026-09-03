@@ -74,6 +74,7 @@ BENCHMARK_PROMPTS = []
 def apply_config(config, hardware):
     """Bind the resolved config and hardware onto the module globals."""
     global CONFIG, HARDWARE, STUDENT_MODEL_ID, TEACHER_MODEL_ID, TOKENIZER_SOURCE
+    global TEACHER_ADAPTER
     global OUTPUT_DIR, ADAPTER_DIR, DEVICE, COMPUTE_DTYPE, SEED
     global MAX_PROMPT_TOKENS, MAX_TOTAL_TOKENS, VALIDATION_SIZE
     global DATASET_SOURCE, DATASET_DOMAINS, INCLUDE_SYNTHETIC, BENCHMARK_PROMPTS

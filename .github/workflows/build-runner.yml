@@ -40,6 +40,40 @@ jobs:
       - name: Byte-compile sources
         run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py check_teacher.py fix_teacher.py
 
+      - name: Verify apply_config binds every name it assigns
+        run: |
+          uv run python - <<'PY'
+          import ast
+          # A name assigned in apply_config but not declared global stays a local,
+          # so run() later dies with NameError - and only once it reaches that
+          # line, i.e. after the dataset build and the teacher download.
+          tree = ast.parse(open("train_scaled.py", encoding="utf-8").read())
+          fn = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == "apply_config")
+          declared = {nm for n in ast.walk(fn) if isinstance(n, ast.Global) for nm in n.names}
+          assigned = {t.id for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                      for t in n.targets if isinstance(t, ast.Name)}
+          local_only = {"tokenizer_choice", "dataset_cfg"}
+          leaked = assigned - declared - local_only
+          assert not leaked, f"assigned but not declared global: {sorted(leaked)}"
+          print(f"apply_config OK: {len(declared)} globals bound")
+          PY
+
+          # And they must actually be set on the module after a real call.
+          uv run python - <<'PY'
+          import importlib.util as u
+          from kd_config import load_config, resolve_device
+          spec = u.spec_from_file_location("ts", "train_scaled.py")
+          m = u.module_from_spec(spec); spec.loader.exec_module(m)
+          for cfg in ("configs/smoke.yaml", "configs/qwen-poc.yaml"):
+              c = load_config(cfg)
+              m.apply_config(c, resolve_device(c))
+              for name in ("TEACHER_MODEL_ID", "TEACHER_ADAPTER", "STUDENT_MODEL_ID",
+                           "OUTPUT_DIR", "BENCHMARK_PROMPTS"):
+                  assert hasattr(m, name), f"{name} not bound after apply_config({cfg})"
+          print("module globals bound OK")
+          PY
+
       - name: Resolve every config profile
         run: |
           for cfg in configs/*.yaml; do
@@ -249,6 +283,8 @@ jobs:
           echo "steps=$MAX_STEPS"
           echo "mode=$MODE"
           echo "adapter=$TEACHER_ADAPTER"
+          echo "profile=$CONFIG_PROFILE"
+          echo "explicit=$PROFILE_EXPLICIT"
           echo "port=$UI_PORT"
           echo "host=$UI_HOST"
           EOF
@@ -289,6 +325,13 @@ jobs:
           out=$(bash /tmp/parsecheck.sh --teacher-adapter=eq/A)
           expect "$out" "adapter=eq/A"
           out=$(bash /tmp/parsecheck.sh); expect "$out" "adapter="
+
+          # --smoke must not clobber an explicitly requested profile, or the
+          # projected run time would describe a different model pair entirely.
+          out=$(bash /tmp/parsecheck.sh --smoke)
+          expect "$out" "explicit=0"
+          out=$(bash /tmp/parsecheck.sh --profile qwen-poc --smoke)
+          expect "$out" "explicit=1"; expect "$out" "profile=qwen-poc"
 
           # UI mode and its options
           out=$(bash /tmp/parsecheck.sh); expect "$out" "mode=train"

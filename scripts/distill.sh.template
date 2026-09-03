@@ -41,6 +41,7 @@ LORA_ALPHA="${KD_LORA_ALPHA:-}"
 LMBDA="${KD_LMBDA:-}"
 
 CONFIG_PROFILE=""                    # blank = auto (Apple Silicon -> mac)
+PROFILE_EXPLICIT=0                   # 1 once --profile is given on the CLI
 MODE="train"
 
 UI_PORT="${KD_UI_PORT:-7860}"
@@ -249,8 +250,8 @@ while [ $# -gt 0 ]; do
 
     -o|--output)      need_val "$1" $#; OUTPUT_DIR="$2"; shift 2 ;;
     --output=*)       OUTPUT_DIR="${1#*=}"; shift ;;
-    -p|--profile)     need_val "$1" $#; CONFIG_PROFILE="$2"; shift 2 ;;
-    --profile=*)      CONFIG_PROFILE="${1#*=}"; shift ;;
+    -p|--profile)     need_val "$1" $#; CONFIG_PROFILE="$2"; PROFILE_EXPLICIT=1; shift 2 ;;
+    --profile=*)      CONFIG_PROFILE="${1#*=}"; PROFILE_EXPLICIT=1; shift ;;
 
     --port)           need_val "$1" $#; UI_PORT="$2"; shift 2 ;;
     --port=*)         UI_PORT="${1#*=}"; shift ;;
@@ -315,7 +316,12 @@ fi
 if [ -z "$CONFIG_PROFILE" ]; then
   if [ "$IS_APPLE_SILICON" -eq 1 ]; then CONFIG_PROFILE="mac"; else CONFIG_PROFILE="default"; fi
 fi
-[ "$MODE" = "smoke" ] && CONFIG_PROFILE="smoke"
+# --smoke defaults to the tiny smoke profile, but ONLY when no profile was asked
+# for. Overriding an explicit --profile would measure a different model pair than
+# the one about to be trained, making the projected run time meaningless.
+if [ "$MODE" = "smoke" ] && [ "$PROFILE_EXPLICIT" -eq 0 ]; then
+  CONFIG_PROFILE="smoke"
+fi
 log "Config profile: $CONFIG_PROFILE"
 
 # ---------------------------------------------------------------------------
