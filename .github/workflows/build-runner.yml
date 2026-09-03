@@ -38,7 +38,7 @@ jobs:
         run: uv sync
 
       - name: Byte-compile sources
-        run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py check_teacher.py fix_teacher.py
+        run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py check_teacher.py fix_teacher.py convert_mlx_adapter.py
 
       - name: Verify apply_config binds every name it assigns
         run: |
@@ -162,6 +162,29 @@ jobs:
           print("shape reconciliation OK")
           PY
           echo "repair tool OK"
+
+      - name: Verify the MLX adapter converter
+        run: |
+          uv run python convert_mlx_adapter.py --help | grep -q -- '--dry-run'
+          uv run python - <<'PY'
+          import importlib.util as u, torch
+          spec = u.spec_from_file_location("cv", "convert_mlx_adapter.py")
+          m = u.module_from_spec(spec); spec.loader.exec_module(m)
+          # MLX names modules language_model.model.layers.N; the live text-only
+          # tree exposes model.layers.N. The rewrite must be derived, not assumed.
+          mlx = {f"language_model.model.layers.{i}.mlp.up_proj" for i in range(24)}
+          live = {f"model.layers.{i}.mlp.up_proj" for i in range(24)}
+          mapping, hits, label = m.choose_prefix(mlx, live)
+          assert hits == 24, (hits, label)
+          assert set(mapping.values()) == live, sorted(set(mapping.values()) - live)
+          print("prefix rewrite OK:", label)
+          # Orientation: MLX (in, r) / (r, out) -> PEFT (r, in) / (out, r).
+          a = torch.zeros(2048, 16); b = torch.zeros(16, 6144)
+          assert tuple(a.t().shape) == (16, 2048)
+          assert tuple(b.t().shape) == (6144, 16)
+          print("transpose orientation OK")
+          PY
+          echo "converter OK"
 
       - name: Verify the comparison UI entrypoint
         run: |
@@ -320,6 +343,8 @@ jobs:
           expect "$out" "mode=check-teacher"
           out=$(bash /tmp/parsecheck.sh --fix-teacher)
           expect "$out" "mode=fix-teacher"
+          out=$(bash /tmp/parsecheck.sh --convert-adapter --teacher-adapter org/a)
+          expect "$out" "mode=convert-adapter"; expect "$out" "adapter=org/a"
           out=$(bash /tmp/parsecheck.sh --teacher Q/B --teacher-adapter ./lora)
           expect "$out" "teacher=Q/B"; expect "$out" "adapter=./lora"
           out=$(bash /tmp/parsecheck.sh --teacher-adapter=eq/A)

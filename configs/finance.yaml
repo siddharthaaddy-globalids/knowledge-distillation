@@ -20,7 +20,15 @@ project:
   seed: 42
 
 models:
-  teacher: siddhartha-addy-globalids-labs/qwen3.5-2b-finance-alpaca-lora
+  # The MERGED export. The sibling repo with the -lora suffix holds an MLX-format
+  # adapter (lora_parameters/keys schema, adapters.safetensors), which PEFT
+  # cannot load - so teacher_adapter is not an option for it.
+  #
+  # This checkpoint uses MLX/unsloth key naming rather than the layout
+  # transformers 5.x expects, so it must be repaired before use:
+  #     ./distill.sh --profile finance --fix-teacher
+  # then point --teacher at the repaired copy.
+  teacher: siddhartha-addy-globalids-labs/qwen3.5-2b-finance-alpaca
   student: Qwen/Qwen3.5-0.8B
   # If the teacher is a base model plus a LoRA adapter rather than a merged
   # checkpoint, set `teacher` to the base and name the adapter here; it is merged

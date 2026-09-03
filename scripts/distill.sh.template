@@ -146,6 +146,10 @@ MODES
                           match its architecture, by renaming them to what the
                           model asks for. No retraining and no GPU. Writes a
                           repaired copy and prints the --teacher flag to use.
+      --convert-adapter   Convert an MLX-LM / unsloth-on-Apple-Silicon LoRA
+                          adapter into PEFT format so --teacher-adapter can
+                          load it. Needs --teacher-adapter to name the MLX
+                          adapter. Renames and transposes only; no retraining.
       --smoke             2-step end-to-end validation (~1 min)
       --ui                Launch the side-by-side comparison web UI
                           (original vs distilled vs teacher) instead of training
@@ -172,6 +176,10 @@ EXAMPLES
 
   # Known-good proof-of-concept run, in bfloat16 to fit comfortably in 16GB
   ./distill.sh --profile qwen-poc --dtype bfloat16
+
+  # unsloth trained on a Mac writes MLX adapters; convert, then use
+  ./distill.sh --teacher-adapter <org>/<mlx-lora> --convert-adapter
+  ./distill.sh --teacher Qwen/Qwen3.5-2B --teacher-adapter ~/peft-adapter --check-teacher
 
   # Teacher as base + LoRA adapter, instead of a merged checkpoint
   ./distill.sh --teacher Qwen/Qwen3.5-2B --teacher-adapter ./lora_model
@@ -264,6 +272,7 @@ while [ $# -gt 0 ]; do
     --check)          MODE="check"; shift ;;
     --check-teacher)  MODE="check-teacher"; shift ;;
     --fix-teacher)    MODE="fix-teacher"; shift ;;
+    --convert-adapter) MODE="convert-adapter"; shift ;;
     --smoke)          MODE="smoke"; shift ;;
     --ui)             MODE="ui"; shift ;;
     --shell)          MODE="shell"; shift ;;
@@ -413,6 +422,33 @@ case "$MODE" in
     esac
     echo
     ok "   Next: ./distill.sh --profile $CONFIG_PROFILE --check-teacher"
+    echo
+    ;;
+  convert-adapter)
+    if [ -z "$TEACHER_ADAPTER" ]; then
+      die "--convert-adapter needs --teacher-adapter <mlx-adapter-repo-or-dir>"
+    fi
+    CONV_OUT="$WORKDIR/peft-adapter"
+    log "Converting MLX adapter to PEFT format"
+    log "  from : $TEACHER_ADAPTER"
+    log "  to   : $CONV_OUT"
+    set +e
+    CONV_ARGS="--adapter $TEACHER_ADAPTER --out $CONV_OUT --force"
+    [ -n "$TEACHER_MODEL" ] && CONV_ARGS="$CONV_ARGS --base $TEACHER_MODEL"
+    # shellcheck disable=SC2086  # CONV_ARGS is intentionally word-split into flags
+    uv run python convert_mlx_adapter.py $CONV_ARGS
+    CONV_RC=$?
+    set -e
+    if [ "$CONV_RC" -ne 0 ]; then
+      banner_bad "adapter conversion failed (exit $CONV_RC)"
+      exit "$CONV_RC"
+    fi
+    banner_ok "adapter converted to PEFT format"
+    ok "   output : $CONV_OUT"
+    echo
+    ok "   Verify it against the base model, then train:"
+    ok "     ./distill.sh --teacher <base> --teacher-adapter $CONV_OUT --check-teacher"
+    ok "     ./distill.sh --teacher <base> --teacher-adapter $CONV_OUT"
     echo
     ;;
   fix-teacher)
