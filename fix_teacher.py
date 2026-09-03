@@ -26,7 +26,9 @@ Afterwards, verify and use the repaired copy:
 """
 
 import argparse
+import itertools
 import json
+import math
 import pathlib
 import shutil
 import sys
@@ -95,17 +97,53 @@ def load_all_tensors(src):
 
 
 def expected_keys(src):
-    """Build the architecture from its config and report the names it wants.
+    """Build the architecture from its config and report the tensors it wants.
 
-    This is the authoritative list: it is what `from_pretrained` reported as
-    MISSING. Building the skeleton on the meta device costs no memory.
+    Returns {name: shape}. This is the authoritative list - it is exactly what
+    `from_pretrained` reports as MISSING or MISMATCH. Building the skeleton on
+    the meta device allocates no memory.
     """
     config = AutoConfig.from_pretrained(src)
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config)
-    names = set(dict(model.named_parameters())) | set(dict(model.named_buffers()))
+    shapes = {n: tuple(t.shape) for n, t in model.named_parameters()}
+    shapes.update({n: tuple(t.shape) for n, t in model.named_buffers()})
     tied = bool(getattr(config, "tie_word_embeddings", False))
-    return names, tied, type(model).__name__
+    return shapes, tied, type(model).__name__
+
+
+def reconcile_shape(tensor, expected):
+    """Return (tensor, note) reshaped to `expected`, or (None, reason) if unsafe.
+
+    Frameworks disagree about axis order for some tensors - notably the depthwise
+    conv in linear attention, stored as (channels, kernel, 1) by some exporters and
+    (channels, 1, kernel) by transformers. When the two shapes are a permutation of
+    each other and every axis that moves is a singleton, the swap is a pure memory
+    reshape: no element is reordered, so it is lossless.
+
+    A permutation between two non-singleton axes is a genuine transpose. That may
+    still be right, but it cannot be verified from shape alone, so it is flagged.
+    """
+    have = tuple(tensor.shape)
+    expected = tuple(expected)
+    if have == expected:
+        return tensor, None
+    if tensor.numel() != math.prod(expected):
+        return None, f"element count differs ({tensor.numel()} vs {math.prod(expected)})"
+    if sorted(have) != sorted(expected):
+        return None, f"shapes are not a permutation ({have} vs {expected})"
+
+    # A permutation is a pure reshape - element order untouched - exactly when the
+    # non-singleton axes keep their relative order. Only the singleton axes move,
+    # so nothing is reordered and the change is lossless.
+    if [d for d in have if d != 1] == [d for d in expected if d != 1]:
+        return tensor.reshape(expected).contiguous(), f"axis swap {have} -> {expected}"
+
+    for perm in itertools.permutations(range(tensor.ndim)):
+        if tuple(have[i] for i in perm) == expected:
+            return (tensor.permute(*perm).contiguous(),
+                    f"TRANSPOSE {have} -> {expected} (reorders elements; verify output)")
+    return None, f"no permutation maps {have} to {expected}"
 
 
 def build_mapping(have, want):
@@ -162,7 +200,8 @@ def main():
           f"{total_bytes / 1e9:.2f} GB")
 
     print("\n[3/5] Building the architecture to learn what it expects...")
-    want, tied, cls = expected_keys(src)
+    want_shapes, tied, cls = expected_keys(src)
+    want = set(want_shapes)
     print(f" -> {cls} expects {len(want)} tensors"
           + (" (lm_head tied to embeddings)" if tied else ""))
 
@@ -186,6 +225,42 @@ def main():
         print(f"    ... and {len(renamed) - 4} more")
 
     out_tensors = {mapping[k]: v for k, v in tensors.items() if k in mapping}
+
+    # Names now line up; shapes may not. A checkpoint tensor whose axes are
+    # ordered differently loads as MISMATCH and gets silently reinitialised,
+    # which is the same failure as a missing weight.
+    fixed_shapes, flagged, unfixable = [], [], []
+    for name in sorted(out_tensors):
+        if name not in want_shapes:
+            continue
+        adjusted, note = reconcile_shape(out_tensors[name], want_shapes[name])
+        if note is None:
+            continue
+        if adjusted is None:
+            unfixable.append((name, note))
+        else:
+            out_tensors[name] = adjusted
+            (flagged if note.startswith("TRANSPOSE") else fixed_shapes).append((name, note))
+
+    if fixed_shapes:
+        print(f"\n  shape fixes : {len(fixed_shapes)} tensor(s) had their axes reordered")
+        print(f"    {fixed_shapes[0][0]}\n      {fixed_shapes[0][1]}")
+        if len(fixed_shapes) > 1:
+            print(f"    ... and {len(fixed_shapes) - 1} more of the same form")
+    if flagged:
+        print(f"\n  ! {len(flagged)} tensor(s) needed a non-trivial transpose:")
+        for name, note in flagged[:4]:
+            print(f"    {name}: {note}")
+    if unfixable:
+        print(f"\n  ! {len(unfixable)} tensor(s) have irreconcilable shapes:")
+        for name, note in unfixable[:4]:
+            print(f"    {name}: {note}")
+        if not args.force:
+            raise SystemExit(
+                "\nRefusing to write a checkpoint transformers would reinitialise. "
+                "Re-run with --force to write it anyway."
+            )
+
     still_missing = want - set(out_tensors)
     ignorable = {"lm_head.weight"} if tied else set()
     real_missing = {k for k in still_missing
@@ -233,7 +308,8 @@ def main():
     print("\n" + bar)
     print("  ALL OK - checkpoint repaired")
     print(bar)
-    print(f"   tensors : {len(out_tensors)} written, {len(dropped)} dropped")
+    print(f"   tensors : {len(out_tensors)} written, {len(dropped)} dropped"
+          + (f", {len(fixed_shapes)} reshaped" if fixed_shapes else ""))
     print(f"   output  : {out}")
     print()
     print("   Verify it, then train against it:")

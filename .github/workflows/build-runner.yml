@@ -103,6 +103,25 @@ jobs:
           assert mapped & want == want - {"lm_head.weight"}, sorted(want - mapped)
           assert not [k for k in mapping if k.startswith(m.DROP_PREFIXES)], "vision kept"
           print("remap OK:", label)
+
+          # Axis-order reconciliation. The depthwise conv in linear attention is
+          # exported as (channels, kernel, 1) by some frameworks and wanted as
+          # (channels, 1, kernel); that swap must be recognised as lossless.
+          import torch
+          t = torch.arange(24, dtype=torch.float32).reshape(6, 4, 1)
+          out, note = m.reconcile_shape(t, (6, 1, 4))
+          assert tuple(out.shape) == (6, 1, 4), out.shape
+          assert torch.equal(out.flatten(), t.flatten()), "reshape reordered elements"
+          assert note.startswith("axis swap"), note
+          # A real transpose must be flagged, not silently applied as lossless.
+          _, note = m.reconcile_shape(torch.zeros(3, 4), (4, 3))
+          assert note.startswith("TRANSPOSE"), note
+          # Irreconcilable shapes must be refused.
+          assert m.reconcile_shape(torch.zeros(3, 4), (5, 5))[0] is None
+          assert m.reconcile_shape(torch.zeros(2, 6), (3, 4))[0] is None
+          # A matching shape is a no-op.
+          assert m.reconcile_shape(torch.zeros(3, 4), (3, 4))[1] is None
+          print("shape reconciliation OK")
           PY
           echo "repair tool OK"
 
