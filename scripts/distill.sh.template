@@ -126,8 +126,12 @@ TRAINING
       --lmbda F           On-policy fraction 0.0-1.0; raise toward 1.0 for
                           more student rollouts corrected by the teacher
   -o, --output DIR        Output directory (default: from profile)
-  -p, --profile NAME      Config profile: default | mac | smoke | finance
+  -p, --profile NAME      Config profile:
+                            default | mac | smoke | finance | qwen-poc
                           (default: auto-selected from platform)
+                          qwen-poc = Qwen3.5-2B -> Qwen3.5-0.8B on finance-alpaca.
+                          A known-good pairing for proving the pipeline; pair it
+                          with --dtype bfloat16 to halve the memory footprint.
 
 MODES
       --check             Resolve config and hardware, print, and exit.
@@ -164,6 +168,9 @@ EXAMPLES
 
   # Teacher failed --check-teacher because its keys are mislabelled? Repair it
   ./distill.sh --profile finance --fix-teacher
+
+  # Known-good proof-of-concept run, in bfloat16 to fit comfortably in 16GB
+  ./distill.sh --profile qwen-poc --dtype bfloat16
 
   # Teacher as base + LoRA adapter, instead of a merged checkpoint
   ./distill.sh --teacher Qwen/Qwen3.5-2B --teacher-adapter ./lora_model
@@ -277,7 +284,7 @@ case "$DTYPE"  in ''|auto|float32|bfloat16|float16) ;; *) die "--dtype must be a
 [ -n "$MAX_STEPS" ] && case "$MAX_STEPS" in *[!0-9]*) die "--steps must be a positive integer (got '$MAX_STEPS')" ;; esac
 case "$UI_PORT"  in ''|*[!0-9]*) die "--port must be a positive integer (got '$UI_PORT')" ;; esac
 [ -n "$CONFIG_PROFILE" ] && case "$CONFIG_PROFILE" in
-  default|mac|smoke|finance) ;; *) die "--profile must be default|mac|smoke|finance (got '$CONFIG_PROFILE')" ;;
+  default|mac|smoke|finance|qwen-poc) ;; *) die "--profile must be default|mac|smoke|finance|qwen-poc (got '$CONFIG_PROFILE')" ;;
 esac
 
 # ---------------------------------------------------------------------------

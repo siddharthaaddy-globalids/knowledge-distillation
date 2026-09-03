@@ -1,0 +1,139 @@
+# ---------------------------------------------------------------------------
+# Proof-of-concept distillation - Qwen3.5-2B -> Qwen3.5-0.8B
+#
+#   ./distill.sh --profile qwen-poc --check-teacher
+#   ./distill.sh --profile qwen-poc --smoke
+#   ./distill.sh --profile qwen-poc --dtype bfloat16
+#
+# A deliberately small, known-good pairing to prove the pipeline end to end
+# before committing to a longer run or a custom teacher.
+#
+# Why this teacher: it is the official Qwen3.5 instruct release one size up from
+# the student. Verified against the Hub before writing this file:
+#   * identical tokenizer - vocab length 248077, identical vocab dict, identical
+#     token ids, identical rendered chat template. GKD requires a shared
+#     vocabulary, and this is the strongest form of that guarantee.
+#   * canonical key layout - model.language_model.* plus a complete 15-tensor
+#     mtp head, exactly the convention the 0.8B student loads correctly with.
+#     A merged export from another framework is what broke the previous run:
+#     its keys were language_model.model.*, so transformers randomly initialised
+#     all 320 language-model weights and the teacher emitted uniform noise.
+#   * declares architectures: [Qwen3_5ForConditionalGeneration], so transformers
+#     builds the matching class rather than falling back to a text-only one.
+#
+# Always run --check-teacher first. It loads only the teacher and takes a couple
+# of minutes; a broken teacher silently produces a broken student.
+# ---------------------------------------------------------------------------
+
+project:
+  name: qwen35-poc-distillation
+  output_dir: ./distilled_qwen_poc
+  seed: 42
+
+models:
+  teacher: Qwen/Qwen3.5-2B
+  student: Qwen/Qwen3.5-0.8B
+  tokenizer: student
+
+hardware:
+  device: auto
+  # float32 is the safe default: it is correct everywhere and is what the
+  # numbers in this file were reasoned about.
+  #
+  # A 2B teacher plus a 0.8B student is ~11 GB in float32 before activations,
+  # which is tight on a 16 GB machine. bfloat16 roughly halves that and is native
+  # on macOS 14+, so pass it at the command line when you actually train:
+  #
+  #     ./distill.sh --profile qwen-poc --dtype bfloat16
+  #
+  # It is a flag rather than a default here so the memory/precision trade-off is
+  # a deliberate choice per run. On CPU it is ignored and float32 is used anyway,
+  # because bf16 there is slow and often unstable.
+  dtype: float32
+  threads: 0
+  mps_fallback: true
+  mps_high_watermark_ratio: 0.0
+
+dataset:
+  source: gbharti/finance-alpaca
+  # Measured over 3,000 rows: prompts are short (median 25 tokens, max 52), answers
+  # are long (median 199, p90 488). Tighter than the finance profile's 128/512:
+  # shorter sequences mean less compute per forward pass, and it still admits the
+  # majority of rows.
+  max_prompt_tokens: 96
+  max_total_tokens: 320
+  # Each eval pass is a full forward over this many held-out samples, so it is not
+  # free at these model sizes.
+  validation_size: 24
+  include_synthetic: false
+  domains:
+    - name: finance-alpaca
+      config: null
+      format: alpaca
+      instruction_column: instruction
+      input_column: input
+      output_column: output
+      # Dataset size does NOT drive wall-clock: max_steps x effective batch sets
+      # how many samples are consumed (100 x 4 = 400 here). A larger pool only
+      # changes how often samples repeat. It is kept just above that number.
+      quota: 500
+      pool: 800
+
+lora:
+  # Half the finance profile's rank. Fewer trainable parameters means faster
+  # steps and less memory, at some cost in capacity - fine for a PoC.
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  # Qwen3.5 is a hybrid architecture. Its 24 layers split as:
+  #     18 x linear attention  -> linear_attn.{in_proj_qkv, in_proj_z, out_proj}
+  #      6 x standard attention -> self_attn.{q_proj, k_proj, v_proj, o_proj}
+  #     24 x MLP               -> mlp.{gate_proj, up_proj, down_proj}
+  # A Llama-style target list would miss the attention in 18 of the 24 layers.
+  target_modules:
+    - in_proj_qkv     # linear-attn fused Q/K/V   (18 layers)
+    - in_proj_z       # linear-attn gate          (18 layers)
+    - out_proj        # linear-attn output        (18 layers)
+    - q_proj          # standard attention        (6 layers)
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj       # MLP                       (24 layers)
+    - up_proj
+    - down_proj
+
+training:
+  max_steps: 100
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  lr_scheduler_type: cosine
+  warmup: 0.05
+  max_grad_norm: 1.0
+  logging_steps: 1
+  save_steps: 50
+  save_total_limit: 2
+  eval_enabled: true
+  # Each benchmark generates 3 sample answers autoregressively - cheap relative to
+  # training, but not worth doing often on a short run.
+  benchmark_every: 50
+
+gkd:
+  # THE dominant cost. lmbda is the fraction of batches for which the student
+  # generates its own completion on-policy before the teacher scores it - that is
+  # max_new_tokens sequential forward passes, versus one for a supervised batch.
+  # 0.5 -> 0.25 removes half of those generation passes.
+  # Set 0.0 for pure off-policy distillation: no generation at all, several times
+  # faster, but it loses the on-policy correction that makes GKD better than
+  # plain KD. 0.25 keeps some of that benefit at a fraction of the cost.
+  lmbda: 0.25
+  beta: 0.5
+  temperature: 0.7
+  # Second-biggest lever: generation cost is linear in this.
+  max_new_tokens: 24
+  seq_kd: false
+
+benchmark_prompts:
+  - What is the difference between a Roth IRA and a traditional IRA?
+  - How does compound interest work? Explain briefly.
+  - What does it mean when a stock is described as having a high P/E ratio?

@@ -67,6 +67,10 @@ jobs:
           out=$(uv run python train_scaled.py --config configs/finance.yaml --print-config)
           echo "$out" | grep -q 'Qwen/Qwen3.5-0.8B' || { echo "finance student wrong: $out"; exit 1; }
           echo "$out" | grep -q 'gbharti/finance-alpaca' || { echo "finance dataset wrong: $out"; exit 1; }
+          # The qwen-poc profile must pair the official instruct teacher with the student.
+          out=$(uv run python train_scaled.py --config configs/qwen-poc.yaml --print-config)
+          echo "$out" | grep -q 'Qwen/Qwen3.5-2B' || { echo "qwen-poc teacher wrong: $out"; exit 1; }
+          echo "$out" | grep -q 'Qwen/Qwen3.5-0.8B' || { echo "qwen-poc student wrong: $out"; exit 1; }
           echo "override precedence OK"
 
       - name: Verify the teacher checker entrypoint
