@@ -109,6 +109,7 @@ DEFAULTS = {
 ENV_OVERRIDES = {
     "KD_STUDENT_MODEL": ("models", "student", str),
     "KD_TEACHER_MODEL": ("models", "teacher", str),
+    "KD_TEACHER_ADAPTER": ("models", "teacher_adapter", str),
     "KD_TOKENIZER": ("models", "tokenizer", str),
     "KD_DATASET": ("dataset", "source", str),
     "KD_OUTPUT_DIR": ("project", "output_dir", str),

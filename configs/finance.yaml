@@ -22,6 +22,13 @@ project:
 models:
   teacher: siddhartha-addy-globalids-labs/qwen3.5-2b-finance-alpaca-lora
   student: Qwen/Qwen3.5-0.8B
+  # If the teacher is a base model plus a LoRA adapter rather than a merged
+  # checkpoint, set `teacher` to the base and name the adapter here; it is merged
+  # in at load time. Prefer this over a merged checkpoint written by another
+  # framework: those keep that framework's key layout, which plain transformers
+  # may not map back onto the architecture.
+  #   teacher: Qwen/Qwen3.5-2B
+  #   teacher_adapter: <org>/<adapter-repo-or-local-path>
   # The teacher is the finance-tuned model, but both share the Qwen3.5 tokenizer.
   # Using the student's keeps the chat template aligned with what we generate from.
   tokenizer: student

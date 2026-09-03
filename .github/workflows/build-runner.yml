@@ -38,7 +38,7 @@ jobs:
         run: uv sync
 
       - name: Byte-compile sources
-        run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py
+        run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py check_teacher.py
 
       - name: Resolve every config profile
         run: |
@@ -68,6 +68,17 @@ jobs:
           echo "$out" | grep -q 'Qwen/Qwen3.5-0.8B' || { echo "finance student wrong: $out"; exit 1; }
           echo "$out" | grep -q 'gbharti/finance-alpaca' || { echo "finance dataset wrong: $out"; exit 1; }
           echo "override precedence OK"
+
+      - name: Verify the teacher checker entrypoint
+        run: |
+          uv run python check_teacher.py --help | grep -q -- '--teacher-adapter'
+          uv run python check_teacher.py --help | grep -q -- '--dtype'
+          # teacher_adapter must survive the config precedence chain
+          out=$(KD_TEACHER_ADAPTER=env/A uv run python train_scaled.py                   --config configs/finance.yaml --print-config)
+          echo "$out" | grep -q 'env/A' || { echo "adapter env override failed"; exit 1; }
+          out=$(uv run python train_scaled.py --config configs/finance.yaml                   --teacher-adapter cli/A --print-config)
+          echo "$out" | grep -q 'cli/A' || { echo "adapter CLI override failed"; exit 1; }
+          echo "teacher checker OK"
 
       - name: Verify the comparison UI entrypoint
         run: |
@@ -138,6 +149,44 @@ jobs:
             || ./distill.sh --version | grep -q "${{ steps.meta.outputs.sha_short }}"
           echo "help/version OK"
 
+      - name: Verify every helper used is defined, and output is plain text
+        run: |
+          set -e
+          # A helper that is called but never defined fails at runtime with
+          # "command not found". Because these sit inside `case` arms, nothing
+          # exercises them until a user reaches that mode - this shipped once,
+          # so --check and --smoke printed nothing where a banner belonged.
+          missing=0
+          for fn in log warn die ok bad banner_ok banner_bad field need_val usage; do
+            if ! grep -qE "^${fn}\(\)" distill.sh; then
+              echo "FAIL: ${fn}() is called but never defined"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          # The banners must actually render.
+          awk '/^RULE=/{f=1} f{print} /^field\(\)/{c=1} c&&/^}/{exit}' distill.sh > /tmp/helpers.sh
+          out=$(bash -c '. /tmp/helpers.sh; banner_ok "test"; ok "  detail"' 2>&1)
+          case "$out" in
+            *"ALL OK - test"*) ;;
+            *) echo "FAIL: banner_ok did not render: $out"; exit 1 ;;
+          esac
+          out=$(bash -c '. /tmp/helpers.sh; banner_bad "boom"' 2>&1)
+          case "$out" in
+            *"FAILED - boom"*) ;;
+            *) echo "FAIL: banner_bad did not render: $out"; exit 1 ;;
+          esac
+          out=$(bash -c '. /tmp/helpers.sh; field " teacher       : org/model" teacher')
+          [ "$out" = "org/model" ] || { echo "FAIL: field() returned '$out'"; exit 1; }
+
+          # Plain text only: ANSI escapes do not survive every terminal or log.
+          if grep -q '\\033\[' distill.sh; then
+            echo "FAIL: ANSI escape sequences found; output must be plain text"
+            exit 1
+          fi
+          echo "helpers OK"
+
       - name: Verify CLI parsing and precedence
         run: |
           set -e
@@ -150,6 +199,7 @@ jobs:
           echo "dataset=$DATASET"
           echo "steps=$MAX_STEPS"
           echo "mode=$MODE"
+          echo "adapter=$TEACHER_ADAPTER"
           echo "port=$UI_PORT"
           echo "host=$UI_HOST"
           EOF
@@ -180,6 +230,15 @@ jobs:
           expect "$out" "teacher="; expect "$out" "student="
           expect "$out" "dataset="; expect "$out" "steps="
 
+          # Teacher verification mode and the adapter flag
+          out=$(bash /tmp/parsecheck.sh --check-teacher)
+          expect "$out" "mode=check-teacher"
+          out=$(bash /tmp/parsecheck.sh --teacher Q/B --teacher-adapter ./lora)
+          expect "$out" "teacher=Q/B"; expect "$out" "adapter=./lora"
+          out=$(bash /tmp/parsecheck.sh --teacher-adapter=eq/A)
+          expect "$out" "adapter=eq/A"
+          out=$(bash /tmp/parsecheck.sh); expect "$out" "adapter="
+
           # UI mode and its options
           out=$(bash /tmp/parsecheck.sh); expect "$out" "mode=train"
           out=$(bash /tmp/parsecheck.sh --ui --port 8080 --host 0.0.0.0)
@@ -199,6 +258,7 @@ jobs:
           fails --steps abc
           fails --profile nope
           fails --teacher
+          fails --teacher-adapter
           fails --bogus
           fails stray-arg
           fails --ui --port abc
@@ -232,7 +292,8 @@ jobs:
             echo "unzip distill-runner-${{ steps.meta.outputs.sha_short }}.zip"
             echo "chmod +x distill.sh"
             echo "./distill.sh --help      # all options"
-            echo "./distill.sh --check     # verify hardware + resolved config"
+            echo "./distill.sh --check          # verify hardware + resolved config"
+            echo "./distill.sh --check-teacher  # verify the teacher is fit to distil from"
             echo "./distill.sh --teacher HuggingFaceTB/SmolLM2-1.7B-Instruct"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

@@ -24,6 +24,7 @@ Retarget without touching YAML, via CLI or KD_* environment variables:
 """
 
 import argparse
+import math
 import os
 import random
 import time
@@ -31,7 +32,7 @@ import time
 import torch
 import yaml
 from datasets import Dataset, load_dataset
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 
 import kd_config
@@ -81,6 +82,7 @@ def apply_config(config, hardware):
 
     STUDENT_MODEL_ID = config["models"]["student"]
     TEACHER_MODEL_ID = config["models"]["teacher"]
+    TEACHER_ADAPTER = config["models"].get("teacher_adapter") or None
 
     tokenizer_choice = str(config["models"].get("tokenizer", "teacher"))
     TOKENIZER_SOURCE = {
@@ -692,6 +694,13 @@ def parse_args():
     # Ad-hoc overrides. Anything left as None does not override the config file.
     parser.add_argument("--student", default=None, help="Override models.student")
     parser.add_argument("--teacher", default=None, help="Override models.teacher")
+    parser.add_argument("--teacher-adapter", default=None,
+                        help="LoRA adapter to merge into the teacher "
+                             "(use when the teacher is base + adapter rather "
+                             "than a merged checkpoint)")
+    parser.add_argument("--allow-bad-teacher", action="store_true",
+                        help="Train even if the teacher fails its pre-flight "
+                             "sanity check (not recommended)")
     parser.add_argument("--dataset", default=None, help="Override dataset.source")
     parser.add_argument("--output-dir", default=None, help="Override project.output_dir")
     parser.add_argument("--device", default=None, choices=["auto", "cpu", "mps", "cuda"],
@@ -718,6 +727,7 @@ def build_overrides(args):
 
     put("models", "student", args.student)
     put("models", "teacher", args.teacher)
+    put("models", "teacher_adapter", args.teacher_adapter)
     put("dataset", "source", args.dataset)
     put("project", "output_dir", args.output_dir)
     put("hardware", "device", args.device)
@@ -728,6 +738,99 @@ def build_overrides(args):
     if args.no_eval:
         put("training", "eval_enabled", False)
     return overrides
+
+
+# ---------------------------------------------------------------------------
+# Teacher pre-flight
+# ---------------------------------------------------------------------------
+# GKD trains the student to match the teacher's output distribution, so a broken
+# teacher silently produces a broken student: the run "succeeds", burns the whole
+# step budget, and only the final samples reveal it.
+#
+# The failure that motivated this check was a merged checkpoint whose key layout
+# did not match the architecture transformers built for it. from_pretrained does
+# not raise in that case - it randomly initialises whatever it could not map and
+# prints a warning that scrolls past. A partly random teacher emits near-uniform
+# token salad, and the student faithfully learns to reproduce it.
+# ---------------------------------------------------------------------------
+def verify_teacher(model, tokenizer, loading_info=None, strict=True):
+    """Fail fast when the teacher is not a usable distillation target."""
+    problems = []
+
+    # 1. Weights that were fabricated rather than loaded from the checkpoint.
+    if loading_info:
+        missing = list(loading_info.get("missing_keys") or [])
+        unexpected = list(loading_info.get("unexpected_keys") or [])
+        # Derived buffers and tied heads go missing legitimately; real parameter
+        # tensors do not.
+        ignorable = ("rotary_emb.inv_freq", ".attn_bias", "lm_head.weight")
+        real = [k for k in missing if not k.endswith(ignorable)]
+        if real:
+            problems.append(
+                "%d weight(s) were randomly initialised instead of loaded - the "
+                "teacher is partly untrained. First few: %s" % (len(real), real[:6])
+            )
+        if unexpected:
+            print(" !! %d checkpoint tensor(s) went unused: %s"
+                  % (len(unexpected), unexpected[:4]))
+
+    # 2. Non-finite parameters, e.g. a bad merge or an overflowed save.
+    bad = [n for n, t in model.named_parameters() if not torch.isfinite(t).all()]
+    if bad:
+        problems.append("%d parameter tensor(s) contain NaN/Inf: %s" % (len(bad), bad[:4]))
+
+    # 3. The behavioural test. A healthy instruct teacher is confident about its
+    #    next token; a randomly initialised one is near-uniform over ~248k tokens,
+    #    which is exactly what produces multilingual token salad downstream.
+    probe = BENCHMARK_PROMPTS[0] if BENCHMARK_PROMPTS else "Explain compound interest."
+    text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": probe}], tokenize=False, add_generation_prompt=True
+    )
+    ids = tokenizer(text, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        logits = model(**ids).logits[0, -1].float()
+    probs = torch.softmax(logits, dim=-1)
+    top_p = float(probs.max())
+    entropy = float(-(probs * probs.clamp_min(1e-12).log()).sum())
+    uniform = math.log(logits.numel())
+
+    print(" -> teacher sanity: top-1 prob %.4f, entropy %.2f (uniform would be %.2f)"
+          % (top_p, entropy, uniform))
+    print("    teacher says: %r" % (generate_sample(model, tokenizer, probe,
+                                                    max_new_tokens=32)[:160],))
+
+    if entropy > 0.80 * uniform or top_p < 0.02:
+        problems.append(
+            "teacher output is near-uniform (entropy %.2f of a possible %.2f); it is "
+            "not predicting language" % (entropy, uniform)
+        )
+
+    if not problems:
+        print(" -> teacher pre-flight OK")
+        return
+
+    bar = "=" * 78
+    print("\n" + bar)
+    print("  TEACHER PRE-FLIGHT FAILED")
+    print(bar)
+    for item in problems:
+        print("  * " + item)
+    print("""
+  Distilling from this teacher would produce a broken student, because GKD trains
+  the student to match whatever distribution the teacher emits.
+
+  Common causes:
+    * the checkpoint's key layout does not match the architecture transformers
+      built for it (merged or converted models often keep an older prefix
+      convention, e.g. language_model.model.* vs model.language_model.*);
+    * config.json declares components the checkpoint does not contain;
+    * the merge was saved from a quantised or partially loaded model.
+
+  Re-run with --allow-bad-teacher to proceed anyway.
+""")
+    print(bar)
+    if strict:
+        raise SystemExit(2)
 
 
 def run(args):
@@ -768,13 +871,27 @@ def run(args):
 
     # 3. Teacher (frozen)
     print(f"\n[Phase 2] Loading frozen teacher ({TEACHER_MODEL_ID})...")
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        TEACHER_MODEL_ID, dtype=COMPUTE_DTYPE, low_cpu_mem_usage=True
-    ).to(DEVICE)
+    teacher_model, loading_info = AutoModelForCausalLM.from_pretrained(
+        TEACHER_MODEL_ID, dtype=COMPUTE_DTYPE, low_cpu_mem_usage=True,
+        output_loading_info=True,
+    )
+    if TEACHER_ADAPTER:
+        # The teacher is a base model plus a LoRA adapter rather than a merged
+        # checkpoint. This is the safer form: merged checkpoints written by other
+        # frameworks often use that framework's key layout, which plain
+        # transformers may not map back onto the architecture. Merging here, from
+        # the canonical base, sidesteps that entirely.
+        print(f" -> applying teacher LoRA adapter: {TEACHER_ADAPTER}")
+        teacher_model = PeftModel.from_pretrained(teacher_model, TEACHER_ADAPTER)
+        teacher_model = teacher_model.merge_and_unload()
+        print(" -> adapter merged into the teacher")
+    teacher_model = teacher_model.to(DEVICE)
     teacher_model.eval()
     for param in teacher_model.parameters():
         param.requires_grad = False
     print(" -> teacher frozen")
+    verify_teacher(teacher_model, tokenizer, loading_info,
+                   strict=not getattr(args, "allow_bad_teacher", False))
 
     # 4. Student + high-capacity LoRA
     print(f"\n[Phase 3] Loading student ({STUDENT_MODEL_ID}) and injecting LoRA...")
