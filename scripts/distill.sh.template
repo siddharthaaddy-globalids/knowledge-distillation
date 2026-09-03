@@ -511,6 +511,9 @@ case "$MODE" in
     UI_ARGS="--host $UI_HOST --port $UI_PORT --config $CONFIG_FILE"
     [ -n "$TEACHER_MODEL" ] && UI_ARGS="$UI_ARGS --teacher $TEACHER_MODEL"
     [ -n "$STUDENT_MODEL" ] && UI_ARGS="$UI_ARGS --student $STUDENT_MODEL"
+    # Without this the reference column would show the base teacher rather than
+    # the fine-tuned one that was actually distilled from.
+    [ -n "$TEACHER_ADAPTER" ] && UI_ARGS="$UI_ARGS --teacher-adapter $TEACHER_ADAPTER"
     [ -n "$ADAPTER_DIR" ] && [ -d "$ADAPTER_DIR" ] && UI_ARGS="$UI_ARGS --adapter $ADAPTER_DIR"
     [ "$UI_SHARE" -eq 1 ] && UI_ARGS="$UI_ARGS --share"
     log "Launching comparison UI on http://$UI_HOST:$UI_PORT"

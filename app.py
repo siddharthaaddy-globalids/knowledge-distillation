@@ -58,13 +58,21 @@ def _resolve_adapter_path(explicit=None):
     return ADAPTER_CANDIDATES[0]
 
 
-def configure(adapter=None, student=None, teacher=None, host=None, port=None, threads=None):
+TEACHER_ADAPTER_PATH = None
+
+
+def configure(adapter=None, student=None, teacher=None, host=None, port=None,
+              threads=None, teacher_adapter=None):
     """Bind runtime settings before models are loaded."""
     global ADAPTER_PATH, STUDENT_MODEL_ID, TEACHER_MODEL_ID, SERVER_NAME, SERVER_PORT
+    global TEACHER_ADAPTER_PATH
 
     ADAPTER_PATH = _resolve_adapter_path(adapter)
     STUDENT_MODEL_ID = student or os.environ.get("KD_STUDENT_MODEL") or STUDENT_MODEL_ID
     TEACHER_MODEL_ID = teacher or os.environ.get("KD_TEACHER_MODEL") or TEACHER_MODEL_ID
+    TEACHER_ADAPTER_PATH = (teacher_adapter
+                            or os.environ.get("KD_TEACHER_ADAPTER")
+                            or TEACHER_ADAPTER_PATH)
     SERVER_NAME = host or os.environ.get("KD_UI_HOST") or SERVER_NAME
     SERVER_PORT = int(port or os.environ.get("KD_UI_PORT") or SERVER_PORT)
 
@@ -220,17 +228,32 @@ def load_all_models():
 
     # --- 3. Teacher reference ----------------------------------------------- #
     print(f"[4/4] Loading teacher ({TEACHER_MODEL_ID})...")
+    # The label must name what is actually loaded. Showing a stale or base-only
+    # name next to a distilled student invites the wrong conclusion about whether
+    # distillation worked.
+    teacher_label = TEACHER_MODEL_ID.split("/")[-1]
+    if TEACHER_ADAPTER_PATH:
+        teacher_label += f" + {os.path.basename(str(TEACHER_ADAPTER_PATH).rstrip('/\\'))}"
     try:
         teacher = _load_base_causal_lm(TEACHER_MODEL_ID)
+        if TEACHER_ADAPTER_PATH:
+            # The teacher may itself be a base model plus a LoRA adapter. Merging
+            # here means the reference column shows the fine-tuned teacher that
+            # was actually distilled from, not the generic base.
+            print(f" -> merging teacher adapter: {TEACHER_ADAPTER_PATH}")
+            from peft import PeftModel
+            teacher = PeftModel.from_pretrained(teacher, TEACHER_ADAPTER_PATH)
+            teacher = teacher.merge_and_unload()
+            teacher.eval()
         MODELS["teacher"] = ModelBundle(
-            "teacher", "Teacher Reference", "SmolLM2-360M-Instruct",
+            "teacher", "Teacher Reference", teacher_label,
             model=teacher, tokenizer=_load_tokenizer(TEACHER_MODEL_ID),
         )
         print(" -> ok")
     except Exception as exc:
         traceback.print_exc()
         MODELS["teacher"] = ModelBundle(
-            "teacher", "Teacher Reference", "SmolLM2-360M-Instruct",
+            "teacher", "Teacher Reference", teacher_label,
             error=f"Failed to load teacher: {exc}",
         )
 
@@ -442,6 +465,10 @@ def parse_args():
                              + ", ".join(ADAPTER_CANDIDATES))
     parser.add_argument("-s", "--student", default=None, help="Student base model id")
     parser.add_argument("-t", "--teacher", default=None, help="Teacher model id")
+    parser.add_argument("--teacher-adapter", default=None, metavar="DIR",
+                        help="LoRA adapter merged into the teacher before comparison. "
+                             "Use when the teacher is a base model plus an adapter, so "
+                             "the reference column shows what was actually distilled from.")
     parser.add_argument("--config", default=None, metavar="PATH",
                         help="Read student/teacher from a training YAML config, so the UI "
                              "compares exactly what was trained.")
@@ -475,15 +502,17 @@ def main():
         return
 
     student, teacher = args.student, args.teacher
+    teacher_adapter = args.teacher_adapter
     if args.config:
         # Reuse the training config so the UI never drifts from what was trained.
         import kd_config
         cfg = kd_config.load_config(args.config)
         student = student or cfg["models"]["student"]
         teacher = teacher or cfg["models"]["teacher"]
+        teacher_adapter = teacher_adapter or cfg["models"].get("teacher_adapter")
 
     configure(adapter=args.adapter, student=student, teacher=teacher,
-              host=args.host, port=args.port)
+              host=args.host, port=args.port, teacher_adapter=teacher_adapter)
 
     if not _is_adapter(ADAPTER_PATH):
         print(f" !! No adapter at '{ADAPTER_PATH}'. The distilled column will show an error.")
