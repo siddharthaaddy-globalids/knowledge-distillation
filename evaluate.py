@@ -513,6 +513,36 @@ def main():
         print("  (fraction of the base->teacher perplexity gap the adapter closed;")
         print("   negative means the distilled student is worse than the base)")
 
+    # --- the single "how close is it" number ------------------------------- #
+    # Two standard percentages, deliberately NOT blended into one score. There is
+    # no accepted composite closeness metric, and averaging these would combine a
+    # token-level agreement rate with a likelihood ratio - different units,
+    # different questions. Retention on perplexity is inverted (teacher/student)
+    # because lower perplexity is better.
+    ppl_ret_base = (ppl_teacher / ppl_base * 100) if ppl_base else float("nan")
+    ppl_ret_dist = (ppl_teacher / ppl_dist * 100) if ppl_dist else float("nan")
+
+    print("\n" + BAR)
+    print("  CLOSENESS TO TEACHER")
+    print(BAR)
+    print(f"\n  {'':34} {'base':>10} {'distilled':>11} {'teacher':>10}")
+    print("  " + "-" * 70)
+    print(f"  {'prediction agreement':34} {agreement_base:9.2f}% "
+          f"{agreement_dist:10.2f}% {100.0:9.2f}%")
+    print(f"  {'perplexity retention':34} {ppl_ret_base:9.2f}% "
+          f"{ppl_ret_dist:10.2f}% {100.0:9.2f}%")
+    if math.isfinite(recovered):
+        print(f"\n  Training closed {recovered:.1f}% of the base->teacher gap.")
+    print("""
+  Read these as "how close", not "how good". The base student already scores
+  most of this before any training, because student and teacher share an
+  architecture, a tokenizer and instruction tuning - so the absolute number is
+  dominated by that head start, not by distillation. What distillation bought
+  is the LIFT over the base column, and the gap-recovered figure.
+
+  The two rows answer different questions (token agreement vs likelihood) and
+  are not averaged: no standard composite closeness score exists.""")
+
     print("\n" + BAR)
     print("  EFFICIENCY - what the retention cost")
     print(BAR)
@@ -564,6 +594,13 @@ def main():
             "perplexity_teacher": ppl_teacher,
             "perplexity_base": ppl_base,
             "perplexity_distilled": ppl_dist,
+            "gap_recovered_pct": recovered,
+        },
+        "closeness_to_teacher": {
+            "prediction_agreement_base_pct": agreement_base,
+            "prediction_agreement_distilled_pct": agreement_dist,
+            "perplexity_retention_base_pct": ppl_ret_base,
+            "perplexity_retention_distilled_pct": ppl_ret_dist,
             "gap_recovered_pct": recovered,
         },
         "efficiency": {
