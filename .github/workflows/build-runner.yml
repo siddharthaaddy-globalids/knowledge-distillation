@@ -237,6 +237,41 @@ jobs:
           # Degenerate boundaries must be refused, not scored.
           assert m.completion_slice(lg, ids, prompt_len=10)[0] is None
           assert m.completion_slice(lg, ids, prompt_len=0)[0] is None
+          # The retention table must attach each metric to its own stderr and
+          # flag a base->distilled difference that is inside the error bars. At
+          # small --eval-limit values almost everything is noise, and a table that
+          # does not say so invites exactly the wrong conclusion.
+          import io, contextlib
+          res = {
+              "base_student":      {"arc_easy": {"acc,none": 0.20, "acc_stderr,none": 0.20,
+                                                 "alias": "arc_easy", "sample_len": 5}},
+              "distilled_student": {"arc_easy": {"acc,none": 0.40, "acc_stderr,none": 0.24,
+                                                 "alias": "arc_easy", "sample_len": 5}},
+              "teacher":           {"arc_easy": {"acc,none": 0.60, "acc_stderr,none": 0.24,
+                                                 "alias": "arc_easy", "sample_len": 5}},
+          }
+          buf = io.StringIO()
+          with contextlib.redirect_stdout(buf):
+              m.report_tasks(res)
+          out = buf.getvalue()
+          assert "NOT SIGNIFICANT" in out, out
+          assert "arc_easy/acc" in out, out
+          # Bookkeeping keys are not metrics and must not get a retention row.
+          assert "sample_len" not in out, out
+          assert "alias" not in out, out
+          # The stderr belongs beside its metric, not on a row of its own.
+          assert "acc_stderr" not in out, out
+          assert "0.2000+-0.200" in out, out
+
+          # A difference comfortably outside the error bars must NOT be flagged.
+          res["distilled_student"]["arc_easy"] = {"acc,none": 0.80, "acc_stderr,none": 0.02}
+          res["base_student"]["arc_easy"] = {"acc,none": 0.20, "acc_stderr,none": 0.02}
+          buf = io.StringIO()
+          with contextlib.redirect_stdout(buf):
+              m.report_tasks(res)
+          assert "NOT SIGNIFICANT" not in buf.getvalue(), buf.getvalue()
+          print("retention table OK")
+
           print("evaluation metrics OK")
           PY
           echo "evaluation harness OK"

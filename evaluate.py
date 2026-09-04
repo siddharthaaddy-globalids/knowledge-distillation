@@ -29,11 +29,12 @@ when it did not, so a run can be gated in a shell script.
 """
 
 import argparse
+import gc
+import importlib.util
 import json
 import math
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
 import time
@@ -156,7 +157,12 @@ def compare_distributions(teacher_logits, student_logits, chunk=32):
         s = student_logits[i:i + chunk].float()
         t_log = F.log_softmax(t, dim=-1)
         s_log = F.log_softmax(s, dim=-1)
-        kl_total += float((t_log.exp() * (t_log - s_log)).sum())
+        # F.kl_div(input, target) computes KL(target || input), i.e. the argument
+        # order is the reverse of the mathematical convention - the same quirk TRL
+        # works around in generalized_jsd_loss. Passing (student, teacher) here is
+        # therefore KL(teacher || student), which is what fidelity means: how much
+        # information is lost when the student stands in for the teacher.
+        kl_total += float(F.kl_div(s_log, t_log, log_target=True, reduction="sum"))
         agree += int((t.argmax(-1) == s.argmax(-1)).sum())
     return agree, kl_total
 
@@ -210,7 +216,7 @@ def run_lm_eval(tasks, student_id, adapter_dir, teacher_id, teacher_adapter,
     LLM Leaderboard runs), so numbers produced here are comparable with published
     ones rather than only with each other.
     """
-    if shutil.which("lm_eval") is None:
+    if importlib.util.find_spec("lm_eval") is None:
         print("\n !! lm-eval is not installed; skipping --tasks.")
         print("    Install the optional extra and re-run:")
         print("      uv sync --extra eval")
@@ -226,28 +232,50 @@ def run_lm_eval(tasks, student_id, adapter_dir, teacher_id, teacher_adapter,
     results = {}
     for label, model_args in runs.items():
         print(f"\n  [lm-eval] {label} on {tasks}")
+        # Invoked as a module rather than by console-script name: the entry point is
+        # spelled lm-eval in some releases and lm_eval in others, and neither is
+        # guaranteed to be on PATH. sys.executable always resolves to this venv.
+        #
+        # --apply_chat_template is set for all three models, including the base
+        # student. Every model here is instruct-tuned and the adapter was trained
+        # against a chat template, so this keeps the three columns internally
+        # consistent, which is what a base-vs-distilled comparison needs. It does
+        # mean the absolute numbers are not directly comparable to leaderboard
+        # entries that scored multiple-choice tasks without a template.
         cmd = [
-            "lm_eval", "--model", "hf",
+            sys.executable, "-m", "lm_eval", "run",
+            "--model", "hf",
             "--model_args", f"{model_args},dtype={dtype_name}",
             "--tasks", tasks,
             "--device", device,
             "--batch_size", "1",
+            "--seed", "42",
             "--apply_chat_template",
         ]
         if limit:
             cmd += ["--limit", str(limit)]
         out_dir = pathlib.Path("./evals") / label
         cmd += ["--output_path", str(out_dir)]
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as exc:
-            print(f"  !! lm-eval failed for {label} (exit {exc.returncode})")
-            continue
+
+        # lm-eval renders its summary table with Unicode arrows. On a Windows
+        # console that defaults to cp1252 the print raises UnicodeEncodeError and
+        # the process exits 1 - AFTER the results file has been written. Force
+        # UTF-8 so it does not happen, and treat the results file as the source of
+        # truth below rather than the exit status.
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        completed = subprocess.run(cmd, env=env)
+
         # lm-eval writes results_<timestamp>.json under a model-named subdirectory.
         files = sorted(out_dir.rglob("results_*.json"))
-        if files:
-            payload = json.loads(files[-1].read_text(encoding="utf-8"))
-            results[label] = payload.get("results", {})
+        if not files:
+            print(f"  !! lm-eval produced no results for {label} "
+                  f"(exit {completed.returncode})")
+            continue
+        if completed.returncode != 0:
+            print(f"  -- lm-eval exited {completed.returncode} for {label}, but wrote "
+                  f"results; using them")
+        payload = json.loads(files[-1].read_text(encoding="utf-8"))
+        results[label] = payload.get("results", {})
     return results or None
 
 
@@ -262,24 +290,59 @@ def report_tasks(results):
                          results.get("teacher", {}))
     task_names = sorted(set(base) | set(dist) | set(teach))
 
-    print(f"\n  {'task / metric':38} {'base':>9} {'distilled':>10} "
-          f"{'teacher':>9} {'retention':>10}")
-    print("  " + "-" * 76)
+    def stderr_key(metric):
+        """lm-eval names metrics 'acc,none' and their error 'acc_stderr,none'."""
+        name, _, suffix = metric.partition(",")
+        return f"{name}_stderr,{suffix}" if suffix else f"{name}_stderr"
+
+    def is_reportable(task, metric):
+        # Skip the error bars themselves (they are attached to their metric below)
+        # and lm-eval's bookkeeping entries, which have no meaningful retention.
+        name = metric.partition(",")[0]
+        if name.endswith("_stderr") or name in ("alias", "sample_len"):
+            return False
+        return isinstance((dist.get(task) or {}).get(metric), (int, float))
+
+    def cell(value, err):
+        if not isinstance(value, (int, float)):
+            return f"{'-':>14}"
+        return f"{value:8.4f}+-{err:<4.3f}" if isinstance(err, (int, float)) \
+            else f"{value:8.4f}      "
+
+    print(f"\n  {'task / metric':30} {'base':>14} {'distilled':>14} "
+          f"{'teacher':>14} {'retention':>10}")
+    print("  " + "-" * 86)
+    noisy = []
     for task in task_names:
-        metrics = [k for k in (dist.get(task) or {})
-                   if not k.endswith("_stderr") and k != "alias"
-                   and isinstance((dist.get(task) or {}).get(k), (int, float))]
-        for metric in metrics:
-            b = (base.get(task) or {}).get(metric)
-            d = (dist.get(task) or {}).get(metric)
-            t = (teach.get(task) or {}).get(metric)
-            retention = f"{d / t * 100:9.1f}%" if (isinstance(d, (int, float))
-                                                   and isinstance(t, (int, float))
-                                                   and t) else "        -"
-            fmt = lambda v: f"{v:9.4f}" if isinstance(v, (int, float)) else "        -"
-            print(f"  {task + ' / ' + metric:38} {fmt(b)} {fmt(d):>10} {fmt(t)} {retention}")
+        for metric in [m for m in (dist.get(task) or {}) if is_reportable(task, m)]:
+            sk = stderr_key(metric)
+            b, d, t = ((base.get(task) or {}).get(metric),
+                       (dist.get(task) or {}).get(metric),
+                       (teach.get(task) or {}).get(metric))
+            be, de, te = ((base.get(task) or {}).get(sk),
+                          (dist.get(task) or {}).get(sk),
+                          (teach.get(task) or {}).get(sk))
+            retention = (f"{d / t * 100:9.1f}%"
+                         if isinstance(d, (int, float)) and isinstance(t, (int, float)) and t
+                         else "        -")
+            print(f"  {task + ' / ' + metric.partition(',')[0]:30} "
+                  f"{cell(b, be)} {cell(d, de)} {cell(t, te)} {retention}")
+
+            # A difference smaller than the combined error bars is not a result.
+            # Saying so here is the whole point of running a standard harness.
+            if all(isinstance(v, (int, float)) for v in (b, d, be, de)):
+                if abs(d - b) <= (be + de):
+                    noisy.append(f"{task}/{metric.partition(',')[0]}")
+
     print("\n  retention = distilled / teacher. The comparison that matters is")
     print("  distilled vs base: if that lift is ~0, distillation changed nothing.")
+    print("  +- values are lm-eval's standard error at the sample count you ran.")
+    if noisy:
+        print("\n  !! NOT SIGNIFICANT - distilled vs base is within the error bars for:")
+        for item in noisy:
+            print(f"       {item}")
+        print("     Re-run with a larger --eval-limit (or none) before drawing")
+        print("     any conclusion from these.")
 
 
 # --------------------------------------------------------------------------- #
@@ -513,10 +576,16 @@ def main():
         "generations": generations,
     }
 
-    # Free the resident models before lm-eval spawns its own processes.
+    # Free the resident models before lm-eval spawns its own processes. Not
+    # cosmetic: each lm-eval run loads its own copy of the model, so on a 16 GB
+    # unified-memory Mac the parent still caching ~6 GB is the difference between
+    # the benchmark running and the machine swapping itself to a halt.
     del teacher, student
+    gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
+    elif device == "mps" and hasattr(torch, "mps"):
+        torch.mps.empty_cache()
 
     if args.tasks:
         task_results = run_lm_eval(args.tasks, student_id, adapter_dir, teacher_id,
