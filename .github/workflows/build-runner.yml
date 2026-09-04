@@ -38,7 +38,7 @@ jobs:
         run: uv sync
 
       - name: Byte-compile sources
-        run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py check_teacher.py fix_teacher.py convert_mlx_adapter.py publish_model.py
+        run: uv run python -m compileall -q train_scaled.py kd_config.py app.py test_inference.py check_teacher.py fix_teacher.py convert_mlx_adapter.py publish_model.py evaluate.py
 
       - name: Verify apply_config binds every name it assigns
         run: |
@@ -186,6 +186,61 @@ jobs:
           PY
           echo "converter OK"
 
+      - name: Verify the evaluation harness
+        run: |
+          uv run python evaluate.py --help | grep -q -- '--tasks'
+          uv run python evaluate.py --help | grep -q -- '--samples'
+          uv run python evaluate.py --help | grep -q -- '--teacher-adapter'
+          # The metric maths, on tensors with known answers. These are the numbers
+          # the whole mode reports, so a silent shift here would be invisible.
+          uv run python - <<'PY'
+          import importlib.util as u, math, torch
+          spec = u.spec_from_file_location("ev", "evaluate.py")
+          m = u.module_from_spec(spec); spec.loader.exec_module(m)
+
+          # Identical logits: perfect agreement, zero divergence.
+          a = torch.randn(20, 512)
+          agree, kl = m.compare_distributions(a, a.clone())
+          assert agree == 20, agree
+          assert abs(kl) < 1e-3, kl
+
+          # Disjoint argmaxes: zero agreement, strictly positive divergence.
+          b = torch.zeros(4, 8); c = torch.zeros(4, 8)
+          b[:, 0] = 10.0; c[:, 1] = 10.0
+          agree, kl = m.compare_distributions(b, c)
+          assert agree == 0, agree
+          assert kl > 0, kl
+
+          # Chunking must not change the result: the loop exists only to keep a
+          # [positions, 248k] float32 tensor from being materialised at once.
+          # Agreement is a count and must match exactly; the KL sum is compared
+          # with a tolerance, since chunking changes float summation order.
+          t, s_ = torch.randn(37, 256), torch.randn(37, 256)
+          a4, k4 = m.compare_distributions(t, s_, chunk=4)
+          a37, k37 = m.compare_distributions(t, s_, chunk=37)
+          assert a4 == a37, (a4, a37)
+          assert abs(k4 - k37) < 1e-3, (k4, k37)
+
+          # NLL against a one-hot-ish distribution is ~0; perplexity ~1.
+          logits = torch.full((5, 16), -20.0); logits[range(5), 3] = 20.0
+          nll = m.summed_nll(logits, torch.full((5,), 3))
+          assert math.exp(nll / 5) < 1.01, math.exp(nll / 5)
+
+          # The causal shift: logits[t] predicts token t+1, so completion token
+          # `prompt_len` is scored by logit index prompt_len-1. Off by one here
+          # would silently score the prompt's last token instead.
+          ids = torch.arange(10).unsqueeze(0)
+          lg = torch.randn(1, 10, 32)
+          sl, tg = m.completion_slice(lg, ids, prompt_len=4)
+          assert sl.shape[0] == 6 and tg.tolist() == [4, 5, 6, 7, 8, 9], (sl.shape, tg)
+          assert torch.equal(sl[0], lg[0, 3])
+          # Degenerate boundaries must be refused, not scored.
+          assert m.completion_slice(lg, ids, prompt_len=10)[0] is None
+          assert m.completion_slice(lg, ids, prompt_len=0)[0] is None
+          print("evaluation metrics OK")
+          PY
+          echo "evaluation harness OK"
+
       - name: Verify the comparison UI entrypoint
         run: |
           # A function-local import of a name already imported at module scope makes
@@ -273,9 +328,28 @@ jobs:
       - name: Verify it parses, and --help / --version work
         run: |
           bash -n distill.sh
-          ./distill.sh --help | grep -q -- '--teacher'
-          ./distill.sh --version | grep -q "${{ github.sha }}" \
-            || ./distill.sh --version | grep -q "${{ steps.meta.outputs.sha_short }}"
+
+          # REGRESSION: the usage() heredoc MUST use a quoted delimiter. Unquoted,
+          # the shell expands the help text, so a backticked example such as
+          # `hf auth login` is EXECUTED - and --help hangs on an interactive login
+          # prompt for every user who has that CLI on PATH. It does not reproduce
+          # on this runner (hf is not installed here), which is exactly why it
+          # needs a static check and not only a behavioural one.
+          grep -q "cat <<'EOF'" distill.sh \
+            || { echo "FAIL: usage() heredoc is not quoted; help text would be expanded"; exit 1; }
+
+          # --help must terminate promptly with stdin closed.
+          timeout 20 ./distill.sh --help < /dev/null > /tmp/help.txt \
+            || { echo "FAIL: --help did not exit within 20s"; exit 1; }
+          grep -q -- '--teacher' /tmp/help.txt
+          grep -q -- '--evaluate' /tmp/help.txt
+          grep -q -- '--tasks' /tmp/help.txt
+          # Escapes and backticks must survive as literal text, not be expanded.
+          grep -q 'hf auth login' /tmp/help.txt
+          grep -q '[$]HOME/.cache/kd-runner' /tmp/help.txt
+
+          timeout 20 ./distill.sh --version < /dev/null | grep -q "${{ github.sha }}" \
+            || timeout 20 ./distill.sh --version < /dev/null | grep -q "${{ steps.meta.outputs.sha_short }}"
           echo "help/version OK"
 
       - name: Verify every helper used is defined, and output is plain text
@@ -328,6 +402,8 @@ jobs:
           echo "dataset=$DATASET"
           echo "steps=$MAX_STEPS"
           echo "mode=$MODE"
+          echo "tasks=$EVAL_TASKS"
+          echo "samples=$EVAL_SAMPLES"
           echo "adapter=$TEACHER_ADAPTER"
           echo "profile=$CONFIG_PROFILE"
           echo "explicit=$PROFILE_EXPLICIT"
@@ -381,6 +457,15 @@ jobs:
           out=$(bash /tmp/parsecheck.sh --profile qwen-poc --smoke)
           expect "$out" "explicit=1"; expect "$out" "profile=qwen-poc"
 
+          # Evaluation mode and its options
+          out=$(bash /tmp/parsecheck.sh --evaluate)
+          expect "$out" "mode=evaluate"
+          out=$(bash /tmp/parsecheck.sh --evaluate --tasks ifeval --eval-samples 100)
+          expect "$out" "tasks=ifeval"; expect "$out" "samples=100"
+          out=$(bash /tmp/parsecheck.sh --evaluate --tasks=a,b --eval-samples=7)
+          expect "$out" "tasks=a,b"; expect "$out" "samples=7"
+          out=$(bash /tmp/parsecheck.sh); expect "$out" "tasks="; expect "$out" "samples="
+
           # UI mode and its options
           out=$(bash /tmp/parsecheck.sh); expect "$out" "mode=train"
           out=$(bash /tmp/parsecheck.sh --ui --port 8080 --host 0.0.0.0)
@@ -405,6 +490,9 @@ jobs:
           fails --bogus
           fails stray-arg
           fails --ui --port abc
+          fails --eval-samples abc
+          fails --eval-limit xyz
+          fails --tasks
           echo "validation OK"
 
       - name: Upload runner artifact

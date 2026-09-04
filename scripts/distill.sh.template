@@ -45,6 +45,11 @@ PROFILE_EXPLICIT=0                   # 1 once --profile is given on the CLI
 PUBLISH_REPO=""                      # target repo for --publish
 MODE="train"
 
+EVAL_TASKS="${KD_EVAL_TASKS:-}"   # lm-eval task list; empty = fidelity metrics only
+EVAL_SAMPLES="${KD_EVAL_SAMPLES:-}"  # blank = evaluate.py default
+EVAL_LIMIT=""                        # per-task example cap for lm-eval
+EVAL_JSON=""
+
 UI_PORT="${KD_UI_PORT:-7860}"
 UI_HOST="${KD_UI_HOST:-127.0.0.1}"
 UI_SHARE=0
@@ -90,7 +95,11 @@ field() {
 #  Help
 # ---------------------------------------------------------------------------
 usage() {
-  cat <<EOF
+  # QUOTED delimiter, deliberately. With an unquoted <<EOF the shell performs
+  # expansion on the help text, so a backticked example such as `hf auth login`
+  # is EXECUTED - which hangs --help on an interactive prompt for anyone who has
+  # the environment on PATH. Nothing in this text needs expansion.
+  cat <<'EOF'
 distill.sh - knowledge distillation runner (pinned to __SHA_SHORT__)
 
 USAGE
@@ -157,12 +166,31 @@ MODES
                           uses canonical tensor names. Verifies the merged model
                           generates language before uploading anything.
                           Needs `hf auth login` or HF_TOKEN.
+      --evaluate          Measure how much of the teacher actually transferred
+                          into the trained adapter. Reports FIDELITY (top-1
+                          agreement with the teacher, KL divergence) and
+                          CAPABILITY (held-out perplexity), for the BASE student
+                          and the DISTILLED student against the same teacher, on
+                          the held-out split the student never trained on.
+                          Exits 3 if the adapter did not improve on the base.
       --smoke             2-step end-to-end validation (~1 min)
       --ui                Launch the side-by-side comparison web UI
                           (original vs distilled vs teacher) instead of training
       --shell             Open a shell with the environment activated
   -h, --help              Show this help
   -V, --version           Show the pinned build revision
+
+EVALUATION OPTIONS (with --evaluate)
+      --tasks LIST        Also score base/distilled/teacher on lm-evaluation-
+                          harness benchmarks, e.g. ifeval,hellaswag,arc_easy,
+                          and print the retention table (distilled / teacher).
+                          ifeval is the standard benchmark for instruction-shape
+                          compliance, which is what short distillation runs
+                          actually transfer. Installs the `eval` extra on demand.
+      --eval-samples N    Held-out samples to score (default: 50)
+      --eval-limit N      Per-task example cap for --tasks (quick look)
+      --eval-json PATH    Write every metric to a JSON file
+      --adapter DIR       Adapter to evaluate (default: <output>/final_adapter)
 
 UI OPTIONS (with --ui)
       --port N            Port to serve on (default: 7860)
@@ -204,6 +232,12 @@ EXAMPLES
   # Force CPU on a Mac (slow, for comparison)
   ./distill.sh --device cpu --steps 50
 
+  # How much of the teacher actually made it into the student?
+  ./distill.sh --profile finance --evaluate
+
+  # ...and the standard task benchmarks with it (slow: three models)
+  ./distill.sh --profile finance --evaluate --tasks ifeval --eval-limit 100
+
   # Train, then inspect the result in the browser
   ./distill.sh --teacher HuggingFaceTB/SmolLM2-1.7B-Instruct
   ./distill.sh --ui
@@ -217,7 +251,8 @@ ENVIRONMENT
     KD_TEACHER_ADAPTER
     KD_MAX_STEPS      KD_BATCH_SIZE     KD_GRAD_ACCUM         KD_LEARNING_RATE
     KD_LORA_R         KD_LORA_ALPHA     KD_LMBDA              KD_OUTPUT_DIR
-  KD_WORKDIR sets the checkout cache (default: \$HOME/.cache/kd-runner)
+  KD_WORKDIR sets the checkout cache (default: $HOME/.cache/kd-runner)
+  KD_EVAL_TASKS and KD_EVAL_SAMPLES preset the --evaluate options
 
 OUTPUT
   The trained LoRA adapter is written to <output>/final_adapter
@@ -276,6 +311,16 @@ while [ $# -gt 0 ]; do
     --adapter)        need_val "$1" $#; ADAPTER_DIR="$2"; shift 2 ;;
     --adapter=*)      ADAPTER_DIR="${1#*=}"; shift ;;
 
+    --evaluate)       MODE="evaluate"; shift ;;
+    --tasks)          need_val "$1" $#; EVAL_TASKS="$2"; shift 2 ;;
+    --tasks=*)        EVAL_TASKS="${1#*=}"; shift ;;
+    --eval-samples)   need_val "$1" $#; EVAL_SAMPLES="$2"; shift 2 ;;
+    --eval-samples=*) EVAL_SAMPLES="${1#*=}"; shift ;;
+    --eval-limit)     need_val "$1" $#; EVAL_LIMIT="$2"; shift 2 ;;
+    --eval-limit=*)   EVAL_LIMIT="${1#*=}"; shift ;;
+    --eval-json)      need_val "$1" $#; EVAL_JSON="$2"; shift 2 ;;
+    --eval-json=*)    EVAL_JSON="${1#*=}"; shift ;;
+
     --check)          MODE="check"; shift ;;
     --check-teacher)  MODE="check-teacher"; shift ;;
     --fix-teacher)    MODE="fix-teacher"; shift ;;
@@ -302,6 +347,8 @@ case "$DEVICE" in ''|auto|cpu|mps|cuda) ;; *) die "--device must be auto|cpu|mps
 case "$DTYPE"  in ''|auto|float32|bfloat16|float16) ;; *) die "--dtype must be auto|float32|bfloat16|float16 (got '$DTYPE')" ;; esac
 [ -n "$MAX_STEPS" ] && case "$MAX_STEPS" in *[!0-9]*) die "--steps must be a positive integer (got '$MAX_STEPS')" ;; esac
 case "$UI_PORT"  in ''|*[!0-9]*) die "--port must be a positive integer (got '$UI_PORT')" ;; esac
+[ -n "$EVAL_SAMPLES" ] && case "$EVAL_SAMPLES" in *[!0-9]*) die "--eval-samples must be a positive integer (got '$EVAL_SAMPLES')" ;; esac
+[ -n "$EVAL_LIMIT" ] && case "$EVAL_LIMIT" in *[!0-9]*) die "--eval-limit must be a positive integer (got '$EVAL_LIMIT')" ;; esac
 [ -n "$CONFIG_PROFILE" ] && case "$CONFIG_PROFILE" in
   default|mac|smoke|finance|qwen-poc) ;; *) die "--profile must be default|mac|smoke|finance|qwen-poc (got '$CONFIG_PROFILE')" ;;
 esac
@@ -531,6 +578,53 @@ case "$MODE" in
     ok "   Next: ./distill.sh --profile $CONFIG_PROFILE --smoke"
     echo
     ;;
+  evaluate)
+    # The adapter this runner wrote, unless one was named explicitly. With no
+    # --output, evaluate.py resolves <output_dir>/final_adapter from the profile.
+    [ -z "$ADAPTER_DIR" ] && [ -n "$OUTPUT_DIR" ] && ADAPTER_DIR="${OUTPUT_DIR}/final_adapter"
+    EV_ARGS="--config $CONFIG_FILE"
+    [ -n "$ADAPTER_DIR" ] && EV_ARGS="$EV_ARGS --adapter $ADAPTER_DIR"
+    [ -n "$DTYPE" ] && EV_ARGS="$EV_ARGS --dtype $DTYPE"
+    [ -n "$DEVICE" ] && EV_ARGS="$EV_ARGS --device $DEVICE"
+    [ -n "$EVAL_SAMPLES" ] && EV_ARGS="$EV_ARGS --samples $EVAL_SAMPLES"
+    [ -n "$EVAL_JSON" ] && EV_ARGS="$EV_ARGS --json $EVAL_JSON"
+    # The teacher and its adapter are exported as KD_* above, so evaluate.py picks
+    # them up through the same precedence chain training used - the comparison is
+    # only meaningful against the teacher that was actually distilled from.
+    if [ -n "$EVAL_TASKS" ]; then
+      log "Installing the lm-evaluation-harness extra"
+      uv sync --extra eval --quiet || die "uv sync --extra eval failed"
+      EV_ARGS="$EV_ARGS --tasks $EVAL_TASKS"
+      [ -n "$EVAL_LIMIT" ] && EV_ARGS="$EV_ARGS --limit $EVAL_LIMIT"
+    fi
+    log "Evaluating the distilled adapter against the teacher"
+    log "  profile : $CONFIG_PROFILE"
+    log "  adapter : ${ADAPTER_DIR:-(from profile)}"
+    log "  tasks   : ${EVAL_TASKS:-(fidelity + perplexity only)}"
+    log "  (loads the teacher and the student together; this needs memory for both)"
+    set +e
+    # shellcheck disable=SC2086  # EV_ARGS is intentionally word-split into flags
+    uv run python evaluate.py $EV_ARGS
+    EV_RC=$?
+    set -e
+    if [ "$EV_RC" -eq 3 ]; then
+      banner_bad "the adapter did not improve on the base student"
+      bad "   The student is no closer to the teacher than before training."
+      bad "   Verify the teacher first, then train for longer:"
+      bad "     ./distill.sh --profile $CONFIG_PROFILE --check-teacher"
+      bad "     ./distill.sh --profile $CONFIG_PROFILE --steps 600"
+      exit 3
+    fi
+    if [ "$EV_RC" -ne 0 ]; then
+      banner_bad "evaluation did not complete (exit $EV_RC)"
+      exit "$EV_RC"
+    fi
+    banner_ok "evaluation complete"
+    ok "   Fidelity is agreement with the teacher; capability is held-out"
+    ok "   perplexity. Both are reported against the untrained base student,"
+    ok "   which is the only comparison that shows what distillation added."
+    echo
+    ;;
   ui)
     # Default to the adapter this runner would have written, so --ui right after a
     # training run just works. app.py falls back to its own search if it is absent.
@@ -608,7 +702,8 @@ case "$MODE" in
     banner_ok "training complete"
     ok "   adapter : $ABS_OUT/final_adapter"
     echo
-    ok "   Next: ./distill.sh --profile $CONFIG_PROFILE --ui"
+    ok "   Next: ./distill.sh --profile $CONFIG_PROFILE --evaluate"
+    ok "         ./distill.sh --profile $CONFIG_PROFILE --ui"
     echo
     ;;
 esac
