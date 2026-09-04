@@ -193,6 +193,7 @@ jobs:
           uv run python evaluate.py --help | grep -q -- '--teacher-adapter'
           uv run python evaluate.py --help | grep -q -- '--gen-similarity'
           uv run python evaluate.py --help | grep -q -- '--similarity-model'
+          uv run python evaluate.py --help | grep -q -- '--report'
           # The metric maths, on tensors with known answers. These are the numbers
           # the whole mode reports, so a silent shift here would be invisible.
           uv run python - <<'PY'
@@ -303,6 +304,70 @@ jobs:
           # explanatory footer still names it, so assert on the ROW, not the word.
           assert "ROUGE-L vs teacher" not in out, out
           print("generation similarity reporting OK")
+
+          # The readable report. Both formats must render from one payload, the
+          # extension must pick the format, and a run WITHOUT --gen-similarity must
+          # simply omit that section rather than crash.
+          import json, tempfile, os
+          payload = {
+              "teacher": "org/T", "teacher_adapter": None, "student": "org/S",
+              "adapter": "./a", "device": "cpu", "dtype": "float32",
+              "samples": 50, "completion_tokens": 9000,
+              "fidelity": {"top1_agreement_base_pct": 65.5,
+                           "top1_agreement_distilled_pct": 71.15,
+                           "agreement_lift_pts": 5.65,
+                           "kl_base": 0.51, "kl_distilled": 0.36},
+              "capability": {"perplexity_teacher": 14.3, "perplexity_base": 23.8,
+                             "perplexity_distilled": 20.0, "gap_recovered_pct": 40.1},
+              "closeness_to_teacher": {
+                  "prediction_agreement_base_pct": 65.5,
+                  "prediction_agreement_distilled_pct": 71.15,
+                  "perplexity_retention_base_pct": 60.0,
+                  "perplexity_retention_distilled_pct": 71.5},
+              "efficiency": {"teacher_params": 1882000000, "student_params": 773000000,
+                             "adapter_params": 20450000,
+                             "teacher_tok_per_s": 17.1, "distilled_tok_per_s": 26.7},
+              "generation_similarity": None,
+          }
+          tmp = tempfile.mkdtemp()
+          md = m.write_report(payload, os.path.join(tmp, "r.md"))
+          html = m.write_report(payload, os.path.join(tmp, "r.html"))
+          md_text = open(md, encoding="utf-8").read()
+          html_text = open(html, encoding="utf-8").read()
+          assert md_text.startswith("# Distillation evaluation"), md_text[:80]
+          assert "| Prediction agreement | 65.50% | **71.15%** | 100% |" in md_text, md_text
+          assert html_text.startswith("<!doctype html>"), html_text[:60]
+
+          # Theme correctness: the artifact renders in the viewer's theme, and a
+          # palette defined ONLY inside a media query leaves the un-stamped state
+          # painting one theme's text on the other theme's ground.
+          assert "prefers-color-scheme: dark" in html_text
+          assert '[data-theme="dark"]' in html_text
+          assert "--paper:#FBFBFD" in html_text, "light palette not on bare :root"
+
+          # The headline number and the gap bar must both reflect the payload.
+          assert '<div class="big">40%' in html_text, "gap-recovered headline missing"
+          assert 'class="seg-gain"' in html_text, "gap bar missing"
+
+          # No generation_similarity -> that section is simply absent.
+          assert "Free-running similarity" not in md_text
+          assert "Free-running similarity" not in html_text
+
+          # With it, the section appears in both formats.
+          payload["generation_similarity"] = {
+              "prompts": 50, "max_new_tokens": 64,
+              "bertscore_f1_base": 0.8712, "bertscore_f1_distilled": 0.8815,
+              "rougeL_base": 0.2639, "rougeL_distilled": 0.3041}
+          md_text = open(m.write_report(payload, os.path.join(tmp, "r2.md")),
+                         encoding="utf-8").read()
+          assert "Free-running similarity" in md_text, md_text
+
+          # The plain-English summary must name the wording/meaning split, which is
+          # the finding a reader is most likely to misread from the raw numbers.
+          summary = " ".join(m.plain_summary(payload))
+          assert "The training worked" in summary, summary
+          assert "WORDING" in summary and "MEANING" in summary, summary
+          print("readable report OK")
 
           print("evaluation metrics OK")
           PY
@@ -471,6 +536,7 @@ jobs:
           echo "mode=$MODE"
           echo "tasks=$EVAL_TASKS"
           echo "samples=$EVAL_SAMPLES"
+          echo "report=$EVAL_REPORT"
           echo "adapter=$TEACHER_ADAPTER"
           echo "profile=$CONFIG_PROFILE"
           echo "explicit=$PROFILE_EXPLICIT"
@@ -527,6 +593,11 @@ jobs:
           # Evaluation mode and its options
           out=$(bash /tmp/parsecheck.sh --evaluate)
           expect "$out" "mode=evaluate"
+          out=$(bash /tmp/parsecheck.sh --evaluate --report /tmp/r.html)
+          expect "$out" "report=/tmp/r.html"
+          out=$(bash /tmp/parsecheck.sh --evaluate --report=/tmp/r.md)
+          expect "$out" "report=/tmp/r.md"
+          out=$(bash /tmp/parsecheck.sh); expect "$out" "report="
           out=$(bash /tmp/parsecheck.sh --evaluate --tasks ifeval --eval-samples 100)
           expect "$out" "tasks=ifeval"; expect "$out" "samples=100"
           out=$(bash /tmp/parsecheck.sh --evaluate --tasks=a,b --eval-samples=7)
@@ -560,6 +631,7 @@ jobs:
           fails --eval-samples abc
           fails --eval-limit xyz
           fails --tasks
+          fails --report
           echo "validation OK"
 
       - name: Upload runner artifact
