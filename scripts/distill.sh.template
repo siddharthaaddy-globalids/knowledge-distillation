@@ -51,6 +51,7 @@ SIMILARITY_MODEL=""                  # BERTScore encoder override
 EVAL_SAMPLES="${KD_EVAL_SAMPLES:-}"  # blank = evaluate.py default
 EVAL_LIMIT=""                        # per-task example cap for lm-eval
 EVAL_JSON=""
+EVAL_REPORT=""                       # readable report; .md or .html
 
 UI_PORT="${KD_UI_PORT:-7860}"
 UI_HOST="${KD_UI_HOST:-127.0.0.1}"
@@ -199,7 +200,12 @@ EVALUATION OPTIONS (with --evaluate)
                           own drift. This does. Slow: three models generate.
       --similarity-model ID
                           BERTScore encoder (default: roberta-large, ~1.4GB)
-      --eval-json PATH    Write every metric to a JSON file
+      --report PATH       Write a READABLE report next to the raw numbers. The
+                          extension picks the format: .md for Markdown, .html for
+                          a self-contained page you can open or send to someone.
+                          Leads with a plain-English summary, so a reader does not
+                          need to know what perplexity is.
+      --eval-json PATH    Write every metric to a JSON file (machine-readable)
       --adapter DIR       Adapter to evaluate (default: <output>/final_adapter)
 
 UI OPTIONS (with --ui)
@@ -334,6 +340,8 @@ while [ $# -gt 0 ]; do
     --similarity-model) need_val "$1" $#; SIMILARITY_MODEL="$2"; shift 2 ;;
     --similarity-model=*) SIMILARITY_MODEL="${1#*=}"; shift ;;
     --eval-json=*)    EVAL_JSON="${1#*=}"; shift ;;
+    --report)         need_val "$1" $#; EVAL_REPORT="$2"; shift 2 ;;
+    --report=*)       EVAL_REPORT="${1#*=}"; shift ;;
 
     --check)          MODE="check"; shift ;;
     --check-teacher)  MODE="check-teacher"; shift ;;
@@ -348,8 +356,10 @@ while [ $# -gt 0 ]; do
     -V|--version)     echo "distill.sh pinned to __REPO__@__SHA_SHORT__ (built __BUILT_AT__)"; exit 0 ;;
 
     --) shift; break ;;
-    -*) die "Unknown option: $1  (run --help)" ;;
-    *)  die "Unexpected argument: $1  (run --help)" ;;
+    -*) die "Unknown option: '$1'  (run --help)" ;;
+    *)  die "Unexpected argument: '$1'  (run --help). A blank one usually means a
+    trailing space after a line-continuation backslash - the backslash escaped the
+    space instead of the newline." ;;
   esac
 done
 
@@ -603,6 +613,7 @@ case "$MODE" in
     [ -n "$DEVICE" ] && EV_ARGS="$EV_ARGS --device $DEVICE"
     [ -n "$EVAL_SAMPLES" ] && EV_ARGS="$EV_ARGS --samples $EVAL_SAMPLES"
     [ -n "$EVAL_JSON" ] && EV_ARGS="$EV_ARGS --json $EVAL_JSON"
+    [ -n "$EVAL_REPORT" ] && EV_ARGS="$EV_ARGS --report $EVAL_REPORT"
     # The teacher and its adapter are exported as KD_* above, so evaluate.py picks
     # them up through the same precedence chain training used - the comparison is
     # only meaningful against the teacher that was actually distilled from.
