@@ -86,6 +86,15 @@ def parse_args():
                     help="Per-task example cap passed to lm-eval (use for a quick look)")
     ap.add_argument("--no-generations", action="store_true",
                     help="Skip the qualitative side-by-side generations")
+    ap.add_argument("--gen-similarity", type=int, default=0, metavar="N",
+                    help="Also measure free-running generation similarity to the "
+                         "teacher on N held-out prompts (BERTScore + ROUGE-L). "
+                         "0 = off. Unlike agreement/KL this is NOT teacher-forced, "
+                         "so it captures the student's own drift. Slow: generates "
+                         "from three models. Requires `uv sync --extra eval`.")
+    ap.add_argument("--similarity-model", default="roberta-large", metavar="ID",
+                    help="Encoder for BERTScore (default: roberta-large, the "
+                         "bert-score English default; ~1.4GB on first use)")
     ap.add_argument("--json", default=None, metavar="PATH",
                     help="Write all metrics to a JSON file")
     return ap.parse_args()
@@ -203,6 +212,117 @@ def generate(model, tokenizer, prompt, device, new_tokens=64):
                              repetition_penalty=1.1,
                              pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
     return tokenizer.decode(out[0][ids.input_ids.shape[1]:], skip_special_tokens=True).strip()
+
+
+# --------------------------------------------------------------------------- #
+# Optional: free-running generation similarity
+# --------------------------------------------------------------------------- #
+def generation_similarity(student, teacher, tokenizer, prompts, device,
+                          model_type="roberta-large", new_tokens=64):
+    """Does the student SAY what the teacher says, when each writes freely?
+
+    Agreement and KL are teacher-forced: both models read the same correct text,
+    so neither ever sees the student's own drift. At inference the student runs
+    free and its errors compound. This generates from each model independently on
+    the same prompts and compares the resulting text, which is the behaviour a
+    user actually experiences.
+
+    BERTScore is the primary metric because these are free-text answers with many
+    valid phrasings. Exact-match and n-gram metrics punish paraphrase: on two
+    sentences that mean the same thing, exact_match scores 0.0 and ROUGE-2 scores
+    0.0 (the shared words appear in a different order), while BERTScore - which
+    compares contextual embeddings rather than spelling - scores ~0.95. ROUGE-L is
+    reported beside it only as a cheap surface-overlap reference point.
+
+    The comparison is student-vs-TEACHER, not student-vs-dataset-reference: this
+    is a fidelity measurement, not a correctness one.
+    """
+    teacher_gen, base_gen, dist_gen = [], [], []
+    for index, prompt in enumerate(prompts):
+        teacher_gen.append(generate(teacher, tokenizer, prompt, device, new_tokens))
+        dist_gen.append(generate(student, tokenizer, prompt, device, new_tokens))
+        with student.disable_adapter():
+            base_gen.append(generate(student, tokenizer, prompt, device, new_tokens))
+        if (index + 1) % 5 == 0:
+            print(f"   {index + 1}/{len(prompts)} prompts generated (3 models each)")
+
+    # A model can legitimately emit nothing; both scorers choke on an empty string.
+    clean = lambda texts: [t if t.strip() else "(empty)" for t in texts]
+    teacher_gen, base_gen, dist_gen = (clean(teacher_gen), clean(base_gen),
+                                       clean(dist_gen))
+
+    result = {"prompts": len(prompts), "max_new_tokens": new_tokens}
+
+    try:
+        from rouge_score import rouge_scorer
+        scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+        mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
+        result["rougeL_base"] = mean([scorer.score(t, c)["rougeL"].fmeasure
+                                      for t, c in zip(teacher_gen, base_gen)])
+        result["rougeL_distilled"] = mean([scorer.score(t, c)["rougeL"].fmeasure
+                                           for t, c in zip(teacher_gen, dist_gen)])
+    except ImportError:
+        print(" !! rouge_score not installed; skipping ROUGE-L")
+
+    try:
+        from bert_score import score as bert_score_fn
+    except ImportError:
+        print("\n !! bert-score is not installed, so only ROUGE-L was computed.")
+        print("    BERTScore is the metric that actually handles paraphrase here:")
+        print("      uv sync --extra eval")
+        return result, {"teacher": teacher_gen, "base": base_gen, "distilled": dist_gen}
+
+    print(f"   scoring with BERTScore ({model_type}; first run downloads it)")
+    for label, cands in (("base", base_gen), ("distilled", dist_gen)):
+        _, _, f1 = bert_score_fn(cands, teacher_gen, model_type=model_type,
+                                 verbose=False, batch_size=8)
+        result[f"bertscore_f1_{label}"] = float(f1.mean())
+
+    return result, {"teacher": teacher_gen, "base": base_gen, "distilled": dist_gen}
+
+
+def report_similarity(result):
+    print("\n" + BAR)
+    print("  GENERATION SIMILARITY - free-running, vs the teacher's own output")
+    print(BAR)
+    print(f"\n  {result['prompts']} prompts, greedy decoding, "
+          f"{result['max_new_tokens']} new tokens per model\n")
+    print(f"  {'metric':34} {'base':>10} {'distilled':>11} {'change':>12}")
+    print("  " + "-" * 70)
+
+    rows = [("BERTScore F1 vs teacher", "bertscore_f1_base", "bertscore_f1_distilled"),
+            ("ROUGE-L vs teacher", "rougeL_base", "rougeL_distilled")]
+    for title, base_key, dist_key in rows:
+        if base_key not in result or dist_key not in result:
+            continue
+        b, d = result[base_key], result[dist_key]
+        print(f"  {title:34} {b:10.4f} {d:11.4f} {d - b:+12.4f}")
+
+    print("""
+  This is the one measurement here taken with the models running FREE rather
+  than reading the reference text, so it is the closest to what a user sees.
+  BERTScore compares meaning, so a correct answer worded differently is not
+  punished; ROUGE-L compares word overlap and is shown only for contrast.""")
+
+    # Free-running generation is far noisier than the teacher-forced metrics: a
+    # single divergent token early in a greedy decode changes the whole
+    # continuation. Small prompt counts routinely produce a change of either sign.
+    if result["prompts"] < 20:
+        print(f"\n  !! ONLY {result['prompts']} PROMPTS - treat the change column as noise.")
+        print("     Greedy generation diverges on a single early token, so this")
+        print("     metric needs 50+ prompts before a small difference means")
+        print("     anything. Raise --gen-similarity.")
+
+    # Worth saying out loud when it happens: the two families of fidelity metric
+    # genuinely can disagree, and that disagreement is informative rather than a bug.
+    b = result.get("bertscore_f1_base")
+    d = result.get("bertscore_f1_distilled")
+    if isinstance(b, (int, float)) and isinstance(d, (int, float)) and d < b:
+        print("\n  Note: free-running similarity did NOT improve, even if the")
+        print("  teacher-forced agreement above did. That combination means the")
+        print("  student matches the teacher well when reading correct text, but")
+        print("  still drifts when writing on its own - the gap on-policy training")
+        print("  (a higher gkd.lmbda) is meant to close.")
 
 
 # --------------------------------------------------------------------------- #
@@ -574,6 +694,21 @@ def main():
             print(f"    distilled : {dist_text[:220]}")
             print(f"    teacher   : {teach_text[:220]}")
 
+    similarity, similarity_texts = None, None
+    if args.gen_similarity > 0:
+        print("\n" + BAR)
+        print(f"  Generating from three models on {args.gen_similarity} held-out "
+              f"prompts...")
+        print(BAR)
+        # The user turn of each held-out sample: real domain prompts the student
+        # was never trained on, not the handful of benchmark_prompts.
+        prompts = [m[-2]["content"] for m in samples[:args.gen_similarity]
+                   if len(m) >= 2]
+        similarity, similarity_texts = generation_similarity(
+            student, teacher, tokenizer, prompts, device,
+            model_type=args.similarity_model)
+        report_similarity(similarity)
+
     payload = {
         "teacher": teacher_id,
         "teacher_adapter": teacher_adapter,
@@ -611,6 +746,8 @@ def main():
             "distilled_tok_per_s": tps_dist,
         },
         "generations": generations,
+        "generation_similarity": similarity,
+        "generation_similarity_texts": similarity_texts,
     }
 
     # Free the resident models before lm-eval spawns its own processes. Not

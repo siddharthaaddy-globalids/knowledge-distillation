@@ -191,6 +191,8 @@ jobs:
           uv run python evaluate.py --help | grep -q -- '--tasks'
           uv run python evaluate.py --help | grep -q -- '--samples'
           uv run python evaluate.py --help | grep -q -- '--teacher-adapter'
+          uv run python evaluate.py --help | grep -q -- '--gen-similarity'
+          uv run python evaluate.py --help | grep -q -- '--similarity-model'
           # The metric maths, on tensors with known answers. These are the numbers
           # the whole mode reports, so a silent shift here would be invisible.
           uv run python - <<'PY'
@@ -271,6 +273,36 @@ jobs:
               m.report_tasks(res)
           assert "NOT SIGNIFICANT" not in buf.getvalue(), buf.getvalue()
           print("retention table OK")
+
+          # Free-running similarity reporting. The scoring itself needs an encoder
+          # download, so only the reporting contract is asserted here: the caution
+          # for small prompt counts, and the note fired when free-running
+          # similarity disagrees with the teacher-forced metrics. Both exist to stop
+          # a reader drawing a conclusion the sample size does not support.
+          sim = {"prompts": 4, "max_new_tokens": 64,
+                 "bertscore_f1_base": 0.8968, "bertscore_f1_distilled": 0.8921,
+                 "rougeL_base": 0.3406, "rougeL_distilled": 0.3371}
+          buf = io.StringIO()
+          with contextlib.redirect_stdout(buf):
+              m.report_similarity(sim)
+          out = buf.getvalue()
+          assert "ONLY 4 PROMPTS" in out, out
+          assert "did NOT improve" in out, out
+          assert "BERTScore F1 vs teacher" in out and "ROUGE-L vs teacher" in out, out
+
+          # A large, improving run must produce neither caution.
+          sim = {"prompts": 100, "max_new_tokens": 64,
+                 "bertscore_f1_base": 0.74, "bertscore_f1_distilled": 0.81}
+          buf = io.StringIO()
+          with contextlib.redirect_stdout(buf):
+              m.report_similarity(sim)
+          out = buf.getvalue()
+          assert "PROMPTS - treat" not in out, out
+          assert "did NOT improve" not in out, out
+          # ROUGE-L absent (rouge_score missing) must not break the table. The
+          # explanatory footer still names it, so assert on the ROW, not the word.
+          assert "ROUGE-L vs teacher" not in out, out
+          print("generation similarity reporting OK")
 
           print("evaluation metrics OK")
           PY

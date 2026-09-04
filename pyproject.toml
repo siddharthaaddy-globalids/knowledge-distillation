@@ -22,6 +22,11 @@ dependencies = [
 [project.optional-dependencies]
 eval = [
     "lm-eval[ifeval]>=0.4.5",
+    # Free-running generation similarity (--gen-similarity). bert-score compares
+    # contextual embeddings rather than surface strings, so a correct answer worded
+    # differently is not scored as wrong - which exact-match and n-gram metrics do.
+    "bert-score>=0.3.13",
+    "rouge-score>=0.1.2",
 ]
 
 # Pull CPU-only torch wheels on Linux and Windows. Without this, Linux resolves the

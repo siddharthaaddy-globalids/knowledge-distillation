@@ -46,6 +46,8 @@ PUBLISH_REPO=""                      # target repo for --publish
 MODE="train"
 
 EVAL_TASKS="${KD_EVAL_TASKS:-}"   # lm-eval task list; empty = fidelity metrics only
+GEN_SIMILARITY=""                    # N prompts for free-running similarity; empty = off
+SIMILARITY_MODEL=""                  # BERTScore encoder override
 EVAL_SAMPLES="${KD_EVAL_SAMPLES:-}"  # blank = evaluate.py default
 EVAL_LIMIT=""                        # per-task example cap for lm-eval
 EVAL_JSON=""
@@ -189,6 +191,14 @@ EVALUATION OPTIONS (with --evaluate)
                           actually transfer. Installs the `eval` extra on demand.
       --eval-samples N    Held-out samples to score (default: 50)
       --eval-limit N      Per-task example cap for --tasks (quick look)
+      --gen-similarity N  Also compare FREE-RUNNING generations against the
+                          teacher's own output on N held-out prompts, using
+                          BERTScore (meaning, not word overlap) plus ROUGE-L.
+                          Agreement and KL are teacher-forced - both models read
+                          the same correct text - so they never see the student's
+                          own drift. This does. Slow: three models generate.
+      --similarity-model ID
+                          BERTScore encoder (default: roberta-large, ~1.4GB)
       --eval-json PATH    Write every metric to a JSON file
       --adapter DIR       Adapter to evaluate (default: <output>/final_adapter)
 
@@ -319,6 +329,10 @@ while [ $# -gt 0 ]; do
     --eval-limit)     need_val "$1" $#; EVAL_LIMIT="$2"; shift 2 ;;
     --eval-limit=*)   EVAL_LIMIT="${1#*=}"; shift ;;
     --eval-json)      need_val "$1" $#; EVAL_JSON="$2"; shift 2 ;;
+    --gen-similarity) need_val "$1" $#; GEN_SIMILARITY="$2"; shift 2 ;;
+    --gen-similarity=*) GEN_SIMILARITY="${1#*=}"; shift ;;
+    --similarity-model) need_val "$1" $#; SIMILARITY_MODEL="$2"; shift 2 ;;
+    --similarity-model=*) SIMILARITY_MODEL="${1#*=}"; shift ;;
     --eval-json=*)    EVAL_JSON="${1#*=}"; shift ;;
 
     --check)          MODE="check"; shift ;;
@@ -349,6 +363,7 @@ case "$DTYPE"  in ''|auto|float32|bfloat16|float16) ;; *) die "--dtype must be a
 case "$UI_PORT"  in ''|*[!0-9]*) die "--port must be a positive integer (got '$UI_PORT')" ;; esac
 [ -n "$EVAL_SAMPLES" ] && case "$EVAL_SAMPLES" in *[!0-9]*) die "--eval-samples must be a positive integer (got '$EVAL_SAMPLES')" ;; esac
 [ -n "$EVAL_LIMIT" ] && case "$EVAL_LIMIT" in *[!0-9]*) die "--eval-limit must be a positive integer (got '$EVAL_LIMIT')" ;; esac
+[ -n "$GEN_SIMILARITY" ] && case "$GEN_SIMILARITY" in *[!0-9]*) die "--gen-similarity must be a positive integer (got '$GEN_SIMILARITY')" ;; esac
 [ -n "$CONFIG_PROFILE" ] && case "$CONFIG_PROFILE" in
   default|mac|smoke|finance|qwen-poc) ;; *) die "--profile must be default|mac|smoke|finance|qwen-poc (got '$CONFIG_PROFILE')" ;;
 esac
@@ -591,9 +606,14 @@ case "$MODE" in
     # The teacher and its adapter are exported as KD_* above, so evaluate.py picks
     # them up through the same precedence chain training used - the comparison is
     # only meaningful against the teacher that was actually distilled from.
-    if [ -n "$EVAL_TASKS" ]; then
-      log "Installing the lm-evaluation-harness extra"
+    [ -n "$GEN_SIMILARITY" ] && EV_ARGS="$EV_ARGS --gen-similarity $GEN_SIMILARITY"
+    [ -n "$SIMILARITY_MODEL" ] && EV_ARGS="$EV_ARGS --similarity-model $SIMILARITY_MODEL"
+    # Both the benchmark harness and the similarity scorers live in the same extra.
+    if [ -n "$EVAL_TASKS" ] || [ -n "$GEN_SIMILARITY" ]; then
+      log "Installing the evaluation extra (lm-eval, bert-score)"
       uv sync --extra eval --quiet || die "uv sync --extra eval failed"
+    fi
+    if [ -n "$EVAL_TASKS" ]; then
       EV_ARGS="$EV_ARGS --tasks $EVAL_TASKS"
       [ -n "$EVAL_LIMIT" ] && EV_ARGS="$EV_ARGS --limit $EVAL_LIMIT"
     fi
