@@ -14,6 +14,11 @@
 # ===========================================================================
 set -euo pipefail
 
+# Absolute path to this script, captured before any cd. The control UI re-invokes
+# the runner for every action it performs, so it needs a path that survives the
+# working-directory change into $SRC_DIR further down.
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
 # ---------------------------------------------------------------------------
 #  Defaults. Override with CLI flags (preferred) or KD_* environment variables.
 #  Precedence: CLI flag  >  KD_* env var  >  these defaults.
@@ -56,6 +61,7 @@ EVAL_REPORT=""                       # readable report; .md or .html
 UI_PORT="${KD_UI_PORT:-7860}"
 UI_HOST="${KD_UI_HOST:-127.0.0.1}"
 UI_SHARE=0
+UI_APP="control"                     # control = full panel, compare = 3-model view
 ADAPTER_DIR="${KD_ADAPTER_PATH:-}"
 
 REPO_URL="__REPO_URL__"
@@ -177,7 +183,10 @@ MODES
                           the held-out split the student never trained on.
                           Exits 3 if the adapter did not improve on the base.
       --smoke             2-step end-to-end validation (~1 min)
-      --ui                Launch the side-by-side comparison web UI
+      --ui                Launch the control panel: train, evaluate and compare
+                          from the browser. Every screen shows the command it
+                          runs, so nothing here is hidden from the terminal.
+      --ui-compare        Launch only the side-by-side comparison UI
                           (original vs distilled vs teacher) instead of training
       --shell             Open a shell with the environment activated
   -h, --help              Show this help
@@ -208,7 +217,7 @@ EVALUATION OPTIONS (with --evaluate)
       --eval-json PATH    Write every metric to a JSON file (machine-readable)
       --adapter DIR       Adapter to evaluate (default: <output>/final_adapter)
 
-UI OPTIONS (with --ui)
+UI OPTIONS (with --ui / --ui-compare)
       --port N            Port to serve on (default: 7860)
       --host ADDR         Bind address (default: 127.0.0.1)
       --share             Create a public Gradio share link
@@ -351,6 +360,7 @@ while [ $# -gt 0 ]; do
     --convert-adapter) MODE="convert-adapter"; shift ;;
     --smoke)          MODE="smoke"; shift ;;
     --ui)             MODE="ui"; shift ;;
+    --ui-compare)     MODE="ui"; UI_APP="compare"; shift ;;
     --shell)          MODE="shell"; shift ;;
     -h|--help)        usage; exit 0 ;;
     -V|--version)     echo "distill.sh pinned to __REPO__@__SHA_SHORT__ (built __BUILT_AT__)"; exit 0 ;;
@@ -377,6 +387,13 @@ case "$UI_PORT"  in ''|*[!0-9]*) die "--port must be a positive integer (got '$U
 [ -n "$CONFIG_PROFILE" ] && case "$CONFIG_PROFILE" in
   default|mac|smoke|finance|qwen-poc) ;; *) die "--profile must be default|mac|smoke|finance|qwen-poc (got '$CONFIG_PROFILE')" ;;
 esac
+
+# The control panel shells back into this script for every action it performs, so
+# refuse to nest one inside another: it would fork a second server onto the same port.
+# Checked before the bootstrap, so it fails in a second rather than after a uv sync.
+if [ "$MODE" = "ui" ] && [ -n "${KD_UI_ACTIVE:-}" ]; then
+  die "A control UI is already running - this shell was started by it."
+fi
 
 # ---------------------------------------------------------------------------
 #  1. Platform detection
@@ -658,22 +675,39 @@ case "$MODE" in
     ;;
   ui)
     # Default to the adapter this runner would have written, so --ui right after a
-    # training run just works. app.py falls back to its own search if it is absent.
-    # With no explicit --output, let app.py discover the newest adapter itself.
+    # training run just works. The UI falls back to its own search if it is absent.
+    # With no explicit --output, let the UI discover the newest adapter itself.
     [ -z "$ADAPTER_DIR" ] && [ -n "$OUTPUT_DIR" ] && ADAPTER_DIR="${OUTPUT_DIR}/final_adapter"
-    UI_ARGS="--host $UI_HOST --port $UI_PORT --config $CONFIG_FILE"
-    [ -n "$TEACHER_MODEL" ] && UI_ARGS="$UI_ARGS --teacher $TEACHER_MODEL"
-    [ -n "$STUDENT_MODEL" ] && UI_ARGS="$UI_ARGS --student $STUDENT_MODEL"
-    # Without this the reference column would show the base teacher rather than
-    # the fine-tuned one that was actually distilled from.
-    [ -n "$TEACHER_ADAPTER" ] && UI_ARGS="$UI_ARGS --teacher-adapter $TEACHER_ADAPTER"
-    [ -n "$ADAPTER_DIR" ] && [ -d "$ADAPTER_DIR" ] && UI_ARGS="$UI_ARGS --adapter $ADAPTER_DIR"
-    [ "$UI_SHARE" -eq 1 ] && UI_ARGS="$UI_ARGS --share"
-    log "Launching comparison UI on http://$UI_HOST:$UI_PORT"
-    log "  adapter : ${ADAPTER_DIR:-(auto-discovered)}"
-    log "  (loads three models - first start takes a minute; Ctrl+C to stop)"
-    # shellcheck disable=SC2086  # UI_ARGS is intentionally word-split into flags
-    uv run python app.py $UI_ARGS
+    if [ "$UI_APP" = "control" ]; then
+      # The panel re-invokes this exact script to train and evaluate, so hand it the
+      # path captured before the cd: the working directory is $SRC_DIR by now, not
+      # wherever the user keeps distill.sh.
+      export KD_RUNNER="$SELF"
+      export KD_UI_HOST="$UI_HOST"
+      export KD_UI_PORT="$UI_PORT"
+      [ -n "$ADAPTER_DIR" ] && [ -d "$ADAPTER_DIR" ] && export KD_ADAPTER_PATH="$ADAPTER_DIR"
+      UI_ARGS="--host $UI_HOST --port $UI_PORT"
+      [ "$UI_SHARE" -eq 1 ] && UI_ARGS="$UI_ARGS --share"
+      log "Launching the control panel on http://$UI_HOST:$UI_PORT"
+      log "  Train, evaluate and compare from the browser; every screen shows the"
+      log "  command it runs. Ctrl+C to stop."
+      # shellcheck disable=SC2086  # UI_ARGS is intentionally word-split into flags
+      uv run python control_app.py $UI_ARGS
+    else
+      UI_ARGS="--host $UI_HOST --port $UI_PORT --config $CONFIG_FILE"
+      [ -n "$TEACHER_MODEL" ] && UI_ARGS="$UI_ARGS --teacher $TEACHER_MODEL"
+      [ -n "$STUDENT_MODEL" ] && UI_ARGS="$UI_ARGS --student $STUDENT_MODEL"
+      # Without this the reference column would show the base teacher rather than
+      # the fine-tuned one that was actually distilled from.
+      [ -n "$TEACHER_ADAPTER" ] && UI_ARGS="$UI_ARGS --teacher-adapter $TEACHER_ADAPTER"
+      [ -n "$ADAPTER_DIR" ] && [ -d "$ADAPTER_DIR" ] && UI_ARGS="$UI_ARGS --adapter $ADAPTER_DIR"
+      [ "$UI_SHARE" -eq 1 ] && UI_ARGS="$UI_ARGS --share"
+      log "Launching comparison UI on http://$UI_HOST:$UI_PORT"
+      log "  adapter : ${ADAPTER_DIR:-(auto-discovered)}"
+      log "  (loads three models - first start takes a minute; Ctrl+C to stop)"
+      # shellcheck disable=SC2086  # UI_ARGS is intentionally word-split into flags
+      uv run python app.py $UI_ARGS
+    fi
     ;;
   shell)
     log "Entering a shell with the environment active. Exit to return."

@@ -14,7 +14,7 @@ plain CPU.
 ./distill.sh --smoke          # 2 steps end-to-end (~1 min)
 ./distill.sh                  # the real run
 ./distill.sh --evaluate       # how much of the teacher actually transferred?
-./distill.sh --ui             # compare base vs distilled vs teacher in a browser
+./distill.sh --ui             # drive all of the above from a browser instead
 ```
 
 If you want to understand *what* is happening rather than *how to run it*, read
@@ -298,7 +298,8 @@ If step 2 fails, the runner prints the repair to try:
 | `--publish REPO` | Publish the trained adapter to `REPO-lora` and a `transformers`-merged model to `REPO` on the Hugging Face Hub. Verifies the merged model generates language *before* uploading anything. Needs `hf auth login` or `HF_TOKEN`. |
 | `--evaluate` | Measure how much of the teacher transferred. Reports **fidelity** (top-1 agreement with the teacher, KL divergence) and **capability** (held-out perplexity) for the base student *and* the distilled student against the same teacher, plus efficiency. Optionally runs lm-evaluation-harness benchmarks with `--tasks`. Exits `3` if the adapter did not improve on the base. See [§15](#15-measuring-the-result). |
 | `--smoke` | 2-step end-to-end validation (~1 min). Prints trainable params, held-out loss, s/step, and projects the full run time. |
-| `--ui` | Launch the Gradio comparison UI (original student vs distilled student vs teacher) instead of training. |
+| `--ui` | Launch the control panel instead of training: a browser UI that runs training and evaluation, streams their logs live, renders the evaluation report, and compares the three models. Every screen shows the `./distill.sh` command it is about to run, so it drives the CLI rather than replacing it. See [the control panel](#the-control-panel---ui). |
+| `--ui-compare` | Launch only the side-by-side comparison UI (original student vs distilled student vs teacher) — the panel's Compare tab on its own. |
 | `--shell` | Drop into a shell with the environment activated. |
 | `-h, --help` | Full help text. |
 | `-V, --version` | Pinned build revision. |
@@ -347,7 +348,7 @@ If step 2 fails, the runner prints the repair to try:
 | `--eval-json PATH` | *(none)* | Write every metric to JSON. |
 | `--adapter DIR` | `<output>/final_adapter` | Which adapter to evaluate. |
 
-### UI options (with `--ui`)
+### UI options (with `--ui` / `--ui-compare`)
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -358,6 +359,37 @@ If step 2 fails, the runner prints the repair to try:
 
 All flags accept both `--flag value` and `--flag=value`. Unknown flags and stray
 positional arguments are rejected rather than ignored.
+
+### The control panel (`--ui`)
+
+`./distill.sh --ui` bootstraps as usual — uv, the pinned checkout, `uv sync` — and then
+serves a browser UI instead of training. It does not reimplement the pipeline: each
+action shells back into this same `distill.sh`, so profile resolution, `KD_*`
+precedence and the meaning of every exit code stay in one place. The command it is
+about to run is printed on screen, which makes the panel a way to learn the CLI rather
+than a way to avoid it.
+
+| Tab | What it does |
+|---|---|
+| **Train** | The training flags as a form. Blank fields mean "inherit from the profile", exactly as on the command line. Starts the run, streams its log live, and stops it — killing the whole process tree, not just the shell. |
+| **Evaluate** | Runs `--evaluate` and renders the Markdown report it writes. Exit `3` is reported in words: the adapter got no closer to the teacher than the base student. |
+| **Compare** | `app.py`'s three-way comparison, loaded on demand — the models are not held in memory while you train, and the panel refuses to load them mid-run. |
+
+Two behaviours worth knowing:
+
+- **The output directory defaults to an absolute path under your working directory.**
+  The runner does its work inside its own pinned checkout (`$KD_WORKDIR/src`), so a
+  relative output path would drop the adapter somewhere the Evaluate and Compare tabs
+  never look. Report and metrics paths are absolutised for the same reason.
+- **One job at a time.** Two trainings, or a training plus three loaded comparison
+  models, will exhaust memory on a laptop. The second request is refused with a message
+  rather than queued.
+
+In a source checkout there is no built `distill.sh` (CI renders it from the template),
+so the same forms fall back to invoking `train_scaled.py` / `evaluate.py` directly with
+the `KD_*` variables the script would have exported. The panel header says which
+backend is live. On Windows the runner backend needs Git Bash on `PATH`; without it the
+panel uses the direct backend.
 
 ---
 
@@ -553,12 +585,12 @@ only the newest 2 by default.
 ./distill.sh --device cpu --steps 50
 ```
 
-**Inspect the result, then share it on the LAN**
+**Drive the whole thing from a browser, then share it on the LAN**
 
 ```bash
 ./distill.sh --ui
 ./distill.sh --ui --host 0.0.0.0 --port 8080
-./distill.sh --ui --adapter "$PWD/my-run/final_adapter"
+./distill.sh --ui-compare --adapter "$PWD/my-run/final_adapter"
 ```
 
 **Measure how much of the teacher transferred**
@@ -603,7 +635,8 @@ uv sync
 | `--convert-adapter` | `uv run python convert_mlx_adapter.py --adapter <mlx> --out ./peft-adapter` |
 | `--publish` | `uv run python publish_model.py --repo my-org/name --config configs/qwen-poc.yaml` |
 | `--evaluate` | `uv run python evaluate.py --config configs/finance.yaml` |
-| `--ui` | `uv run python app.py --config configs/default.yaml` |
+| `--ui` | `uv run python control_app.py --host 127.0.0.1 --port 7860` |
+| `--ui-compare` | `uv run python app.py --config configs/default.yaml` |
 
 `train_scaled.py` has flags the runner does not expose:
 
@@ -641,7 +674,8 @@ Useful extras elsewhere:
 | `convert_mlx_adapter.py` | MLX-LM/unsloth LoRA → PEFT LoRA (renames + transposes; `lora_alpha = round(scale × r)`). |
 | `publish_model.py` | Publish adapter + `transformers`-merged model to the Hub, with a pre-upload soundness check. |
 | `evaluate.py` | Fidelity (top-1 agreement, KL) and capability (held-out perplexity) of the distilled student vs the base student vs the teacher, plus an optional lm-evaluation-harness sweep. |
-| `app.py` | Gradio side-by-side UI: original student vs distilled student vs teacher. |
+| `control_app.py` | The control panel served by `--ui`: train, evaluate and compare from a browser. Shells back into `distill.sh` for every action rather than reimplementing it. |
+| `app.py` | Gradio side-by-side UI: original student vs distilled student vs teacher. Served on its own by `--ui-compare`, and embedded as the panel's Compare tab. |
 | `main.py` | The original 50-step PoC script. Superseded by `train_scaled.py`; kept for reference. |
 | `test_inference.py` | Console three-way comparison against the hardcoded SmolLM2 PoC adapter. |
 | `DEMO_PROMPTS.md` | Prompts where the distilled 135M beats the base in 3/3 runs — **and the ones that regressed**, with reasons. Read before demoing. |
