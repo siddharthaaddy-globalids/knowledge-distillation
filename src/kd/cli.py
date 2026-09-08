@@ -157,6 +157,22 @@ def cmd_train(args):
     return 0
 
 
+def cmd_pipeline(args):
+    """Every verification stage, gated, in one run directory."""
+    from .pipeline import run_pipeline
+    from .runlog import Run
+
+    config = load(args)
+    with Run(config, argv=sys.argv) as run:
+        return run_pipeline(
+            config, run,
+            only=args.only,
+            start_from=getattr(args, "from"),
+            skip=args.skip,
+            options={"allow_bad_teacher": args.allow_bad_teacher},
+        )
+
+
 def cmd_doctor(args):
     """Report what this machine can do, and which credentials are present.
 
@@ -219,6 +235,21 @@ def build_parser():
     parser.add_argument("-V", "--version", action="version",
                         version=f"kd {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    pipeline = sub.add_parser(
+        "pipeline",
+        help="Run every verification stage, gated, in one run directory")
+    add_config_args(pipeline)
+    pipeline.add_argument("--only", metavar="STAGE",
+                          help="Run just this stage")
+    pipeline.add_argument("--from", metavar="STAGE",
+                          help="Start at this stage and run everything after it")
+    pipeline.add_argument("--skip", action="append", default=[], metavar="STAGE",
+                          help="Skip this stage, repeatable")
+    pipeline.add_argument("--allow-bad-teacher", action="store_true",
+                          help="Train even if the teacher fails its pre-flight check "
+                               "(not recommended)")
+    pipeline.set_defaults(func=cmd_pipeline)
 
     check = sub.add_parser("check", help="Resolve config and hardware, print, exit")
     add_config_args(check)

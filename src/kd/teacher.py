@@ -194,8 +194,10 @@ def parse_args():
     return ap.parse_args()
 
 
-def main():
-    args = parse_args()
+def main(args=None):
+    # The pipeline calls this with a prepared Namespace, so the stage and the
+    # standalone command run identical code.
+    args = args or parse_args()
     config = load_config(args.config)
     if args.device:
         config.setdefault("hardware", {})["device"] = args.device

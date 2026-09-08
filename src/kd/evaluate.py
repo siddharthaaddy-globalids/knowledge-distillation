@@ -537,8 +537,10 @@ def report_tasks(results):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def main():
-    args = parse_args()
+def main(args=None):
+    # The pipeline calls this with a prepared Namespace rather than through argparse,
+    # so the stage and the standalone command run exactly the same code.
+    args = args or parse_args()
     config = load_config(args.config)
     if args.device:
         config.setdefault("hardware", {})["device"] = args.device

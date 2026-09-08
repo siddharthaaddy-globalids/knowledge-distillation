@@ -213,7 +213,7 @@ class BenchmarkCallback(TrainerCallback):
 # Training
 # --------------------------------------------------------------------------- #
 def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
-          callbacks=None):
+          callbacks=None, checkpoints=None):
     """Distil the teacher into a LoRA student. Returns a summary dict.
 
     config      resolved configuration mapping
@@ -221,6 +221,9 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
     run         a kd.runlog.Run - owns the output directory and the event stream
     dry_run     2 steps and no final save; validates the pipeline end to end
     callbacks   extra TrainerCallbacks, e.g. the pipeline's limit enforcement
+    checkpoints where to write resumable checkpoints; defaults to the run bundle's
+                checkpoints/. The smoke stage points this elsewhere so its throwaway
+                two steps do not sit alongside the real run's.
     """
     training_cfg = config["training"]
     gkd_cfg = config["gkd"]
@@ -308,7 +311,7 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
     # [0, 1) and is interpreted as a ratio of total steps (see
     # TrainingArguments.get_warmup_steps).
     config_kwargs = dict(
-        output_dir=run.checkpoint_dir,
+        output_dir=checkpoints or run.checkpoint_dir,
         per_device_train_batch_size=int(training_cfg["batch_size"]),
         gradient_accumulation_steps=int(training_cfg["gradient_accumulation_steps"]),
         learning_rate=float(training_cfg["learning_rate"]),

@@ -238,8 +238,10 @@ def verify(model_dir, tokenizer):
     return problems
 
 
-def main():
-    args = parse_args()
+def main(args=None):
+    # The pipeline calls this with a prepared Namespace, so the stage and the
+    # standalone command run identical code.
+    args = args or parse_args()
     if args.adapter_only and args.merged_only:
         raise SystemExit("--adapter-only and --merged-only are mutually exclusive")
 
