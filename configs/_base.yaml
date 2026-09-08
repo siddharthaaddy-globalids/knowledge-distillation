@@ -223,3 +223,8 @@ runpod:
   container_disk_gb: 20
   terminate_on_exit: true
   api_key_env: RUNPOD_API_KEY
+  # Extra variables handed to the pod. HF_TOKEN and the AWS_* credentials are
+  # forwarded automatically when they are set locally, so this is for anything
+  # else the run needs. Put names and values a repository may hold - never a
+  # secret, which belongs in the environment this command runs in.
+  extra_env: null

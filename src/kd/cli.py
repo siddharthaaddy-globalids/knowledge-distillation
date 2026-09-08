@@ -163,6 +163,17 @@ def cmd_pipeline(args):
     from .runlog import Run
 
     config = load(args)
+
+    # Set by the RunPod launcher to the rate it actually agreed to pay. Its
+    # presence is what makes limits.max_cost_usd mean anything inside the pod; on a
+    # local machine nothing is rented, so it is absent and the cost cap is inert.
+    price = os.environ.get("KD_PRICE_PER_HOUR")
+    try:
+        price = float(price) if price else None
+    except ValueError:
+        print(f" !! ignoring KD_PRICE_PER_HOUR={price!r} (not a number)")
+        price = None
+
     with Run(config, argv=sys.argv) as run:
         return run_pipeline(
             config, run,
@@ -170,7 +181,57 @@ def cmd_pipeline(args):
             start_from=getattr(args, "from"),
             skip=args.skip,
             options={"allow_bad_teacher": args.allow_bad_teacher},
+            price_per_hour=price,
         )
+
+
+def cmd_runpod(args):
+    """Rent a GPU, run the pipeline on it, and release it."""
+    import logging
+
+    from .remote import runpod as rp
+
+    config = load(args)
+
+    # A plain console logger: this runs on the local machine, orchestrating a run
+    # that happens elsewhere, so it has no run bundle of its own to write into.
+    log = logging.getLogger("kd.runpod")
+    if not log.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+
+    # Prompting is only offered when someone is there to answer. Non-interactive
+    # callers get a refusal rather than a hang, and --yes accepts the estimate
+    # without accepting a different GPU.
+    interactive = sys.stdin.isatty() and not args.yes
+    ask = input if interactive else None
+    if args.yes:
+        ask = (lambda _prompt: "y") if args.action == "launch" else None
+
+    try:
+        if args.action == "gpus":
+            gpus = rp.catalogue(config)
+            cap = (config.get("runpod") or {}).get("max_price_per_hour")
+            log.info(rp.render_options(rp.affordable(gpus, cap))
+                     or "  nothing available under the price cap")
+            return 0
+        if args.action == "stop":
+            if not args.pod_id:
+                raise rp.RunPodError("which pod? usage: kd runpod stop <pod-id>")
+            return 0 if rp.terminate(config, args.pod_id, log=log) else 1
+        if args.action == "status":
+            if not args.pod_id:
+                raise rp.RunPodError("which pod? usage: kd runpod status <pod-id>")
+            log.info(rp.pod_status(config, args.pod_id) or "gone")
+            return 0
+
+        return rp.launch(config, args.config or "configs/_base.yaml", log,
+                         ask=ask, keep_alive=args.keep_alive)
+    except rp.RunPodError as exc:
+        log.error(f"xx  {exc}")
+        return 1
 
 
 def cmd_doctor(args):
@@ -266,6 +327,23 @@ def build_parser():
                             "(not recommended - a broken teacher yields a broken "
                             "student)")
     train.set_defaults(func=cmd_train)
+
+    runpod = sub.add_parser(
+        "runpod",
+        help="Rent a GPU and run the pipeline on it (optional; needs the remote extra)")
+    add_config_args(runpod)
+    runpod.add_argument("action", nargs="?", default="launch",
+                        choices=["launch", "stop", "status", "gpus"],
+                        help="launch (default), stop, status, or list GPUs")
+    runpod.add_argument("pod_id", nargs="?", default=None,
+                        help="Pod id, for stop and status")
+    runpod.add_argument("--yes", action="store_true",
+                        help="Accept the cost estimate without asking. Does NOT "
+                             "accept a different GPU than the one configured.")
+    runpod.add_argument("--keep-alive", type=int, default=0, metavar="MIN",
+                        help="Leave the pod running for MIN minutes after a "
+                             "successful run, for inspection. It bills until then.")
+    runpod.set_defaults(func=cmd_runpod)
 
     doctor = sub.add_parser("doctor", help="Report environment and credentials")
     add_config_args(doctor)

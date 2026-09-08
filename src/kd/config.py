@@ -91,6 +91,11 @@ DOMAIN_KEYS = {
 }
 STAGE_KEYS = {"name", "gate"}
 
+# Mappings whose KEYS are data rather than settings. Everywhere else an unknown
+# key is a typo worth failing on; here the whole point is that the caller chooses
+# the names, so validating them would reject every legitimate use.
+OPAQUE_MAPPINGS = ["runpod.extra_env"]
+
 
 class ConfigError(SystemExit):
     """A configuration problem stated plainly enough to act on without a traceback."""
@@ -304,6 +309,16 @@ def validate(config, base):
     if stages is not None:
         _validate_list_of_mappings(stages, STAGE_KEYS, "pipeline.stages", errors)
         working["pipeline"].pop("stages", None)
+
+    for path in OPAQUE_MAPPINGS:
+        value = _get_path(working, path)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            errors.append(f"{path} must be a mapping of names to values, "
+                          f"got {_kind(value)}")
+        section, _, leaf = path.rpartition(".")
+        _get_path(working, section).pop(leaf, None)
 
     base_flat = _flatten(base)
     for path, value in _flatten(working).items():

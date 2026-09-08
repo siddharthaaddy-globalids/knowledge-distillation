@@ -78,6 +78,11 @@ jobs:
       - name: Runner templates and the stage contract
         run: uv run python tests/test_runners.py
 
+      - name: GPU selection, cost caps and the terminate guarantee
+        # Runs without the runpod SDK installed, on purpose: it is replaced with a
+        # fake, which is also proof that the core pipeline does not import it.
+        run: uv run python tests/test_runpod.py
+
       - name: Object storage
         # Runs without boto3 installed, on purpose: the S3 client is replaced with
         # an in-memory fake, which is also proof that the core pipeline does not

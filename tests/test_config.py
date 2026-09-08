@@ -216,6 +216,18 @@ def test_unknown_domain_key_rejected():
                                "dataset.domains[0].quotaa", "quota"))
 
 
+def test_opaque_mapping_keys_are_not_validated():
+    # runpod.extra_env holds environment variable names the caller chooses, so its
+    # keys are data. Validating them would reject every legitimate use.
+    cfg = profile("smoke", set_overrides=["runpod.extra_env={WANDB_MODE: offline}"])
+    assert cfg["runpod"]["extra_env"] == {"WANDB_MODE": "offline"}
+
+
+def test_opaque_mapping_must_still_be_a_mapping():
+    expect_error(lambda: profile("smoke", set_overrides=["runpod.extra_env=hello"]),
+                 "runpod.extra_env", "must be a mapping")
+
+
 def test_alpaca_domain_keys_accepted():
     # The finance profiles use these; they must not read as typos.
     cfg = profile("finance")

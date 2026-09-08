@@ -1,0 +1,65 @@
+# CUDA image for renting a GPU.
+#
+# The reason this exists is money. Installing torch and its CUDA runtime at pod
+# start costs four to six minutes on every single run, billed at the GPU's hourly
+# rate. Baking them in makes a pod usable in well under a minute, and pins the
+# exact versions a result was produced with.
+#
+#   docker build -f docker/Dockerfile.cuda -t ghcr.io/<org>/kd:<sha> .
+#
+# CUDA 12.8 covers everything RunPod currently rents, from an RTX A4000 up to an
+# H100, so one image serves every GPU in the price range this pipeline is for.
+
+ARG CUDA_VERSION=12.8.1
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # uv installs into the image's own environment rather than a virtualenv: the
+    # container is already the isolation boundary, and a venv inside it only adds
+    # a path to get wrong.
+    UV_SYSTEM_PYTHON=1 \
+    UV_LINK_MODE=copy \
+    # Model weights land on the mounted volume, so they survive the pod and are
+    # downloaded once rather than once per run.
+    HF_HOME=/workspace/hf-cache \
+    KD_RUNS_DIR=/workspace/runs
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-dev python3-pip \
+        git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+# Dependencies first, and on their own layer: they change far less often than the
+# source, so an edit to a stage rebuilds in seconds instead of re-downloading
+# several gigabytes of CUDA wheels.
+COPY pyproject.toml uv.lock README.md ./
+RUN mkdir -p src/kd && touch src/kd/__init__.py \
+    && uv pip install --system \
+        --index-url https://download.pytorch.org/whl/cu128 \
+        --extra-index-url https://pypi.org/simple \
+        torch \
+    && uv pip install --system -r pyproject.toml --extra remote
+
+COPY src/ ./src/
+COPY configs/ ./configs/
+RUN uv pip install --system --no-deps -e .
+
+# Prove the image can actually do the thing before it is ever rented. A missing
+# CUDA build or a broken import discovered on a paid GPU is the expensive way to
+# find out.
+RUN python -c "import torch, kd; print('torch', torch.__version__)" \
+    && python -m kd check --config configs/smoke.yaml > /dev/null \
+    && echo "image ok"
+
+# No ENTRYPOINT: RunPod passes the command to run as docker_args, and the
+# launcher builds it from the config. Defaulting to a shell keeps the pod usable
+# by hand for debugging.
+CMD ["/bin/bash"]

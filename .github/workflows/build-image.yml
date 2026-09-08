@@ -1,0 +1,89 @@
+name: Build CUDA image
+
+# Publishes the GPU image the RunPod launcher rents against, tagged by commit so a
+# result can be traced to the exact environment that produced it.
+#
+# Deliberately NOT on every push. The everyday pipeline is validate-and-build-the-
+# runner; this is a several-gigabyte build that only matters when someone is about
+# to rent a GPU, so it runs on demand and on release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_version:
+        description: "CUDA version to build against"
+        default: "12.8.1"
+        required: false
+      tag_latest:
+        description: "Also publish as :latest"
+        type: boolean
+        default: true
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: Build and push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space
+        # The CUDA base plus torch is comfortably larger than what a hosted runner
+        # leaves free by default, and the failure looks like an unrelated write
+        # error deep in a layer.
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h /
+
+      - name: Metadata
+        id: meta
+        run: |
+          echo "sha_short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/kd" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.cuda
+          push: true
+          build-args: |
+            CUDA_VERSION=${{ inputs.cuda_version || '12.8.1' }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha_short }}
+            ${{ inputs.tag_latest != false && format('{0}:latest', steps.meta.outputs.image) || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Job summary
+        run: |
+          {
+            echo "### CUDA image published"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha_short }}\` |"
+            echo "| CUDA | \`${{ inputs.cuda_version || '12.8.1' }}\` |"
+            echo
+            echo "Rent a GPU against it:"
+            echo '```'
+            echo "kd runpod launch --config configs/finance.yaml \\"
+            echo "  --set runpod.enabled=true \\"
+            echo "  --set runpod.image=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha_short }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
