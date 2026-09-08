@@ -146,12 +146,12 @@ OS="$(uname -s)"
 ARCH="$(uname -m)"
 log "Platform: $OS/$ARCH"
 
-if [ "$OS" = "Darwin" ] && [ "$ARCH" = "arm64" ]; then
-  # Let the MPS allocator use the whole unified memory pool rather than a
-  # fraction of it, and route unsupported ops to CPU instead of raising.
-  export PYTORCH_MPS_HIGH_WATERMARK_RATIO="${PYTORCH_MPS_HIGH_WATERMARK_RATIO:-0.0}"
-  export PYTORCH_ENABLE_MPS_FALLBACK="${PYTORCH_ENABLE_MPS_FALLBACK:-1}"
-fi
+# The Apple Silicon torch settings - the MPS allocator ceiling and the CPU
+# fallback for unsupported ops - are NOT exported here. They are config values
+# (hardware.mps_high_watermark_ratio, hardware.mps_fallback), and kd.config sets
+# the corresponding variables itself. Exporting them from the runner would win,
+# because the config layer only fills them in when they are unset - so
+# `--set hardware.mps_high_watermark_ratio=...` would silently do nothing.
 
 # ---------------------------------------------------------------------------
 #  3. uv

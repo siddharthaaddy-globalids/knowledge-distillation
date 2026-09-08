@@ -22,6 +22,7 @@ and a machine that never uses it must not need it installed.
 """
 
 import os
+import sys
 
 S3_SCHEME = "s3://"
 
@@ -78,6 +79,141 @@ def is_cached(local):
 def mark_complete(local, detail=""):
     with open(os.path.join(local, COMPLETE_MARKER), "w", encoding="utf-8") as handle:
         handle.write(detail + "\n")
+
+
+BYTES_PER_PARAM = {"float32": 4, "bfloat16": 2, "float16": 2}
+
+# Binary gigabytes, because that is what an operating system means by "16 GB" and
+# what the machine was sold as. Dividing by 1e9 would call a 16 GB Mac a 17 GB one
+# and quietly undermine the whole message.
+GB = 1024 ** 3
+
+
+def parameter_count(model_id):
+    """Total parameters, from the Hub's metadata. No weights are downloaded.
+
+    Returns None for anything not on the Hub, or when the field is absent - not
+    knowing is common and is never a reason to block a run.
+    """
+    if not model_id or os.path.isdir(str(model_id)):
+        return None
+    try:
+        from huggingface_hub import model_info
+        total = (model_info(model_id).safetensors or {}).total
+        return int(total) if total else None
+    except Exception:
+        return None
+
+
+def memory_estimate(config, dtype_name):
+    """Resident weight size for teacher + student, and what the machine has.
+
+    Both models are held at once - the teacher frozen, the student training - so
+    the sum is what has to fit. This is weights only: activations, gradients and
+    the generation KV cache sit on top, which is why the warning threshold below
+    is well under 100%.
+    """
+    models = config.get("models") or {}
+    counts = {role: parameter_count(models.get(role))
+              for role in ("teacher", "student")}
+    if not any(counts.values()):
+        return None
+
+    per_param = BYTES_PER_PARAM.get(dtype_name, 4)
+    weight_bytes = sum(n for n in counts.values() if n) * per_param
+
+    return {"counts": counts, "dtype": dtype_name, "weight_bytes": weight_bytes,
+            "total_ram_bytes": total_memory()}
+
+
+def total_memory():
+    """Physical RAM of this machine, in bytes, or None if it cannot be determined.
+
+    Queried from the operating system every time - nothing here assumes a size.
+
+    Total rather than currently-available, deliberately: available fluctuates with
+    whatever else is open, so a warning keyed to it would appear and disappear
+    between identical runs. The question being answered is whether a config is
+    viable on this machine at all.
+    """
+    # POSIX first: Linux and macOS both implement these.
+    try:
+        if hasattr(os, "sysconf"):
+            names = os.sysconf_names
+            if "SC_PAGE_SIZE" in names and "SC_PHYS_PAGES" in names:
+                pages = os.sysconf("SC_PHYS_PAGES")
+                size = os.sysconf("SC_PAGE_SIZE")
+                if pages > 0 and size > 0:
+                    return pages * size
+    except (ValueError, OSError, AttributeError):
+        pass
+
+    # macOS fallback. hw.memsize is the canonical source there, and is worth
+    # having because the sysconf route above is the one path this project has
+    # never been able to exercise on a Mac.
+    if sys.platform == "darwin":
+        try:
+            import subprocess
+            out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                 capture_output=True, text=True, timeout=5)
+            if out.returncode == 0 and out.stdout.strip().isdigit():
+                return int(out.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    total_ram = None
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class Status(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            status = Status()
+            status.dwLength = ctypes.sizeof(Status)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+            total_ram = int(status.ullTotalPhys)
+    except Exception:
+        total_ram = None
+
+    return total_ram
+
+
+def memory_warning(estimate, device):
+    """A warning when the weights alone will not comfortably fit, else None.
+
+    Only meaningful where the models share the machine's memory - CPU, and Apple
+    unified memory. A discrete GPU has its own budget this cannot see.
+    """
+    if not estimate or not estimate["total_ram_bytes"] or device == "cuda":
+        return None
+
+    weights = estimate["weight_bytes"] / GB
+    total = estimate["total_ram_bytes"] / GB
+    # Weights past ~60% of RAM leaves too little for activations, gradients, the
+    # KV cache and the operating system. Past that the allocator does not fail -
+    # it spills to swap, and the run gets slow rather than stopping.
+    if weights < total * 0.6:
+        return None
+
+    line = (f"the teacher and student together are {weights:.1f} GB of "
+            f"{estimate['dtype']} weights, against a {total * 0.6:.1f} GB budget "
+            f"(60% of this machine's {total:.0f} GB).\n"
+            f"Activations, gradients and the generation cache sit on top of the "
+            f"weights, so this will most likely swap - which shows up as a very "
+            f"slow run rather than an error.")
+    if estimate["dtype"] == "float32":
+        line += (f"\n  Halve it:  --set hardware.dtype=bfloat16   "
+                 f"(~{weights / 2:.1f} GB)")
+    return line
 
 
 def adapter_cache(config, source):

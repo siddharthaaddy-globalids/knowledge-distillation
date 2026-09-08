@@ -43,6 +43,17 @@ class StageFailed(RuntimeError):
     """A stage could not do its job. Whether that stops the run depends on the gate."""
 
 
+class StageRefused(StageFailed):
+    """The run was declined on purpose - nothing is broken.
+
+    A projection that does not fit its limits is not a malfunction, and calling it
+    FAILED sends people looking for a bug that is not there. It is the cost guard
+    doing the one thing it exists to do, and it deserves its own word and its own
+    exit code so a script can tell "adjust and retry" apart from "something went
+    wrong".
+    """
+
+
 class Context:
     """What every stage is handed, and where stages leave things for each other."""
 
@@ -142,6 +153,21 @@ def stage_preflight(ctx):
             ctx.run.event("preflight", "adapter_converted", **converted)
         ctx.log.info(f"  teacher lora: {config['models']['teacher_adapter']}")
 
+    # Both models are resident at once. Weights that do not comfortably fit make
+    # the allocator spill to swap rather than fail, so the symptom is a run that
+    # is mysteriously slow - which is worth naming before the smoke stage spends
+    # ten minutes measuring it.
+    estimate = paths.memory_estimate(config, ctx.hardware["dtype_name"])
+    if estimate:
+        ctx.log.info(f"  weights   : "
+                     f"{estimate['weight_bytes'] / paths.GB:.1f} GB "
+                     f"({estimate['dtype']})")
+        ctx.run.event("preflight", "memory_estimate", **estimate)
+        warning = paths.memory_warning(estimate, ctx.hardware["device"])
+        if warning:
+            for line in ("!! " + warning).splitlines():
+                ctx.log.warning(f"      {line}")
+
     return {"device": ctx.hardware["device"], "fetched": fetched}
 
 
@@ -204,7 +230,7 @@ def stage_smoke(ctx):
 
     refusal = ctx.budget.refuse_if_impossible(projection)
     if refusal:
-        raise StageFailed(refusal)
+        raise StageRefused(refusal)
     return {"projection": projection}
 
 
@@ -453,6 +479,20 @@ def run_pipeline(config, run, only=None, start_from=None, skip=(), options=None,
                           f"what survives")
             run.finish("stopped", str(exc))
             _rescue_upload(ctx)
+            return 4
+        except StageRefused as exc:
+            # Declined before spending anything. Nothing is broken, nothing was
+            # trained, and the message already says how to proceed - so this
+            # reports as a refusal rather than a failure, and stops quietly.
+            run.log.warning(f"{label:<26} REFUSED  "
+                            f"{_fmt_duration(time.time() - started)}")
+            for line in str(exc).splitlines():
+                run.log.warning(f"      {line}")
+            run.finish("refused", str(exc))
+            run.log.info("")
+            run.log.info(f"  REFUSED at {name} - nothing was trained and nothing "
+                         f"was spent.")
+            run.log.info(f"  run bundle : {run.dir}")
             return 4
         except (Exception, SystemExit) as exc:  # noqa: BLE001
             elapsed = _fmt_duration(time.time() - started)

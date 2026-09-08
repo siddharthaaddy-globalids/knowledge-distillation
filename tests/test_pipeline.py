@@ -183,6 +183,69 @@ def test_limit_breach_is_a_hard_stop(workspace):
     assert "max_runtime_minutes" in manifest["stopped_reason"]
 
 
+def test_refusal_is_not_reported_as_a_failure(workspace):
+    """A run declined for not fitting its limits is not a malfunction.
+
+    Calling it FAILED sends people hunting for a bug that is not there - and it
+    reads identically to a genuinely broken stage, which is the one distinction
+    that matters when you are deciding whether to retry or investigate.
+    """
+    record = []
+    fake_stages(record, raising={
+        "smoke": pipeline.StageRefused(
+            "This run would take about 610 min, over the 180 min "
+            "limits.max_runtime_minutes.")})
+    code, run_dir = run_with(workspace, record)
+
+    assert code == 4, f"a refusal should exit 4 like other limit outcomes, got {code}"
+    assert "train" not in record, "a refused run must not train"
+    with open(os.path.join(run_dir, runlog.MANIFEST), encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    assert manifest["status"] == "refused",         f"the manifest calls it {manifest['status']!r}, not 'refused'"
+    assert "610 min" in manifest["stopped_reason"], manifest["stopped_reason"]
+
+
+def test_a_real_failure_is_still_a_failure(workspace):
+    """The refusal wording must not swallow genuine breakage."""
+    record = []
+    fake_stages(record, failing={"smoke"})
+    code, run_dir = run_with(workspace, record)
+    assert code == 1, f"a broken gate should still exit 1, got {code}"
+    with open(os.path.join(run_dir, runlog.MANIFEST), encoding="utf-8") as handle:
+        assert json.load(handle)["status"] == "failed"
+
+
+def test_ram_is_detected_not_assumed(workspace):
+    """The memory check reads this machine's RAM from the OS.
+
+    A hardcoded size would be wrong on every machine but one, and the warning it
+    produces is only worth trusting if the number in it is real.
+    """
+    from kd import paths
+
+    detected = paths.total_memory()
+    assert detected, "no RAM figure was obtained from the operating system"
+    # Anything from a small container to a large server, but a plausible size.
+    assert 1 * paths.GB < detected < 4096 * paths.GB, f"implausible: {detected}"
+
+
+def test_memory_warning_scales_with_the_machine(workspace):
+    """The same config warns on a small machine and not on a large one."""
+    from kd import paths
+
+    estimate = {"counts": {"teacher": 2_000_000_000, "student": 800_000_000},
+                "dtype": "float32", "weight_bytes": 2_800_000_000 * 4,
+                "total_ram_bytes": 16 * paths.GB}
+    assert paths.memory_warning(estimate, "mps"), "11 GB of weights in 16 GB should warn"
+
+    estimate["total_ram_bytes"] = 128 * paths.GB
+    assert paths.memory_warning(estimate, "mps") is None, "should not warn on 128 GB"
+
+    # A discrete GPU has its own budget this cannot see, so it is not guessed at.
+    estimate["total_ram_bytes"] = 16 * paths.GB
+    assert paths.memory_warning(estimate, "cuda") is None
+
+
 def test_step_ceiling_is_the_tighter_of_the_two(workspace):
     config = make_config(workspace, **{"training.max_steps": 500})
     assert Budget(config).max_steps == 500, "no ceiling set, so training wins"

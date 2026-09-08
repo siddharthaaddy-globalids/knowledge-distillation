@@ -357,6 +357,19 @@ that is a result, not a crash. The numbers are real and the report is still
 written. If you get a 3, check that the teacher passed its check, that the step
 budget was not tiny, and that `lora.target_modules` covers your architecture.
 
+**`4` means a limit stopped it** — or refused to start it. Also not a
+malfunction: the smoke stage measured your hardware, projected the full run, and
+declined because it would not fit. The message names the two ways out, and
+nothing was trained or spent:
+
+```
+[3/8] smoke                REFUSED  10m04s
+      This run would take about 624 min, over the 180 min limits.max_runtime_minutes.
+        measured 122.09 s/step over 300 steps
+        raise the ceiling:  --set limits.max_runtime_minutes=749
+        or shorten the run: --set training.max_steps=73
+```
+
 ---
 
 ## 9. Use the model

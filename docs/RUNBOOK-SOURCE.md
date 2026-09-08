@@ -140,7 +140,7 @@ run's adapter or evaluation, so you can re-report without retraining.
 | `1` | A gate failed. |
 | `2` | The teacher is not fit to distil from. |
 | `3` | The run completed, but the adapter did not improve on the base student. |
-| `4` | A limit was hit and the run was stopped. |
+| `4` | A limit stopped the run - or refused to start it. Not a malfunction; the message says what to change. |
 
 ---
 
