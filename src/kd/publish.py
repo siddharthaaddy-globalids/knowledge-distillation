@@ -10,10 +10,10 @@ the canonical key layout for its architecture. That matters: a merged file writt
 by another framework keeps that framework's naming, and `from_pretrained` will
 silently randomly-initialise every key it cannot map rather than raising.
 
-    python publish_model.py --repo my-org/qwen3.5-0.8b-finance
-    python publish_model.py --repo my-org/qwen3.5-0.8b-finance --dry-run
-    python publish_model.py --repo my-org/... --adapter-only
-    python publish_model.py --repo my-org/... --private
+    kd publish --repo my-org/qwen3.5-0.8b-finance
+    kd publish --repo my-org/qwen3.5-0.8b-finance --dry-run
+    kd publish --repo my-org/... --adapter-only
+    kd publish --repo my-org/... --private
 
 Authentication comes from `hf auth login` or the HF_TOKEN environment variable.
 
@@ -174,7 +174,7 @@ def load_provenance(config_path, adapter_dir):
     cfg_file = pathlib.Path(config_path)
     if cfg_file.exists():
         try:
-            import kd_config
+            from . import config as kd_config
             cfg = kd_config.load_config(str(cfg_file))
             info["teacher"] = cfg["models"]["teacher"]
             if cfg["models"].get("teacher_adapter"):
@@ -245,7 +245,7 @@ def main():
 
     adapter_dir = args.adapter
     if adapter_dir is None:
-        import kd_config
+        from . import config as kd_config
         cfg = kd_config.load_config(args.config)
         adapter_dir = str(pathlib.Path(cfg["project"]["output_dir"]) / "final_adapter")
     adapter_dir = pathlib.Path(adapter_dir)

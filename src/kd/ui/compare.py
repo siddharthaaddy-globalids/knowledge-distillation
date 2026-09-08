@@ -6,7 +6,7 @@ Serves three CPU-resident models behind a Gradio interface:
   2. Distilled Student - the same base + the GKD-trained LoRA adapter
   3. Teacher Reference - HuggingFaceTB/SmolLM2-360M-Instruct
 
-Run with:  python app.py   (then open http://127.0.0.1:7860)
+Run with:  kd ui --compare   (then open http://127.0.0.1:7860)
 """
 
 import argparse
@@ -20,13 +20,17 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from ..runlog import discover_adapters, is_adapter
+
 STUDENT_MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
 TEACHER_MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
-# Adapter search order, most recent training layout first. Any directory produced by
-# train_scaled.py is picked up automatically; the glob catches custom --output dirs.
-ADAPTER_CANDIDATES = [
-    "./distilled_output/final_adapter",         # distill.sh default
+# Where run bundles live. Every adapter kd writes is inside one, so discovery looks
+# there first and only falls back to the directories older versions wrote to.
+RUNS_DIR = os.environ.get("KD_RUNS_DIR", "./runs")
+
+LEGACY_ADAPTER_CANDIDATES = [
+    "./distilled_output/final_adapter",         # old distill.sh default
     "./distilled_smollm_mac/final_adapter",     # configs/mac.yaml
     "./distilled_smollm_scaled/final_adapter",  # configs/default.yaml
     "./distilled_smollm_poc/final_adapter",     # original 50-step PoC
@@ -40,22 +44,20 @@ ADAPTER_PATH = None
 
 
 def _is_adapter(path):
-    return bool(path) and os.path.isfile(os.path.join(path, "adapter_config.json"))
+    return is_adapter(path)
 
 
 def _resolve_adapter_path(explicit=None):
-    """Find an adapter: explicit path, then KD_ADAPTER_PATH, then known output dirs."""
+    """Find an adapter: explicit path, then KD_ADAPTER_PATH, then the newest run."""
     for candidate in (explicit, os.environ.get("KD_ADAPTER_PATH")):
         if candidate:
             return candidate
-    for candidate in ADAPTER_CANDIDATES:
-        if _is_adapter(candidate):
-            return candidate
-    # Last resort: any */final_adapter in the working directory, newest first.
-    found = [p for p in glob.glob("./*/final_adapter") if _is_adapter(p)]
+    found = discover_adapters(RUNS_DIR, extra=LEGACY_ADAPTER_CANDIDATES)
     if found:
-        return max(found, key=os.path.getmtime).replace("\\", "/")
-    return ADAPTER_CANDIDATES[0]
+        return found[0]
+    # Nothing trained yet. Returning a path that does not exist lets the caller
+    # report "no adapter found" with somewhere concrete to look.
+    return os.path.join(RUNS_DIR, "<run-id>", "final_adapter").replace("\\", "/")
 
 
 TEACHER_ADAPTER_PATH = None
@@ -167,7 +169,7 @@ def load_all_models():
     )
     if not adapter_ok:
         print(f" !! Adapter not found at '{ADAPTER_PATH}'. The distilled column "
-              f"will report the error; run main.py to train it.")
+              f"will report the error; train one with `kd train`.")
 
     # The adapter directory carries its own tokenizer copy - the one the student was
     # actually distilled against. Fall back to the hub tokenizer if it is missing.
@@ -206,7 +208,7 @@ def load_all_models():
         MODELS["distilled"] = ModelBundle(
             "distilled", "Distilled Student", "SmolLM2-135M-Instruct + LoRA adapter",
             error=(f"Adapter directory '{ADAPTER_PATH}' is missing or has no "
-                   f"adapter_config.json. Run `python main.py` to produce it."),
+                   f"adapter_config.json. Train one with `kd train`."),
         )
         print(" -> skipped (adapter missing)")
     else:
@@ -495,7 +497,7 @@ def main():
              if _is_adapter(p)}
         )
         if not found:
-            print("No adapters found. Train one first:  python train_scaled.py")
+            print("No adapters found. Train one first:  kd train")
         else:
             print("Discoverable adapters:")
             for path in found:
@@ -507,8 +509,8 @@ def main():
     teacher_adapter = args.teacher_adapter
     if args.config:
         # Reuse the training config so the UI never drifts from what was trained.
-        import kd_config
-        cfg = kd_config.load_config(args.config)
+        from ..config import load_config
+        cfg = load_config(args.config)
         student = student or cfg["models"]["student"]
         teacher = teacher or cfg["models"]["teacher"]
         teacher_adapter = teacher_adapter or cfg["models"].get("teacher_adapter")
@@ -518,8 +520,8 @@ def main():
 
     if not _is_adapter(ADAPTER_PATH):
         print(f" !! No adapter at '{ADAPTER_PATH}'. The distilled column will show an error.")
-        print("    Train one with:  python train_scaled.py --config configs/default.yaml")
-        print("    Or point at one: python app.py --adapter ./path/to/final_adapter\n")
+        print("    Train one with:  kd train --config configs/default.yaml")
+        print("    Or point at one: kd ui --compare --adapter ./path/to/final_adapter\n")
 
     load_all_models()
     demo = build_ui()

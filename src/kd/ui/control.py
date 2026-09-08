@@ -10,18 +10,17 @@ rather than hiding it.
 
   Train    - build a run from a form, launch it, watch the log stream live
   Evaluate - score an adapter against the teacher, then render the report it writes
-  Compare  - the three-way generation comparison from app.py, loaded on demand
+  Compare  - the three-way generation comparison (kd.ui.compare), loaded on demand
 
 In a source checkout there is no built distill.sh (CI generates it from
-scripts/distill.sh.template), so the same forms fall back to invoking train_scaled.py /
+scripts/distill.sh.template), so the same forms fall back to invoking kd train /
 evaluate.py directly with the KD_* variables the script would have exported. The header
 says which backend is live.
 
-Run with:  python control_app.py   (then open http://127.0.0.1:7860)
+Run with:  kd ui   (then open http://127.0.0.1:7860)
 """
 
 import argparse
-import glob
 import os
 import platform
 import queue
@@ -33,6 +32,9 @@ import threading
 import time
 
 import gradio as gr
+
+from ..runlog import discover_adapters as kd_discover_adapters
+from ..runlog import is_adapter
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 IS_WINDOWS = os.name == "nt"
@@ -48,9 +50,13 @@ MAX_LOG_LINES = 1500
 SERVER_NAME = "127.0.0.1"
 SERVER_PORT = 7860
 
-# Adapter search order, newest training layout first. Mirrors app.ADAPTER_CANDIDATES,
-# duplicated here only so this module can list adapters without importing torch.
-ADAPTER_CANDIDATES = [
+# Where run bundles live. Adapters are discovered inside them rather than from a
+# fixed list of output directories.
+RUNS_DIR = os.environ.get("KD_RUNS_DIR", "./runs")
+
+# Output directories written by earlier versions, still offered if they are present
+# so an adapter trained before the move is not stranded.
+LEGACY_ADAPTER_CANDIDATES = [
     "./distilled_output/final_adapter",
     "./distilled_smollm_mac/final_adapter",
     "./distilled_smollm_scaled/final_adapter",
@@ -117,8 +123,8 @@ def backend_note():
 #
 # One table per mode, so the two backends cannot drift: the middle column is what
 # distill.sh accepts, and the third is how the same value reaches Python without the
-# script - a KD_* variable for training (train_scaled.py reads them through kd_config)
-# and a real flag for evaluation (evaluate.py has its own argparse).
+# script - a KD_* variable for training (kd.config reads them)
+# and a real flag for evaluation (kd.evaluate has its own argparse).
 # --------------------------------------------------------------------------- #
 TRAIN_OPTS = [
     # ui key,            runner flag,          KD_* variable
@@ -177,7 +183,7 @@ def build_train_command(profile, fields):
                 argv += [flag, value]
         return argv, env, "./distill.sh " + " ".join(shlex.quote(a) for a in argv[2:])
 
-    argv = [sys.executable, "train_scaled.py", "--config", config_file(profile)]
+    argv = [sys.executable, "-m", "kd", "train", "--config", config_file(profile)]
     for key, _, env_var in TRAIN_OPTS:
         value = _clean(fields.get(key))
         if value:
@@ -201,7 +207,7 @@ def build_eval_command(profile, fields):
                 argv += [flag, value]
         return argv, env, "./distill.sh " + " ".join(shlex.quote(a) for a in argv[2:])
 
-    argv = [sys.executable, "evaluate.py", "--config", config_file(profile)]
+    argv = [sys.executable, "-m", "kd", "evaluate", "--config", config_file(profile)]
     for key, _, flag in EVAL_OPTS:
         value = _clean(fields.get(key))
         if value:
@@ -396,14 +402,12 @@ def exit_message(job, mode):
 # Adapters and paths
 # --------------------------------------------------------------------------- #
 def _is_adapter(path):
-    return bool(path) and os.path.isfile(os.path.join(path, "adapter_config.json"))
+    return is_adapter(path)
 
 
 def discover_adapters():
-    found = {p.replace("\\", "/")
-             for p in ADAPTER_CANDIDATES + glob.glob("./*/final_adapter")
-             if _is_adapter(p)}
-    return sorted(found, key=lambda p: -os.path.getmtime(p))
+    """Adapters from run bundles, newest first, plus any legacy output directories."""
+    return kd_discover_adapters(RUNS_DIR, extra=LEGACY_ADAPTER_CANDIDATES)
 
 
 def default_output_dir():
@@ -412,8 +416,12 @@ def default_output_dir():
     The runner does its work inside its pinned checkout ($KD_WORKDIR/src), so a relative
     output path would drop the adapter somewhere the Evaluate and Compare tabs never
     look. Anchoring it here keeps train -> evaluate -> compare working in one sitting.
+
+    Left blank by default now that runs land in <runs_dir>/<run-id>: pinning the
+    directory means two runs overwrite each other, which is only ever wanted
+    deliberately.
     """
-    return os.path.join(os.getcwd(), "distilled_output").replace("\\", "/")
+    return ""
 
 
 def rescan_adapters():
@@ -520,14 +528,14 @@ def run_evaluation(profile, adapter, device, dtype, samples, gen_similarity,
 
 
 # --------------------------------------------------------------------------- #
-# Compare tab - app.py, loaded on demand
+# Compare tab - kd.ui.compare, loaded on demand
 # --------------------------------------------------------------------------- #
 _COMPARE = {"loaded": False, "app": None}
 AWAITING = "_awaiting generation_"
 
 
 def load_compare_models(profile, adapter, progress=gr.Progress()):
-    """Import app.py and load its three models.
+    """Import kd.ui.compare and load its three models.
 
     Deliberately not done at startup: it costs a torch import plus a gigabyte of resident
     models, which would compete with a training run for the same RAM.
@@ -538,15 +546,15 @@ def load_compare_models(profile, adapter, progress=gr.Progress()):
                 gr.update(), gr.update(), gr.update())
 
     progress(0.1, desc="Importing torch and transformers...")
-    import app as compare_app
+    from . import compare as compare_app
 
     student = teacher = teacher_adapter = None
     path = config_file(profile)
     if os.path.isfile(path):
         # Read the ids from the training config so the UI never compares something
         # other than what was trained.
-        import kd_config
-        cfg = kd_config.load_config(path)
+        from ..config import load_config
+        cfg = load_config(path)
         student = cfg["models"]["student"]
         teacher = cfg["models"]["teacher"]
         teacher_adapter = cfg["models"].get("teacher_adapter")

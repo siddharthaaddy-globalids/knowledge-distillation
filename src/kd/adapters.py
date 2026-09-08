@@ -16,13 +16,13 @@ MLX-LM's conventions throughout and `peft` cannot load them:
 Nothing is retrained or approximated. The tensors are transposed and the names
 rewritten; the adapter computes the same function afterwards.
 
-    python convert_mlx_adapter.py --adapter <org>/<mlx-lora-repo>
-    python convert_mlx_adapter.py --adapter ./mlx_lora --out ./peft_lora
-    python convert_mlx_adapter.py --adapter <repo> --dry-run
+    kd convert-adapter --adapter <org>/<mlx-lora-repo>
+    kd convert-adapter --adapter ./mlx_lora --out ./peft_lora
+    kd convert-adapter --adapter <repo> --dry-run
 
 Then verify and use it:
 
-    python check_teacher.py --teacher Qwen/Qwen3.5-2B --teacher-adapter ./peft_lora
+    kd check-teacher --teacher Qwen/Qwen3.5-2B --teacher-adapter ./peft_lora
     ./distill.sh --teacher Qwen/Qwen3.5-2B --teacher-adapter ./peft_lora
 
 Scaling note: MLX-LM applies `scale` directly to the LoRA branch, while PEFT
@@ -280,7 +280,7 @@ def main():
     print(f"   output  : {dest}")
     print()
     print("   Verify it against the base model, then train:")
-    print(f"     python check_teacher.py --teacher {base} --teacher-adapter {dest}")
+    print(f"     kd check-teacher --teacher {base} --teacher-adapter {dest}")
     print(f"     ./distill.sh --teacher {base} --teacher-adapter {dest}")
     print()
     return 0

@@ -6,13 +6,13 @@ it builds, so it silently randomly-initialises everything it could not match and
 loads anyway. The result generates uniform noise, and distilling from it produces
 a student that generates uniform noise too.
 
-`check_teacher.py` detects that. This script fixes it, by renaming the tensors to
+`kd check-teacher` detects that. This script fixes it, by renaming the tensors to
 the names the architecture actually asks for and dropping components the text-only
 model does not use (e.g. a vision tower).
 
-    python fix_teacher.py                             # teacher from configs/finance.yaml
-    python fix_teacher.py --teacher org/model --out ./teacher-fixed
-    python fix_teacher.py --dry-run                   # show the mapping, write nothing
+    kd fix-teacher --config configs/finance.yaml
+    kd fix-teacher --teacher org/model --out ./teacher-fixed
+    kd fix-teacher --dry-run                   # show the mapping, write nothing
 
 No GPU and no retraining: this is a rename pass over the safetensors file. The
 config is copied verbatim so transformers builds exactly the same architecture it
@@ -21,8 +21,8 @@ MISSING.
 
 Afterwards, verify and use the repaired copy:
 
-    python check_teacher.py --teacher ./teacher-fixed
-    ./distill.sh --profile finance --teacher ./teacher-fixed
+    kd check-teacher --teacher ./teacher-fixed
+    ./distill.sh --config configs/finance.yaml --set models.teacher=./teacher-fixed
 """
 
 import argparse
@@ -38,7 +38,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from kd_config import load_config
+from .config import load_config
 
 # Components a text-only causal LM never instantiates, so their weights are dead
 # payload in the output. Dropping them also shrinks the file substantially.
@@ -313,8 +313,8 @@ def main():
     print(f"   output  : {out}")
     print()
     print("   Verify it, then train against it:")
-    print(f"     python check_teacher.py --teacher {out}")
-    print(f"     ./distill.sh --profile finance --teacher {out}")
+    print(f"     kd check-teacher --teacher {out}")
+    print(f"     ./distill.sh --config configs/finance.yaml --set models.teacher={out}")
     print()
     return 0
 

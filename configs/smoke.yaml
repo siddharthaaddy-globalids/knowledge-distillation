@@ -1,31 +1,21 @@
 # ---------------------------------------------------------------------------
-# Fast smoke config - validates the whole pipeline end to end in a couple of minutes.
-# Tiny pools, 2 steps, no real convergence. Used by CI and by --dry-run checks.
+# Fast smoke profile - validates the whole pipeline end to end in a couple of
+# minutes. Tiny pools, 2 steps, no real convergence. Used by CI and by anyone
+# checking that a machine can run this at all before committing a real budget.
 #
-#   python train_scaled.py --config configs/smoke.yaml --dry-run
+#   kd pipeline --config configs/smoke.yaml
+#
+# The teacher-check stage still runs, because a smoke test that skips the one
+# check that catches a broken teacher is not testing the thing most likely to
+# be wrong.
 # ---------------------------------------------------------------------------
+extends: _base.yaml
 
 project:
   name: smollm2-distillation-smoke
-  output_dir: ./distilled_smollm_smoke
-  seed: 42
-
-models:
-  student: HuggingFaceTB/SmolLM2-135M-Instruct
-  teacher: HuggingFaceTB/SmolLM2-360M-Instruct
-  tokenizer: teacher
-
-hardware:
-  device: auto
-  dtype: auto
-  threads: 0
 
 dataset:
-  source: HuggingFaceTB/smoltalk
-  max_prompt_tokens: 128
-  max_total_tokens: 384
   validation_size: 8
-  include_synthetic: true
   domains:
     - name: everyday-conversations
       config: everyday-conversations
@@ -39,31 +29,26 @@ dataset:
 lora:
   r: 8
   alpha: 16
-  dropout: 0.05
   target_modules:
     - q_proj
     - v_proj
 
 training:
   max_steps: 2
-  batch_size: 1
   gradient_accumulation_steps: 2
-  learning_rate: 3.0e-4
-  lr_scheduler_type: cosine
-  warmup: 0.05
-  max_grad_norm: 1.0
-  logging_steps: 1
   save_steps: 2
   save_total_limit: 1
-  eval_enabled: true
   benchmark_every: 2
 
 gkd:
-  lmbda: 0.5
-  beta: 0.5
-  temperature: 0.7
   max_new_tokens: 16
-  seq_kd: false
+
+evaluation:
+  samples: 8
+
+limits:
+  # A smoke run that has not finished in ten minutes has hung, not slowed down.
+  max_runtime_minutes: 10
 
 benchmark_prompts:
   - List three states of matter. Use a numbered list.
