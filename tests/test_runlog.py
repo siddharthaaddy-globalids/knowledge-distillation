@@ -150,14 +150,21 @@ def test_skipped_stage_records_why(workspace):
 # Streams
 # --------------------------------------------------------------------------- #
 def test_stdout_is_captured_into_the_log(workspace):
-    # quiet=True raises the console handler's threshold, so this test does not
-    # scribble its fixture lines across the test output. The file handler is
-    # unaffected, which is the half being asserted on.
-    with runlog.Run(make_config(workspace), quiet=True) as run:
-        run.log.info("a logged line")
-        run.log.debug("a debug line")
-        print("a library printed this")
-        run_dir = run.dir
+    # The tee writes to whatever stdout was when the Run was created, so pointing
+    # that at a buffer first keeps this test's fixture lines out of the test
+    # output. quiet=True handles the logger; this handles the bare print().
+    import io
+
+    real_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        with runlog.Run(make_config(workspace), quiet=True) as run:
+            run.log.info("a logged line")
+            run.log.debug("a debug line")
+            print("a library printed this")
+            run_dir = run.dir
+    finally:
+        sys.stdout = real_stdout
     text = open(os.path.join(run_dir, runlog.RUN_LOG), encoding="utf-8").read()
     for expected in ("a logged line", "a debug line", "a library printed this"):
         assert expected in text, f"run.log lost: {expected}"
@@ -220,6 +227,33 @@ def test_discover_adapters_finds_run_output(workspace):
     found = runlog.discover_adapters(runs_dir)
     assert found, "no adapters discovered"
     assert os.path.normpath(found[0]) == os.path.normpath(expected), found
+
+
+def test_discover_adapters_does_not_list_the_latest_alias(workspace):
+    """One adapter, one entry - even where `latest` is a real symlink.
+
+    On a platform that permits directory symlinks (Linux, macOS, the container),
+    runs/latest points at the newest run, so a glob over runs/*/final_adapter
+    matches the same adapter twice. Windows falls back to a latest.txt pointer and
+    never sees it, which is exactly why this reached CI green from a Windows box.
+    """
+    with runlog.Run(make_config(workspace), quiet=True) as run:
+        os.makedirs(run.adapter_dir, exist_ok=True)
+        with open(os.path.join(run.adapter_dir, "adapter_config.json"), "w") as handle:
+            handle.write("{}")
+        runs_dir = os.path.dirname(run.dir)
+        run.point_latest_here()
+
+    found = runlog.discover_adapters(runs_dir)
+    assert len(found) == 1, f"the same adapter was listed more than once: {found}"
+    assert "latest" not in found[0], \
+        f"discovery returned the alias rather than the run: {found[0]}"
+
+    # Only meaningful where the symlink was actually created; on Windows without
+    # developer mode it is a text pointer and there was nothing to deduplicate.
+    link = os.path.join(runs_dir, "latest")
+    if os.path.islink(link):
+        assert os.path.isdir(link), "the latest symlink is broken"
 
 
 def test_discover_adapters_ignores_directories_without_a_config(workspace):

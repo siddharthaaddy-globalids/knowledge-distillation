@@ -112,7 +112,15 @@ def discover_adapters(runs_dir="./runs", extra=()):
     runs_dir = os.path.expanduser(runs_dir or "./runs")
     for pattern in (os.path.join(runs_dir, "*", ADAPTER_DIR),
                     os.path.join(runs_dir, "*", CHECKPOINT_DIR, "checkpoint-*")):
-        found.extend(path for path in glob.glob(pattern) if is_adapter(path))
+        for path in glob.glob(pattern):
+            # `latest` is a pointer at another run, not a run. Where the platform
+            # allows a symlink it matches this glob too, so without skipping it
+            # every adapter would be listed twice - once under its run id and once
+            # under the alias. A run id says which run; the alias moves.
+            if is_latest_alias(path, runs_dir):
+                continue
+            if is_adapter(path):
+                found.append(path)
 
     for candidate in extra:
         if is_adapter(candidate):
@@ -120,11 +128,19 @@ def discover_adapters(runs_dir="./runs", extra=()):
 
     seen, unique = set(), []
     for path in sorted(found, key=os.path.getmtime, reverse=True):
-        normalised = os.path.normpath(path)
-        if normalised not in seen:
-            seen.add(normalised)
-            unique.append(normalised.replace("\\", "/"))
+        # realpath, not normpath: two different paths reaching one directory
+        # through a link are the same adapter, and offering both is noise.
+        key = os.path.realpath(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(os.path.normpath(path).replace("\\", "/"))
     return unique
+
+
+def is_latest_alias(path, runs_dir):
+    """True when `path` sits under the `latest` pointer rather than a real run."""
+    relative = os.path.relpath(path, runs_dir)
+    return relative.split(os.sep)[0] == "latest"
 
 
 # --------------------------------------------------------------------------- #

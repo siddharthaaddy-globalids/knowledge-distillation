@@ -88,8 +88,14 @@ class Context:
         if os.path.isfile(candidate):
             return candidate
         runs_dir = self.config["project"].get("runs_dir") or "./runs"
-        found = sorted(glob.glob(os.path.join(runs_dir, "*", "evaluation.json")),
-                       key=os.path.getmtime, reverse=True)
+        # Skip the `latest` pointer for the same reason discovery does: where the
+        # platform makes it a real symlink it matches this glob as well, and
+        # naming an alias instead of a run id makes the log say something that
+        # will not be true tomorrow.
+        found = sorted(
+            (p for p in glob.glob(os.path.join(runs_dir, "*", "evaluation.json"))
+             if not runlog.is_latest_alias(p, runs_dir)),
+            key=os.path.getmtime, reverse=True)
         if found:
             newest = os.path.normpath(found[0]).replace("\\", "/")
             self.log.info(f"      using the newest evaluation found: {newest}")
