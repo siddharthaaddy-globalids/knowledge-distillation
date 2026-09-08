@@ -1,438 +1,122 @@
 #!/usr/bin/env bash
 # ===========================================================================
-#  Self-contained knowledge-distillation runner
+#  Knowledge-distillation runner
 #
 #  Built by GitHub Actions from __REPO__@__SHA_SHORT__ on __BUILT_AT__
 #
 #  QUICK START
 #    chmod +x distill.sh
-#    ./distill.sh --teacher HuggingFaceTB/SmolLM2-1.7B-Instruct
+#    ./distill.sh --config configs/finance.yaml
 #
-#  Bootstraps uv, fetches the pinned source, detects your hardware
-#  (Apple Silicon MPS / CUDA / CPU) and runs the distillation.
-#  Run ./distill.sh --help for all options.
+#  This script is a bootstrapper and nothing else. It installs uv, fetches the
+#  source pinned to the commit it was built from, and hands over to the Python
+#  pipeline. Everything the pipeline does - stage order, gating, limits, the
+#  config precedence chain - lives in the source, so this file and its
+#  PowerShell twin cannot drift from each other or from the code.
+#
+#  Anything it does not recognise is passed straight through:
+#
+#    ./distill.sh --config configs/finance.yaml --set training.max_steps=500
+#    ./distill.sh evaluate --config configs/finance.yaml
+#    ./distill.sh --help
+#
+#  With no leading subcommand it runs the full gated pipeline.
 # ===========================================================================
 set -euo pipefail
 
-# Absolute path to this script, captured before any cd. The control UI re-invokes
-# the runner for every action it performs, so it needs a path that survives the
-# working-directory change into $SRC_DIR further down.
-SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-
-# ---------------------------------------------------------------------------
-#  Defaults. Override with CLI flags (preferred) or KD_* environment variables.
-#  Precedence: CLI flag  >  KD_* env var  >  these defaults.
-# ---------------------------------------------------------------------------
-# IMPORTANT: empty means "not specified", and the selected profile's YAML value is used.
-# These must NOT carry hardcoded model defaults: they are exported as KD_* variables,
-# which outrank the config file, so a non-empty default here would silently override
-# whatever the profile specifies (e.g. clobbering configs/finance.yaml with SmolLM2).
-# A KD_* variable set by the caller still counts as an explicit choice.
-TEACHER_MODEL="${KD_TEACHER_MODEL:-}"
-STUDENT_MODEL="${KD_STUDENT_MODEL:-}"
-TEACHER_ADAPTER="${KD_TEACHER_ADAPTER:-}"
-DATASET="${KD_DATASET:-}"
-
-DEVICE="${KD_DEVICE:-}"              # auto | cpu | mps | cuda
-DTYPE="${KD_DTYPE:-}"                # auto | float32 | bfloat16 | float16
-MAX_STEPS="${KD_MAX_STEPS:-}"
-OUTPUT_DIR="${KD_OUTPUT_DIR:-}"
-
-BATCH_SIZE="${KD_BATCH_SIZE:-}"      # blank = profile default
-GRAD_ACCUM="${KD_GRAD_ACCUM:-}"
-LEARNING_RATE="${KD_LEARNING_RATE:-}"
-LORA_R="${KD_LORA_R:-}"
-LORA_ALPHA="${KD_LORA_ALPHA:-}"
-LMBDA="${KD_LMBDA:-}"
-
-CONFIG_PROFILE=""                    # blank = auto (Apple Silicon -> mac)
-PROFILE_EXPLICIT=0                   # 1 once --profile is given on the CLI
-PUBLISH_REPO=""                      # target repo for --publish
-MODE="train"
-
-EVAL_TASKS="${KD_EVAL_TASKS:-}"   # lm-eval task list; empty = fidelity metrics only
-GEN_SIMILARITY=""                    # N prompts for free-running similarity; empty = off
-SIMILARITY_MODEL=""                  # BERTScore encoder override
-EVAL_SAMPLES="${KD_EVAL_SAMPLES:-}"  # blank = evaluate.py default
-EVAL_LIMIT=""                        # per-task example cap for lm-eval
-EVAL_JSON=""
-EVAL_REPORT=""                       # readable report; .md or .html
-
-UI_PORT="${KD_UI_PORT:-7860}"
-UI_HOST="${KD_UI_HOST:-127.0.0.1}"
-UI_SHARE=0
-UI_APP="control"                     # control = full panel, compare = 3-model view
-ADAPTER_DIR="${KD_ADAPTER_PATH:-}"
-
 REPO_URL="__REPO_URL__"
 REPO_REF="__SHA__"
+BUILD_REF="__REPO__@__SHA_SHORT__"
+BUILT_AT="__BUILT_AT__"
+
 WORKDIR="${KD_WORKDIR:-$HOME/.cache/kd-runner}"
-SRC_DIR="$WORKDIR/src"
+USE_LOCAL="${KD_LOCAL:-0}"
 
 # Plain text only: ANSI escapes do not survive every terminal, pipe, CI log or
 # `tee`, and a banner that renders as raw escape codes is worse than no colour.
-RULE='=============================================================================='
-
 log()  { printf '==> %s\n' "$*"; }
-warn() { printf '!!  %s\n' "$*" >&2; }
 die()  { printf 'xx  %s\n' "$*" >&2; exit 1; }
 
-# Indented detail lines under a banner.
-ok()   { printf '%s\n' "$*"; }
-bad()  { printf '%s\n' "$*" >&2; }
-
-banner_ok() {
-  echo
-  echo "$RULE"
-  echo "  ALL OK - $1"
-  echo "$RULE"
-}
-
-banner_bad() {
-  echo >&2
-  echo "$RULE" >&2
-  echo "  FAILED - $1" >&2
-  echo "$RULE" >&2
-}
-
-# Pull " <key>  : <value>" out of a --print-config block.
-field() {
-  printf '%s\n' "$1" | awk -F': ' -v k="$2" '$0 ~ "^ "k" +:" {print $2; exit}'
-}
-
-# ---------------------------------------------------------------------------
-#  Help
-# ---------------------------------------------------------------------------
-usage() {
-  # QUOTED delimiter, deliberately. With an unquoted <<EOF the shell performs
-  # expansion on the help text, so a backticked example such as `hf auth login`
-  # is EXECUTED - which hangs --help on an interactive prompt for anyone who has
-  # the environment on PATH. Nothing in this text needs expansion.
+runner_help() {
   cat <<'EOF'
-distill.sh - knowledge distillation runner (pinned to __SHA_SHORT__)
+distill.sh - bootstrapper for the knowledge-distillation pipeline
 
-USAGE
-  ./distill.sh [OPTIONS]
+  ./distill.sh [RUNNER OPTIONS] [COMMAND] [PIPELINE OPTIONS]
 
-MODELS AND DATA
-  -t, --teacher MODEL     Teacher model id or local path
-                          (default: from the selected profile)
-  -s, --student MODEL     Student model id or local path
-      --teacher-adapter P LoRA adapter merged into the teacher at load time.
-                          Use when the teacher is a base model plus an adapter
-                          rather than a merged checkpoint - merged exports from
-                          other frameworks often keep that framework's key
-                          layout, which plain transformers may not map back.
-                          Accepts a HF repo id or a local directory.
-                          (default: from the selected profile)
-  -d, --dataset NAME      Training dataset
-                          (default: from the selected profile)
+RUNNER OPTIONS (consumed here; everything else is passed through)
+  --runner-help       This message. Use --help for the pipeline's own help.
+  --runner-version    The commit this runner was built from.
+  --local             Use the checkout this script sits in, instead of fetching
+                      the pinned source. For working on the pipeline itself.
+  --workdir DIR       Where to keep the checkout (default: ~/.cache/kd-runner,
+                      or $KD_WORKDIR).
 
-  NOTE: teacher and student must share a tokenizer vocabulary for standard GKD.
-
-HARDWARE
-      --device DEV        auto | cpu | mps | cuda   (default: from profile)
-                          auto detects Apple Silicon (MPS) and CUDA
-      --dtype TYPE        auto | float32 | bfloat16 | float16  (default: from profile)
-                          bfloat16 on MPS requires macOS 14.0 or newer
-
-TRAINING
-      --steps N           Optimizer steps (default: from profile)
-      --batch-size N      Per-device batch size
-      --grad-accum N      Gradient accumulation steps
-      --lr RATE           Learning rate (e.g. 3e-4)
-      --lora-r N          LoRA rank
-      --lora-alpha N      LoRA alpha
-      --lmbda F           On-policy fraction 0.0-1.0; raise toward 1.0 for
-                          more student rollouts corrected by the teacher
-  -o, --output DIR        Output directory (default: from profile)
-  -p, --profile NAME      Config profile:
-                            default | mac | smoke | finance | qwen-poc
-                          (default: auto-selected from platform)
-                          qwen-poc = Qwen3.5-2B -> Qwen3.5-0.8B on finance-alpaca.
-                          A known-good pairing for proving the pipeline; pair it
-                          with --dtype bfloat16 to halve the memory footprint.
-
-MODES
-      --check             Resolve config and hardware, print, and exit.
-                          Run this first - it is instant and catches typos.
-      --check-teacher     Load ONLY the teacher and verify it is fit to distil
-                          from: missing/randomly-initialised weights, NaN scan,
-                          and whether its output is actually language.
-                          A broken teacher yields a broken student, because GKD
-                          trains the student to match the teacher's distribution.
-      --fix-teacher       Repair a merged checkpoint whose tensor keys do not
-                          match its architecture, by renaming them to what the
-                          model asks for. No retraining and no GPU. Writes a
-                          repaired copy and prints the --teacher flag to use.
-      --convert-adapter   Convert an MLX-LM / unsloth-on-Apple-Silicon LoRA
-                          adapter into PEFT format so --teacher-adapter can
-                          load it. Needs --teacher-adapter to name the MLX
-                          adapter. Renames and transposes only; no retraining.
-      --publish REPO      Publish the trained adapter to REPO-lora and a merged
-                          ready-to-run model to REPO on the Hugging Face Hub.
-                          The merge is done by transformers, so the checkpoint
-                          uses canonical tensor names. Verifies the merged model
-                          generates language before uploading anything.
-                          Needs `hf auth login` or HF_TOKEN.
-      --evaluate          Measure how much of the teacher actually transferred
-                          into the trained adapter. Reports FIDELITY (top-1
-                          agreement with the teacher, KL divergence) and
-                          CAPABILITY (held-out perplexity), for the BASE student
-                          and the DISTILLED student against the same teacher, on
-                          the held-out split the student never trained on.
-                          Exits 3 if the adapter did not improve on the base.
-      --smoke             2-step end-to-end validation (~1 min)
-      --ui                Launch the control panel: train, evaluate and compare
-                          from the browser. Every screen shows the command it
-                          runs, so nothing here is hidden from the terminal.
-      --ui-compare        Launch only the side-by-side comparison UI
-                          (original vs distilled vs teacher) instead of training
-      --shell             Open a shell with the environment activated
-  -h, --help              Show this help
-  -V, --version           Show the pinned build revision
-
-EVALUATION OPTIONS (with --evaluate)
-      --tasks LIST        Also score base/distilled/teacher on lm-evaluation-
-                          harness benchmarks, e.g. ifeval,hellaswag,arc_easy,
-                          and print the retention table (distilled / teacher).
-                          ifeval is the standard benchmark for instruction-shape
-                          compliance, which is what short distillation runs
-                          actually transfer. Installs the `eval` extra on demand.
-      --eval-samples N    Held-out samples to score (default: 50)
-      --eval-limit N      Per-task example cap for --tasks (quick look)
-      --gen-similarity N  Also compare FREE-RUNNING generations against the
-                          teacher's own output on N held-out prompts, using
-                          BERTScore (meaning, not word overlap) plus ROUGE-L.
-                          Agreement and KL are teacher-forced - both models read
-                          the same correct text - so they never see the student's
-                          own drift. This does. Slow: three models generate.
-      --similarity-model ID
-                          BERTScore encoder (default: roberta-large, ~1.4GB)
-      --report PATH       Write a READABLE report next to the raw numbers. The
-                          extension picks the format: .md for Markdown, .html for
-                          a self-contained page you can open or send to someone.
-                          Leads with a plain-English summary, so a reader does not
-                          need to know what perplexity is.
-      --eval-json PATH    Write every metric to a JSON file (machine-readable)
-      --adapter DIR       Adapter to evaluate (default: <output>/final_adapter)
-
-UI OPTIONS (with --ui / --ui-compare)
-      --port N            Port to serve on (default: 7860)
-      --host ADDR         Bind address (default: 127.0.0.1)
-      --share             Create a public Gradio share link
-      --adapter DIR       Compare a specific adapter directory
-                          (default: the newest one found under --output)
+COMMAND
+  Omitted, or any option starting with "-", runs the full gated pipeline.
+  Otherwise the first argument is the pipeline subcommand: train, evaluate,
+  check, check-teacher, fix-teacher, convert-adapter, publish, ui, doctor.
 
 EXAMPLES
-  # See what would run, without running it
-  ./distill.sh --check
+  ./distill.sh --config configs/finance.yaml
+  ./distill.sh --config configs/finance.yaml --set training.max_steps=500
+  ./distill.sh --config configs/finance.yaml --only train
+  ./distill.sh check --config configs/finance.yaml
+  ./distill.sh doctor
+  ./distill.sh --help
 
-  # Verify the teacher before spending a training budget on it
-  ./distill.sh --profile finance --check-teacher
-
-  # Teacher failed --check-teacher because its keys are mislabelled? Repair it
-  ./distill.sh --profile finance --fix-teacher
-
-  # Known-good proof-of-concept run, in bfloat16 to fit comfortably in 16GB
-  ./distill.sh --profile qwen-poc --dtype bfloat16
-
-  # unsloth trained on a Mac writes MLX adapters; convert, then use
-  ./distill.sh --teacher-adapter <org>/<mlx-lora> --convert-adapter
-  ./distill.sh --teacher Qwen/Qwen3.5-2B --teacher-adapter ~/peft-adapter --check-teacher
-
-  # Teacher as base + LoRA adapter, instead of a merged checkpoint
-  ./distill.sh --teacher Qwen/Qwen3.5-2B --teacher-adapter ./lora_model
-
-  # Bigger teacher - the single highest-leverage change
-  ./distill.sh --teacher HuggingFaceTB/SmolLM2-1.7B-Instruct
-
-  # Retarget everything
-  ./distill.sh -t Qwen/Qwen2.5-1.5B-Instruct -s Qwen/Qwen2.5-0.5B-Instruct \\
-               -d HuggingFaceTB/smoltalk --steps 600
-
-  # More on-policy rollouts, longer run, explicit output
-  ./distill.sh --lmbda 0.9 --steps 600 -o ./run-lmbda09
-
-  # Force CPU on a Mac (slow, for comparison)
-  ./distill.sh --device cpu --steps 50
-
-  # How much of the teacher actually made it into the student?
-  ./distill.sh --profile finance --evaluate
-
-  # ...and the standard task benchmarks with it (slow: three models)
-  ./distill.sh --profile finance --evaluate --tasks ifeval --eval-limit 100
-
-  # Train, then inspect the result in the browser
-  ./distill.sh --teacher HuggingFaceTB/SmolLM2-1.7B-Instruct
-  ./distill.sh --ui
-
-  # Serve the UI on the LAN so others can try it
-  ./distill.sh --ui --host 0.0.0.0 --port 8080
-
-ENVIRONMENT
-  Every flag has a KD_* equivalent, applied when the flag is absent:
-    KD_TEACHER_MODEL  KD_STUDENT_MODEL  KD_DATASET  KD_DEVICE  KD_DTYPE
-    KD_TEACHER_ADAPTER
-    KD_MAX_STEPS      KD_BATCH_SIZE     KD_GRAD_ACCUM         KD_LEARNING_RATE
-    KD_LORA_R         KD_LORA_ALPHA     KD_LMBDA              KD_OUTPUT_DIR
-  KD_WORKDIR sets the checkout cache (default: $HOME/.cache/kd-runner)
-  KD_EVAL_TASKS and KD_EVAL_SAMPLES preset the --evaluate options
-
-OUTPUT
-  The trained LoRA adapter is written to <output>/final_adapter
+  Run `./distill.sh --help` for every pipeline option.
 EOF
 }
 
 # ---------------------------------------------------------------------------
-#  Argument parsing. Supports both "--flag value" and "--flag=value".
+#  1. Split the runner's own flags from everything else
 # ---------------------------------------------------------------------------
-need_val() {
-  # $1 = flag name, $2 = count of remaining args
-  [ "$2" -ge 2 ] || die "Option $1 requires a value. See --help."
-}
-
+ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    -t|--teacher)     need_val "$1" $#; TEACHER_MODEL="$2"; shift 2 ;;
-    --teacher=*)      TEACHER_MODEL="${1#*=}"; shift ;;
-    -s|--student)     need_val "$1" $#; STUDENT_MODEL="$2"; shift 2 ;;
-    --teacher-adapter) need_val "$1" $#; TEACHER_ADAPTER="$2"; shift 2 ;;
-    --teacher-adapter=*) TEACHER_ADAPTER="${1#*=}"; shift ;;
-    --student=*)      STUDENT_MODEL="${1#*=}"; shift ;;
-    -d|--dataset)     need_val "$1" $#; DATASET="$2"; shift 2 ;;
-    --dataset=*)      DATASET="${1#*=}"; shift ;;
-
-    --device)         need_val "$1" $#; DEVICE="$2"; shift 2 ;;
-    --device=*)       DEVICE="${1#*=}"; shift ;;
-    --dtype)          need_val "$1" $#; DTYPE="$2"; shift 2 ;;
-    --dtype=*)        DTYPE="${1#*=}"; shift ;;
-
-    --steps)          need_val "$1" $#; MAX_STEPS="$2"; shift 2 ;;
-    --steps=*)        MAX_STEPS="${1#*=}"; shift ;;
-    --batch-size)     need_val "$1" $#; BATCH_SIZE="$2"; shift 2 ;;
-    --batch-size=*)   BATCH_SIZE="${1#*=}"; shift ;;
-    --grad-accum)     need_val "$1" $#; GRAD_ACCUM="$2"; shift 2 ;;
-    --grad-accum=*)   GRAD_ACCUM="${1#*=}"; shift ;;
-    --lr)             need_val "$1" $#; LEARNING_RATE="$2"; shift 2 ;;
-    --lr=*)           LEARNING_RATE="${1#*=}"; shift ;;
-    --lora-r)         need_val "$1" $#; LORA_R="$2"; shift 2 ;;
-    --lora-r=*)       LORA_R="${1#*=}"; shift ;;
-    --lora-alpha)     need_val "$1" $#; LORA_ALPHA="$2"; shift 2 ;;
-    --lora-alpha=*)   LORA_ALPHA="${1#*=}"; shift ;;
-    --lmbda)          need_val "$1" $#; LMBDA="$2"; shift 2 ;;
-    --lmbda=*)        LMBDA="${1#*=}"; shift ;;
-
-    -o|--output)      need_val "$1" $#; OUTPUT_DIR="$2"; shift 2 ;;
-    --output=*)       OUTPUT_DIR="${1#*=}"; shift ;;
-    -p|--profile)     need_val "$1" $#; CONFIG_PROFILE="$2"; PROFILE_EXPLICIT=1; shift 2 ;;
-    --profile=*)      CONFIG_PROFILE="${1#*=}"; PROFILE_EXPLICIT=1; shift ;;
-
-    --port)           need_val "$1" $#; UI_PORT="$2"; shift 2 ;;
-    --port=*)         UI_PORT="${1#*=}"; shift ;;
-    --host)           need_val "$1" $#; UI_HOST="$2"; shift 2 ;;
-    --host=*)         UI_HOST="${1#*=}"; shift ;;
-    --share)          UI_SHARE=1; shift ;;
-    --adapter)        need_val "$1" $#; ADAPTER_DIR="$2"; shift 2 ;;
-    --adapter=*)      ADAPTER_DIR="${1#*=}"; shift ;;
-
-    --evaluate)       MODE="evaluate"; shift ;;
-    --tasks)          need_val "$1" $#; EVAL_TASKS="$2"; shift 2 ;;
-    --tasks=*)        EVAL_TASKS="${1#*=}"; shift ;;
-    --eval-samples)   need_val "$1" $#; EVAL_SAMPLES="$2"; shift 2 ;;
-    --eval-samples=*) EVAL_SAMPLES="${1#*=}"; shift ;;
-    --eval-limit)     need_val "$1" $#; EVAL_LIMIT="$2"; shift 2 ;;
-    --eval-limit=*)   EVAL_LIMIT="${1#*=}"; shift ;;
-    --eval-json)      need_val "$1" $#; EVAL_JSON="$2"; shift 2 ;;
-    --gen-similarity) need_val "$1" $#; GEN_SIMILARITY="$2"; shift 2 ;;
-    --gen-similarity=*) GEN_SIMILARITY="${1#*=}"; shift ;;
-    --similarity-model) need_val "$1" $#; SIMILARITY_MODEL="$2"; shift 2 ;;
-    --similarity-model=*) SIMILARITY_MODEL="${1#*=}"; shift ;;
-    --eval-json=*)    EVAL_JSON="${1#*=}"; shift ;;
-    --report)         need_val "$1" $#; EVAL_REPORT="$2"; shift 2 ;;
-    --report=*)       EVAL_REPORT="${1#*=}"; shift ;;
-
-    --check)          MODE="check"; shift ;;
-    --check-teacher)  MODE="check-teacher"; shift ;;
-    --fix-teacher)    MODE="fix-teacher"; shift ;;
-    --publish)        need_val "$1" $#; MODE="publish"; PUBLISH_REPO="$2"; shift 2 ;;
-    --publish=*)      MODE="publish"; PUBLISH_REPO="${1#*=}"; shift ;;
-    --convert-adapter) MODE="convert-adapter"; shift ;;
-    --smoke)          MODE="smoke"; shift ;;
-    --ui)             MODE="ui"; shift ;;
-    --ui-compare)     MODE="ui"; UI_APP="compare"; shift ;;
-    --shell)          MODE="shell"; shift ;;
-    -h|--help)        usage; exit 0 ;;
-    -V|--version)     echo "distill.sh pinned to __REPO__@__SHA_SHORT__ (built __BUILT_AT__)"; exit 0 ;;
-
-    --) shift; break ;;
-    -*) die "Unknown option: '$1'  (run --help)" ;;
-    *)  die "Unexpected argument: '$1'  (run --help). A blank one usually means a
-    trailing space after a line-continuation backslash - the backslash escaped the
-    space instead of the newline." ;;
+    --runner-help)    runner_help; exit 0 ;;
+    --runner-version) echo "distill.sh pinned to $BUILD_REF (built $BUILT_AT)"; exit 0 ;;
+    --local)          USE_LOCAL=1; shift ;;
+    --workdir)        [ $# -ge 2 ] || die "--workdir needs a directory"
+                      WORKDIR="$2"; shift 2 ;;
+    --workdir=*)      WORKDIR="${1#*=}"; shift ;;
+    *)                ARGS+=("$1"); shift ;;
   esac
 done
 
-# ---------------------------------------------------------------------------
-#  Validate
-# ---------------------------------------------------------------------------
-# An empty value means "inherit from the profile", so it is always valid.
-case "$DEVICE" in ''|auto|cpu|mps|cuda) ;; *) die "--device must be auto|cpu|mps|cuda (got '$DEVICE')" ;; esac
-case "$DTYPE"  in ''|auto|float32|bfloat16|float16) ;; *) die "--dtype must be auto|float32|bfloat16|float16 (got '$DTYPE')" ;; esac
-[ -n "$MAX_STEPS" ] && case "$MAX_STEPS" in *[!0-9]*) die "--steps must be a positive integer (got '$MAX_STEPS')" ;; esac
-case "$UI_PORT"  in ''|*[!0-9]*) die "--port must be a positive integer (got '$UI_PORT')" ;; esac
-[ -n "$EVAL_SAMPLES" ] && case "$EVAL_SAMPLES" in *[!0-9]*) die "--eval-samples must be a positive integer (got '$EVAL_SAMPLES')" ;; esac
-[ -n "$EVAL_LIMIT" ] && case "$EVAL_LIMIT" in *[!0-9]*) die "--eval-limit must be a positive integer (got '$EVAL_LIMIT')" ;; esac
-[ -n "$GEN_SIMILARITY" ] && case "$GEN_SIMILARITY" in *[!0-9]*) die "--gen-similarity must be a positive integer (got '$GEN_SIMILARITY')" ;; esac
-[ -n "$CONFIG_PROFILE" ] && case "$CONFIG_PROFILE" in
-  default|mac|smoke|finance|qwen-poc) ;; *) die "--profile must be default|mac|smoke|finance|qwen-poc (got '$CONFIG_PROFILE')" ;;
-esac
-
-# The control panel shells back into this script for every action it performs, so
-# refuse to nest one inside another: it would fork a second server onto the same port.
-# Checked before the bootstrap, so it fails in a second rather than after a uv sync.
-if [ "$MODE" = "ui" ] && [ -n "${KD_UI_ACTIVE:-}" ]; then
-  die "A control UI is already running - this shell was started by it."
+# With no arguments at all, or when the first one is an option, the intent is a
+# full pipeline run. Deciding on the leading "-" rather than on a list of known
+# subcommands means this file never has to be updated when one is added.
+if [ "${#ARGS[@]}" -eq 0 ] || [ "${ARGS[0]#-}" != "${ARGS[0]}" ]; then
+  ARGS=("pipeline" "${ARGS[@]+"${ARGS[@]}"}")
 fi
 
+# Print the command that would run, and stop. The only decision this script makes
+# on its own is which pipeline command to invoke, and this is what lets that be
+# tested - in CI and by hand - without a clone, a torch download or a GPU.
+if [ "${KD_DISPATCH_ONLY:-0}" = "1" ]; then
+  printf '%s\n' "${ARGS[*]}"
+  exit 0
+fi
+
+SRC_DIR="$WORKDIR/src"
+
 # ---------------------------------------------------------------------------
-#  1. Platform detection
+#  2. Platform
 # ---------------------------------------------------------------------------
 OS="$(uname -s)"
 ARCH="$(uname -m)"
-IS_APPLE_SILICON=0
-if [ "$OS" = "Darwin" ] && [ "$ARCH" = "arm64" ]; then
-  IS_APPLE_SILICON=1
-fi
-
 log "Platform: $OS/$ARCH"
-if [ "$IS_APPLE_SILICON" -eq 1 ]; then
-  MACOS_VER="$(sw_vers -productVersion 2>/dev/null || echo unknown)"
-  TOTAL_RAM_GB="$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))"
-  log "Apple Silicon detected - macOS $MACOS_VER, ${TOTAL_RAM_GB}GB unified memory"
-  # transformers only permits bfloat16 on MPS from macOS 14.0 onward.
-  MACOS_MAJOR="${MACOS_VER%%.*}"
-  if [ "$DTYPE" = "bfloat16" ] && [ "${MACOS_MAJOR:-0}" -lt 14 ] 2>/dev/null; then
-    warn "bfloat16 needs macOS >= 14.0; the pipeline will fall back to float32."
-  fi
-  # Let the MPS allocator use the whole unified pool rather than a fraction of it.
+
+if [ "$OS" = "Darwin" ] && [ "$ARCH" = "arm64" ]; then
+  # Let the MPS allocator use the whole unified memory pool rather than a
+  # fraction of it, and route unsupported ops to CPU instead of raising.
   export PYTORCH_MPS_HIGH_WATERMARK_RATIO="${PYTORCH_MPS_HIGH_WATERMARK_RATIO:-0.0}"
   export PYTORCH_ENABLE_MPS_FALLBACK="${PYTORCH_ENABLE_MPS_FALLBACK:-1}"
 fi
 
-if [ -z "$CONFIG_PROFILE" ]; then
-  if [ "$IS_APPLE_SILICON" -eq 1 ]; then CONFIG_PROFILE="mac"; else CONFIG_PROFILE="default"; fi
-fi
-# --smoke defaults to the tiny smoke profile, but ONLY when no profile was asked
-# for. Overriding an explicit --profile would measure a different model pair than
-# the one about to be trained, making the projected run time meaningless.
-if [ "$MODE" = "smoke" ] && [ "$PROFILE_EXPLICIT" -eq 0 ]; then
-  CONFIG_PROFILE="smoke"
-fi
-log "Config profile: $CONFIG_PROFILE"
-
 # ---------------------------------------------------------------------------
-#  2. uv bootstrap
+#  3. uv
 # ---------------------------------------------------------------------------
 if ! command -v uv >/dev/null 2>&1; then
   log "uv not found - installing to ~/.local/bin"
@@ -440,335 +124,44 @@ if ! command -v uv >/dev/null 2>&1; then
   export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 fi
 command -v uv >/dev/null 2>&1 || die "uv install failed. See https://docs.astral.sh/uv/"
-log "uv $(uv --version 2>/dev/null | awk '{print $2}')"
 
 # ---------------------------------------------------------------------------
-#  3. Fetch pinned source
+#  4. Source
 # ---------------------------------------------------------------------------
-mkdir -p "$WORKDIR"
-if [ -d "$SRC_DIR/.git" ]; then
-  log "Updating source in $SRC_DIR"
-  git -C "$SRC_DIR" fetch --depth 1 origin "$REPO_REF" 2>/dev/null || git -C "$SRC_DIR" fetch origin
-  git -C "$SRC_DIR" checkout -q "$REPO_REF"
+if [ "$USE_LOCAL" = "1" ]; then
+  SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+  # A runner is normally downloaded on its own, so --local is only meaningful
+  # from inside a checkout. Saying so beats a later import error.
+  [ -f "$SRC_DIR/pyproject.toml" ] || die \
+    "--local needs this script to sit in a checkout; no pyproject.toml in $SRC_DIR"
+  log "Using local checkout: $SRC_DIR"
 else
-  log "Cloning $REPO_URL @ ${REPO_REF:0:12}"
-  rm -rf "$SRC_DIR"
-  git clone --quiet "$REPO_URL" "$SRC_DIR"
-  git -C "$SRC_DIR" checkout -q "$REPO_REF"
+  mkdir -p "$WORKDIR"
+  if [ -d "$SRC_DIR/.git" ]; then
+    log "Updating source in $SRC_DIR"
+    git -C "$SRC_DIR" fetch --depth 1 origin "$REPO_REF" 2>/dev/null \
+      || git -C "$SRC_DIR" fetch origin
+    git -C "$SRC_DIR" checkout -q "$REPO_REF"
+  else
+    log "Cloning $REPO_URL @ ${REPO_REF:0:12}"
+    rm -rf "$SRC_DIR"
+    git clone --quiet "$REPO_URL" "$SRC_DIR"
+    git -C "$SRC_DIR" checkout -q "$REPO_REF"
+  fi
 fi
 cd "$SRC_DIR"
 
 # ---------------------------------------------------------------------------
-#  4. Environment
+#  5. Environment
 # ---------------------------------------------------------------------------
-log "Syncing dependencies (first run downloads torch - this takes a while)"
+log "Syncing dependencies (the first run downloads torch - this takes a while)"
 uv sync --quiet || die "uv sync failed"
 
 # ---------------------------------------------------------------------------
-#  5. Hand the resolved settings to the pipeline as KD_* overrides
+#  6. Hand over
 # ---------------------------------------------------------------------------
-# Export ONLY what was explicitly requested. Anything left empty falls through to the
-# profile's YAML value - exporting a default here would override the config file.
-[ -n "$TEACHER_MODEL" ] && export KD_TEACHER_MODEL="$TEACHER_MODEL"
-[ -n "$STUDENT_MODEL" ] && export KD_STUDENT_MODEL="$STUDENT_MODEL"
-[ -n "$TEACHER_ADAPTER" ] && export KD_TEACHER_ADAPTER="$TEACHER_ADAPTER"
-[ -n "$DATASET" ]       && export KD_DATASET="$DATASET"
-[ -n "$DEVICE" ]        && export KD_DEVICE="$DEVICE"
-[ -n "$DTYPE" ]         && export KD_DTYPE="$DTYPE"
-[ -n "$OUTPUT_DIR" ]    && export KD_OUTPUT_DIR="$OUTPUT_DIR"
-[ -n "$MAX_STEPS" ]     && export KD_MAX_STEPS="$MAX_STEPS"
-[ -n "$BATCH_SIZE" ]    && export KD_BATCH_SIZE="$BATCH_SIZE"
-[ -n "$GRAD_ACCUM" ]    && export KD_GRAD_ACCUM="$GRAD_ACCUM"
-[ -n "$LEARNING_RATE" ] && export KD_LEARNING_RATE="$LEARNING_RATE"
-[ -n "$LORA_R" ]        && export KD_LORA_R="$LORA_R"
-[ -n "$LORA_ALPHA" ]    && export KD_LORA_ALPHA="$LORA_ALPHA"
-[ -n "$LMBDA" ]         && export KD_LMBDA="$LMBDA"
-
-CONFIG_FILE="configs/${CONFIG_PROFILE}.yaml"
-[ -f "$CONFIG_FILE" ] || die "Config profile not found: $CONFIG_FILE"
-
-# ---------------------------------------------------------------------------
-#  6. Run
-# ---------------------------------------------------------------------------
-case "$MODE" in
-  check)
-    log "Resolving configuration (no training)"
-    set +e
-    CHECK_OUT="$(uv run python train_scaled.py --config "$CONFIG_FILE" --print-config 2>&1)"
-    CHECK_RC=$?
-    set -e
-    printf '%s
-' "$CHECK_OUT"
-    if [ $CHECK_RC -ne 0 ]; then
-      banner_bad "configuration did not resolve (exit $CHECK_RC)"
-      exit $CHECK_RC
-    fi
-    C_DEV="$(field "$CHECK_OUT" device)"
-    C_TCH="$(field "$CHECK_OUT" teacher)"
-    C_STU="$(field "$CHECK_OUT" student)"
-    C_DS="$(field "$CHECK_OUT" dataset)"
-    banner_ok "configuration resolved"
-    ok "   profile : $CONFIG_PROFILE"
-    ok "   teacher : $C_TCH"
-    ok "   student : $C_STU"
-    ok "   dataset : $C_DS"
-    ok "   device  : $C_DEV"
-    case "$C_DEV" in
-      mps*)  ok "   Apple GPU (MPS) in use." ;;
-      cuda*) ok "   CUDA GPU in use." ;;
-      cpu*)  [ "$IS_APPLE_SILICON" -eq 1 ]                && warn "Running on CPU despite Apple Silicon - MPS was not detected."                || ok "   Running on CPU." ;;
-    esac
-    echo
-    ok "   Next: ./distill.sh --profile $CONFIG_PROFILE --check-teacher"
-    echo
-    ;;
-  convert-adapter)
-    if [ -z "$TEACHER_ADAPTER" ]; then
-      die "--convert-adapter needs --teacher-adapter <mlx-adapter-repo-or-dir>"
-    fi
-    CONV_OUT="$WORKDIR/peft-adapter"
-    log "Converting MLX adapter to PEFT format"
-    log "  from : $TEACHER_ADAPTER"
-    log "  to   : $CONV_OUT"
-    set +e
-    CONV_ARGS="--adapter $TEACHER_ADAPTER --out $CONV_OUT --force"
-    [ -n "$TEACHER_MODEL" ] && CONV_ARGS="$CONV_ARGS --base $TEACHER_MODEL"
-    # shellcheck disable=SC2086  # CONV_ARGS is intentionally word-split into flags
-    uv run python convert_mlx_adapter.py $CONV_ARGS
-    CONV_RC=$?
-    set -e
-    if [ "$CONV_RC" -ne 0 ]; then
-      banner_bad "adapter conversion failed (exit $CONV_RC)"
-      exit "$CONV_RC"
-    fi
-    banner_ok "adapter converted to PEFT format"
-    ok "   output : $CONV_OUT"
-    echo
-    ok "   Verify it against the base model, then train:"
-    ok "     ./distill.sh --teacher <base> --teacher-adapter $CONV_OUT --check-teacher"
-    ok "     ./distill.sh --teacher <base> --teacher-adapter $CONV_OUT"
-    echo
-    ;;
-  publish)
-    log "Publishing to the Hugging Face Hub: $PUBLISH_REPO"
-    PUB_ARGS="--repo $PUBLISH_REPO --config $CONFIG_FILE"
-    [ -n "$ADAPTER_DIR" ] && PUB_ARGS="$PUB_ARGS --adapter $ADAPTER_DIR"
-    [ -n "$DTYPE" ] && [ "$DTYPE" != "auto" ] && PUB_ARGS="$PUB_ARGS --dtype $DTYPE"
-    set +e
-    # shellcheck disable=SC2086  # PUB_ARGS is intentionally word-split into flags
-    uv run python publish_model.py $PUB_ARGS
-    PUB_RC=$?
-    set -e
-    if [ "$PUB_RC" -ne 0 ]; then
-      banner_bad "publish failed (exit $PUB_RC)"
-      exit "$PUB_RC"
-    fi
-    banner_ok "published to the Hugging Face Hub"
-    ok "   adapter : $PUBLISH_REPO-lora"
-    ok "   merged  : $PUBLISH_REPO"
-    echo
-    ;;
-  fix-teacher)
-    # The repaired copy lives beside the checkout so it survives across runs and
-    # is addressable by absolute path from anywhere.
-    FIXED_DIR="$WORKDIR/teacher-fixed"
-    log "Repairing the teacher checkpoint into $FIXED_DIR"
-    log "  (renames tensors to match the architecture; no retraining, no GPU)"
-    set +e
-    uv run python fix_teacher.py --config "$CONFIG_FILE" --out "$FIXED_DIR" --force
-    FIX_RC=$?
-    set -e
-    if [ "$FIX_RC" -ne 0 ]; then
-      banner_bad "could not repair the checkpoint (exit $FIX_RC)"
-      bad "   The weights may genuinely be incomplete rather than mislabelled."
-      bad "   If you still have the LoRA adapter from training, use it instead:"
-      bad "     ./distill.sh --teacher <base-model> --teacher-adapter <adapter> --check-teacher"
-      exit "$FIX_RC"
-    fi
-    banner_ok "teacher checkpoint repaired"
-    ok "   output : $FIXED_DIR"
-    echo
-    ok "   Verify it, then train against it:"
-    ok "     ./distill.sh --profile $CONFIG_PROFILE --teacher $FIXED_DIR --check-teacher"
-    ok "     ./distill.sh --profile $CONFIG_PROFILE --teacher $FIXED_DIR"
-    echo
-    ;;
-  check-teacher)
-    log "Verifying the teacher (loads the teacher only, not the student)"
-    CT_ARGS="--config $CONFIG_FILE"
-    [ -n "$DTYPE" ] && CT_ARGS="$CT_ARGS --dtype $DTYPE"
-    [ -n "$DEVICE" ] && CT_ARGS="$CT_ARGS --device $DEVICE"
-    set +e
-    # shellcheck disable=SC2086  # CT_ARGS is intentionally word-split into flags
-    uv run python check_teacher.py $CT_ARGS
-    CT_RC=$?
-    set -e
-    if [ "$CT_RC" -ne 0 ]; then
-      banner_bad "teacher is not fit to distil from (exit $CT_RC)"
-      bad "   Distilling from it would produce a broken student."
-      bad "   If the weights are present but mislabelled, repair them:"
-      bad "     ./distill.sh --profile $CONFIG_PROFILE --fix-teacher"
-      bad "   If the teacher was trained as a LoRA adapter, point at the base model"
-      bad "   and merge the adapter instead of using a merged export:"
-      bad "     ./distill.sh --teacher <base> --teacher-adapter <adapter> --check-teacher"
-      exit "$CT_RC"
-    fi
-    banner_ok "teacher is fit to distil from"
-    ok "   profile : $CONFIG_PROFILE"
-    ok "   All weights loaded, no NaN/Inf, output is coherent language."
-    echo
-    ok "   Next: ./distill.sh --profile $CONFIG_PROFILE --smoke"
-    echo
-    ;;
-  evaluate)
-    # The adapter this runner wrote, unless one was named explicitly. With no
-    # --output, evaluate.py resolves <output_dir>/final_adapter from the profile.
-    [ -z "$ADAPTER_DIR" ] && [ -n "$OUTPUT_DIR" ] && ADAPTER_DIR="${OUTPUT_DIR}/final_adapter"
-    EV_ARGS="--config $CONFIG_FILE"
-    [ -n "$ADAPTER_DIR" ] && EV_ARGS="$EV_ARGS --adapter $ADAPTER_DIR"
-    [ -n "$DTYPE" ] && EV_ARGS="$EV_ARGS --dtype $DTYPE"
-    [ -n "$DEVICE" ] && EV_ARGS="$EV_ARGS --device $DEVICE"
-    [ -n "$EVAL_SAMPLES" ] && EV_ARGS="$EV_ARGS --samples $EVAL_SAMPLES"
-    [ -n "$EVAL_JSON" ] && EV_ARGS="$EV_ARGS --json $EVAL_JSON"
-    [ -n "$EVAL_REPORT" ] && EV_ARGS="$EV_ARGS --report $EVAL_REPORT"
-    # The teacher and its adapter are exported as KD_* above, so evaluate.py picks
-    # them up through the same precedence chain training used - the comparison is
-    # only meaningful against the teacher that was actually distilled from.
-    [ -n "$GEN_SIMILARITY" ] && EV_ARGS="$EV_ARGS --gen-similarity $GEN_SIMILARITY"
-    [ -n "$SIMILARITY_MODEL" ] && EV_ARGS="$EV_ARGS --similarity-model $SIMILARITY_MODEL"
-    # Both the benchmark harness and the similarity scorers live in the same extra.
-    if [ -n "$EVAL_TASKS" ] || [ -n "$GEN_SIMILARITY" ]; then
-      log "Installing the evaluation extra (lm-eval, bert-score)"
-      uv sync --extra eval --quiet || die "uv sync --extra eval failed"
-    fi
-    if [ -n "$EVAL_TASKS" ]; then
-      EV_ARGS="$EV_ARGS --tasks $EVAL_TASKS"
-      [ -n "$EVAL_LIMIT" ] && EV_ARGS="$EV_ARGS --limit $EVAL_LIMIT"
-    fi
-    log "Evaluating the distilled adapter against the teacher"
-    log "  profile : $CONFIG_PROFILE"
-    log "  adapter : ${ADAPTER_DIR:-(from profile)}"
-    log "  tasks   : ${EVAL_TASKS:-(fidelity + perplexity only)}"
-    log "  (loads the teacher and the student together; this needs memory for both)"
-    set +e
-    # shellcheck disable=SC2086  # EV_ARGS is intentionally word-split into flags
-    uv run python evaluate.py $EV_ARGS
-    EV_RC=$?
-    set -e
-    if [ "$EV_RC" -eq 3 ]; then
-      banner_bad "the adapter did not improve on the base student"
-      bad "   The student is no closer to the teacher than before training."
-      bad "   Verify the teacher first, then train for longer:"
-      bad "     ./distill.sh --profile $CONFIG_PROFILE --check-teacher"
-      bad "     ./distill.sh --profile $CONFIG_PROFILE --steps 600"
-      exit 3
-    fi
-    if [ "$EV_RC" -ne 0 ]; then
-      banner_bad "evaluation did not complete (exit $EV_RC)"
-      exit "$EV_RC"
-    fi
-    banner_ok "evaluation complete"
-    ok "   Fidelity is agreement with the teacher; capability is held-out"
-    ok "   perplexity. Both are reported against the untrained base student,"
-    ok "   which is the only comparison that shows what distillation added."
-    echo
-    ;;
-  ui)
-    # Default to the adapter this runner would have written, so --ui right after a
-    # training run just works. The UI falls back to its own search if it is absent.
-    # With no explicit --output, let the UI discover the newest adapter itself.
-    [ -z "$ADAPTER_DIR" ] && [ -n "$OUTPUT_DIR" ] && ADAPTER_DIR="${OUTPUT_DIR}/final_adapter"
-    if [ "$UI_APP" = "control" ]; then
-      # The panel re-invokes this exact script to train and evaluate, so hand it the
-      # path captured before the cd: the working directory is $SRC_DIR by now, not
-      # wherever the user keeps distill.sh.
-      export KD_RUNNER="$SELF"
-      export KD_UI_HOST="$UI_HOST"
-      export KD_UI_PORT="$UI_PORT"
-      [ -n "$ADAPTER_DIR" ] && [ -d "$ADAPTER_DIR" ] && export KD_ADAPTER_PATH="$ADAPTER_DIR"
-      UI_ARGS="--host $UI_HOST --port $UI_PORT"
-      [ "$UI_SHARE" -eq 1 ] && UI_ARGS="$UI_ARGS --share"
-      log "Launching the control panel on http://$UI_HOST:$UI_PORT"
-      log "  Train, evaluate and compare from the browser; every screen shows the"
-      log "  command it runs. Ctrl+C to stop."
-      # shellcheck disable=SC2086  # UI_ARGS is intentionally word-split into flags
-      uv run python control_app.py $UI_ARGS
-    else
-      UI_ARGS="--host $UI_HOST --port $UI_PORT --config $CONFIG_FILE"
-      [ -n "$TEACHER_MODEL" ] && UI_ARGS="$UI_ARGS --teacher $TEACHER_MODEL"
-      [ -n "$STUDENT_MODEL" ] && UI_ARGS="$UI_ARGS --student $STUDENT_MODEL"
-      # Without this the reference column would show the base teacher rather than
-      # the fine-tuned one that was actually distilled from.
-      [ -n "$TEACHER_ADAPTER" ] && UI_ARGS="$UI_ARGS --teacher-adapter $TEACHER_ADAPTER"
-      [ -n "$ADAPTER_DIR" ] && [ -d "$ADAPTER_DIR" ] && UI_ARGS="$UI_ARGS --adapter $ADAPTER_DIR"
-      [ "$UI_SHARE" -eq 1 ] && UI_ARGS="$UI_ARGS --share"
-      log "Launching comparison UI on http://$UI_HOST:$UI_PORT"
-      log "  adapter : ${ADAPTER_DIR:-(auto-discovered)}"
-      log "  (loads three models - first start takes a minute; Ctrl+C to stop)"
-      # shellcheck disable=SC2086  # UI_ARGS is intentionally word-split into flags
-      uv run python app.py $UI_ARGS
-    fi
-    ;;
-  shell)
-    log "Entering a shell with the environment active. Exit to return."
-    exec uv run "${SHELL:-bash}"
-    ;;
-  smoke)
-    log "Smoke test - 2 steps end to end"
-    set +e
-    SMOKE_LOG="$(mktemp -t kd-smoke.XXXXXX)"
-    uv run python train_scaled.py --config "$CONFIG_FILE" --dry-run 2>&1 | tee "$SMOKE_LOG"
-    SMOKE_RC=${PIPESTATUS[0]}
-    set -e
-    if [ "$SMOKE_RC" -ne 0 ]; then
-      banner_bad "smoke test did not complete (exit $SMOKE_RC)"
-      rm -f "$SMOKE_LOG"
-      exit "$SMOKE_RC"
-    fi
-    S_PARAMS="$(grep -m1 'trainable params' "$SMOKE_LOG" || true)"
-    S_STEP="$(grep -o '[0-9.]\+s/step' "$SMOKE_LOG" | tail -1 || true)"
-    S_EVAL="$(grep -o 'held-out loss = [0-9.]\+' "$SMOKE_LOG" | tail -1 || true)"
-    S_TRAIN="$(grep -c '^ \[step' "$SMOKE_LOG" || true)"
-    rm -f "$SMOKE_LOG"
-    banner_ok "pipeline runs end to end"
-    ok "   profile        : $CONFIG_PROFILE"
-    [ -n "$S_PARAMS" ] && ok "   ${S_PARAMS# }"
-    ok "   training steps : ${S_TRAIN:-0} completed"
-    [ -n "$S_EVAL" ] && ok "   $S_EVAL"
-    if [ -n "$S_STEP" ]; then
-      ok "   speed          : $S_STEP"
-      SPS="${S_STEP%s/step}"
-      EST="$(awk -v s="$SPS" -v n="${MAX_STEPS:-300}" 'BEGIN{printf "%d", s*n/60}' 2>/dev/null || echo '')"
-      [ -n "$EST" ] && ok "   est. full run  : ~${EST} min for ${MAX_STEPS:-300} steps"
-    fi
-    echo
-    ok "   Next: ./distill.sh --profile $CONFIG_PROFILE"
-    echo
-    ;;
-  train)
-    log "Starting distillation"
-    log "  profile : $CONFIG_PROFILE"
-    log "  teacher : ${TEACHER_MODEL:-(from profile)}"
-    log "  student : ${STUDENT_MODEL:-(from profile)}"
-    log "  dataset : ${DATASET:-(from profile)}"
-    log "  steps   : ${MAX_STEPS:-(from profile)}"
-    set +e
-    uv run python train_scaled.py --config "$CONFIG_FILE"
-    TRAIN_RC=$?
-    set -e
-    if [ "$TRAIN_RC" -ne 0 ]; then
-      banner_bad "training did not complete (exit $TRAIN_RC)"
-      exit "$TRAIN_RC"
-    fi
-    # OUTPUT_DIR may be empty (inherited from the profile), so resolve it for the banner.
-    RESOLVED_OUT="$OUTPUT_DIR"
-    [ -z "$RESOLVED_OUT" ] && RESOLVED_OUT="$(field         "$(uv run python train_scaled.py --config "$CONFIG_FILE" --print-config 2>/dev/null)" output)"
-    ABS_OUT="$SRC_DIR/${RESOLVED_OUT#./}"
-    banner_ok "training complete"
-    ok "   adapter : $ABS_OUT/final_adapter"
-    echo
-    ok "   Next: ./distill.sh --profile $CONFIG_PROFILE --evaluate"
-    ok "         ./distill.sh --profile $CONFIG_PROFILE --ui"
-    echo
-    ;;
-esac
+# `python -m kd` rather than the `kd` console script: the module form needs
+# nothing on PATH and no generated executable, which is what makes it work
+# identically inside a container, in CI, and on a Windows machine whose security
+# software distrusts freshly written binaries.
+exec uv run python -m kd "${ARGS[@]}"

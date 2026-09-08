@@ -1,0 +1,210 @@
+#Requires -Version 5.1
+<#
+===========================================================================
+ Knowledge-distillation runner (Windows)
+
+ Built by GitHub Actions from __REPO__@__SHA_SHORT__ on __BUILT_AT__
+
+ QUICK START
+   .\distill.ps1 -Config configs\finance.yaml
+
+ This script is a bootstrapper and nothing else. It installs uv, fetches the
+ source pinned to the commit it was built from, and hands over to the Python
+ pipeline. Everything the pipeline does - stage order, gating, limits, the
+ config precedence chain - lives in the source, so this file and distill.sh
+ cannot drift from each other or from the code.
+
+ Anything it does not recognise is passed straight through:
+
+   .\distill.ps1 -Config configs\finance.yaml --set training.max_steps=500
+   .\distill.ps1 evaluate -Config configs\finance.yaml
+   .\distill.ps1 --help
+
+ With no leading subcommand it runs the full gated pipeline.
+===========================================================================
+#>
+[CmdletBinding()]
+param(
+    # -Config is offered because it is what a PowerShell user reaches for; it is
+    # translated to --config below. Every other pipeline option is passed through
+    # verbatim, so --set, --only, --from and the rest are spelled exactly as they
+    # are in the documentation and on the other platforms.
+    [string]$Config,
+
+    [switch]$RunnerHelp,
+    [switch]$RunnerVersion,
+
+    # Use the checkout this script sits in rather than fetching the pinned
+    # source. For working on the pipeline itself.
+    [switch]$Local,
+
+    [string]$WorkDir,
+
+    # Position=0 here is what makes every parameter above named-only. Without it
+    # PowerShell binds parameters positionally in declaration order, so a bare
+    # subcommand - `.\distill.ps1 doctor` - would be swallowed by -Config and the
+    # runner would silently start a pipeline run against a config named "doctor".
+    [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+    [string[]]$Rest
+)
+
+$ErrorActionPreference = 'Stop'
+
+$RepoUrl  = '__REPO_URL__'
+$RepoRef  = '__SHA__'
+$BuildRef = '__REPO__@__SHA_SHORT__'
+$BuiltAt  = '__BUILT_AT__'
+
+if (-not $WorkDir) {
+    $WorkDir = if ($env:KD_WORKDIR) { $env:KD_WORKDIR }
+               else { Join-Path $env:USERPROFILE '.cache\kd-runner' }
+}
+if (-not $Local -and $env:KD_LOCAL -eq '1') { $Local = $true }
+
+# Plain text only: escape sequences do not survive every console, redirect or CI
+# log, and a banner rendered as raw codes is worse than no colour.
+function Write-Step { param([string]$Message) Write-Host "==> $Message" }
+function Stop-WithError {
+    param([string]$Message)
+    Write-Host "xx  $Message" -ErrorAction SilentlyContinue
+    exit 1
+}
+
+function Show-RunnerHelp {
+    @'
+distill.ps1 - bootstrapper for the knowledge-distillation pipeline
+
+  .\distill.ps1 [RUNNER OPTIONS] [COMMAND] [PIPELINE OPTIONS]
+
+RUNNER OPTIONS (consumed here; everything else is passed through)
+  -RunnerHelp       This message. Use --help for the pipeline's own help.
+  -RunnerVersion    The commit this runner was built from.
+  -Local            Use the checkout this script sits in, instead of fetching
+                    the pinned source. For working on the pipeline itself.
+  -WorkDir DIR      Where to keep the checkout (default: %USERPROFILE%\.cache\
+                    kd-runner, or $env:KD_WORKDIR).
+  -Config PATH      Shorthand for --config PATH.
+
+COMMAND
+  Omitted, or any option starting with "-", runs the full gated pipeline.
+  Otherwise the first argument is the pipeline subcommand: train, evaluate,
+  check, check-teacher, fix-teacher, convert-adapter, publish, ui, doctor.
+
+EXAMPLES
+  .\distill.ps1 -Config configs\finance.yaml
+  .\distill.ps1 -Config configs\finance.yaml --set training.max_steps=500
+  .\distill.ps1 -Config configs\finance.yaml --only train
+  .\distill.ps1 check -Config configs\finance.yaml
+  .\distill.ps1 doctor
+  .\distill.ps1 --help
+
+  Run `.\distill.ps1 --help` for every pipeline option.
+'@ | Write-Host
+}
+
+if ($RunnerHelp)    { Show-RunnerHelp; exit 0 }
+if ($RunnerVersion) { Write-Host "distill.ps1 pinned to $BuildRef (built $BuiltAt)"; exit 0 }
+
+# ---------------------------------------------------------------------------
+#  1. Assemble the argument list
+# ---------------------------------------------------------------------------
+# Assigned as a statement, not as the value of an `if`. PowerShell unrolls
+# single-element pipeline output, so `$x = if (...) { @($Rest) }` with one
+# remaining argument hands back the bare string - and indexing a string yields a
+# Char, which has no StartsWith. Plain assignment keeps the array an array.
+$passthrough = @()
+if ($Rest) { $passthrough = @($Rest) }
+
+# With no arguments at all, or when the first one is an option, the intent is a
+# full pipeline run. Deciding on the leading "-" rather than on a list of known
+# subcommands means this file never has to be updated when one is added.
+#
+# The subcommand has to be pulled out first rather than prepended afterwards,
+# because -Config is spliced in ahead of the passthrough arguments and would
+# otherwise land in front of it.
+$command = 'pipeline'
+if ($passthrough.Count -gt 0 -and -not $passthrough[0].StartsWith('-')) {
+    $command = $passthrough[0]
+    if ($passthrough.Count -gt 1) {
+        $passthrough = @($passthrough[1..($passthrough.Count - 1)])
+    } else {
+        $passthrough = @()
+    }
+}
+
+$kdArgs = @($command)
+if ($Config) { $kdArgs += @('--config', $Config) }
+$kdArgs += $passthrough
+
+# Print the command that would run, and stop. The only decision this script makes
+# on its own is which pipeline command to invoke, and this is what lets that be
+# tested - in CI and by hand - without a clone, a torch download or a GPU. It is
+# also how CI proves this runner and distill.sh dispatch identically.
+if ($env:KD_DISPATCH_ONLY -eq '1') {
+    Write-Host ($kdArgs -join ' ')
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+#  2. Platform
+# ---------------------------------------------------------------------------
+Write-Step "Platform: Windows $([System.Environment]::OSVersion.Version) $env:PROCESSOR_ARCHITECTURE"
+
+# ---------------------------------------------------------------------------
+#  3. uv
+# ---------------------------------------------------------------------------
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    Write-Step 'uv not found - installing'
+    Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
+    # The installer puts uv here and updates PATH for future sessions, not this one.
+    $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
+}
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    Stop-WithError 'uv install failed. See https://docs.astral.sh/uv/'
+}
+
+# ---------------------------------------------------------------------------
+#  4. Source
+# ---------------------------------------------------------------------------
+if ($Local) {
+    $SrcDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    # A runner is normally downloaded on its own, so -Local is only meaningful
+    # from inside a checkout. Saying so beats a later import error.
+    if (-not (Test-Path (Join-Path $SrcDir 'pyproject.toml'))) {
+        Stop-WithError "-Local needs this script to sit in a checkout; no pyproject.toml in $SrcDir"
+    }
+    Write-Step "Using local checkout: $SrcDir"
+} else {
+    $SrcDir = Join-Path $WorkDir 'src'
+    if (-not (Test-Path $WorkDir)) { New-Item -ItemType Directory -Force $WorkDir | Out-Null }
+    if (Test-Path (Join-Path $SrcDir '.git')) {
+        Write-Step "Updating source in $SrcDir"
+        try { git -C $SrcDir fetch --depth 1 origin $RepoRef } catch { git -C $SrcDir fetch origin }
+        git -C $SrcDir checkout -q $RepoRef
+        if (-not $?) { Stop-WithError "could not check out $RepoRef" }
+    } else {
+        Write-Step "Cloning $RepoUrl @ $($RepoRef.Substring(0, [Math]::Min(12, $RepoRef.Length)))"
+        if (Test-Path $SrcDir) { Remove-Item -Recurse -Force $SrcDir }
+        git clone --quiet $RepoUrl $SrcDir
+        if (-not $?) { Stop-WithError "git clone failed" }
+        git -C $SrcDir checkout -q $RepoRef
+    }
+}
+Set-Location $SrcDir
+
+# ---------------------------------------------------------------------------
+#  5. Environment
+# ---------------------------------------------------------------------------
+Write-Step 'Syncing dependencies (the first run downloads torch - this takes a while)'
+uv sync --quiet
+if (-not $?) { Stop-WithError 'uv sync failed' }
+
+# ---------------------------------------------------------------------------
+#  6. Hand over
+# ---------------------------------------------------------------------------
+# `python -m kd` rather than the `kd` console script: the module form needs
+# nothing on PATH and no generated executable, which is what makes it work
+# identically here, inside a container and in CI - Windows security software
+# routinely refuses to execute a freshly written .exe.
+uv run python -m kd @kdArgs
+exit $LASTEXITCODE
