@@ -32,6 +32,14 @@ BUILT_AT="__BUILT_AT__"
 WORKDIR="${KD_WORKDIR:-$HOME/.cache/kd-runner}"
 USE_LOCAL="${KD_LOCAL:-0}"
 
+# Optional dependency groups to install alongside the core ones. Empty by default,
+# because the core install is already large and neither group is needed for a
+# plain training run. KD_EXTRAS holds a space-separated list of names.
+EXTRAS=""
+for _extra in ${KD_EXTRAS:-}; do
+  EXTRAS="$EXTRAS --extra $_extra"
+done
+
 # Plain text only: ANSI escapes do not survive every terminal, pipe, CI log or
 # `tee`, and a banner that renders as raw escape codes is worse than no colour.
 log()  { printf '==> %s\n' "$*"; }
@@ -48,6 +56,10 @@ RUNNER OPTIONS (consumed here; everything else is passed through)
   --runner-version    The commit this runner was built from.
   --local             Use the checkout this script sits in, instead of fetching
                       the pinned source. For working on the pipeline itself.
+  --extra NAME        Install an optional dependency group, repeatable:
+                        eval    benchmark tasks and generation similarity
+                        remote  S3 and RunPod
+                      Neither is needed for a plain training run.
   --workdir DIR       Where to keep the checkout (default: ~/.cache/kd-runner,
                       or $KD_WORKDIR).
 
@@ -77,6 +89,9 @@ while [ $# -gt 0 ]; do
     --runner-help)    runner_help; exit 0 ;;
     --runner-version) echo "distill.sh pinned to $BUILD_REF (built $BUILT_AT)"; exit 0 ;;
     --local)          USE_LOCAL=1; shift ;;
+    --extra)          [ $# -ge 2 ] || die "--extra needs a name: eval or remote"
+                      EXTRAS="$EXTRAS --extra $2"; shift 2 ;;
+    --extra=*)        EXTRAS="$EXTRAS --extra ${1#*=}"; shift ;;
     --workdir)        [ $# -ge 2 ] || die "--workdir needs a directory"
                       WORKDIR="$2"; shift 2 ;;
     --workdir=*)      WORKDIR="${1#*=}"; shift ;;
@@ -155,7 +170,9 @@ cd "$SRC_DIR"
 #  5. Environment
 # ---------------------------------------------------------------------------
 log "Syncing dependencies (the first run downloads torch - this takes a while)"
-uv sync --quiet || die "uv sync failed"
+[ -n "$EXTRAS" ] && log "  extras:$EXTRAS"
+# shellcheck disable=SC2086  # EXTRAS is intentionally word-split into flag pairs
+uv sync --quiet $EXTRAS || die "uv sync failed"
 
 # ---------------------------------------------------------------------------
 #  6. Hand over

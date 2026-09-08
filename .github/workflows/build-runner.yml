@@ -288,6 +288,9 @@ jobs:
           expect "train --config x.yaml"                       train --config x.yaml
           expect "evaluate --config x.yaml"                    evaluate --config x.yaml
           expect "doctor"                                      doctor
+          # --extra is the runner's own flag: consumed here, never passed on.
+          expect "evaluate --config x.yaml"  --extra eval evaluate --config x.yaml
+          expect "pipeline --config x.yaml"  --extra=remote --config x.yaml
 
       - name: Install PowerShell
         run: |
@@ -335,6 +338,8 @@ jobs:
           expect "pipeline --only train"                       --only train
           expect "train --config x.yaml"                       train -Config x.yaml
           expect "doctor"                                      doctor
+          expect "evaluate --config x.yaml"  -Extra eval evaluate -Config x.yaml
+          expect "doctor"                    -Extra eval,remote doctor
 
       - name: Upload runners
         uses: actions/upload-artifact@v4

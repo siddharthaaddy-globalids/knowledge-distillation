@@ -38,6 +38,11 @@ param(
     # source. For working on the pipeline itself.
     [switch]$Local,
 
+    # Optional dependency groups: eval (benchmark tasks, generation similarity)
+    # and remote (S3, RunPod). Neither is needed for a plain training run, which
+    # is why the core install does not carry them.
+    [string[]]$Extra,
+
     [string]$WorkDir,
 
     # Position=0 here is what makes every parameter above named-only. Without it
@@ -81,6 +86,10 @@ RUNNER OPTIONS (consumed here; everything else is passed through)
   -RunnerVersion    The commit this runner was built from.
   -Local            Use the checkout this script sits in, instead of fetching
                     the pinned source. For working on the pipeline itself.
+  -Extra NAME       Install an optional dependency group, repeatable:
+                      eval    benchmark tasks and generation similarity
+                      remote  S3 and RunPod
+                    Neither is needed for a plain training run.
   -WorkDir DIR      Where to keep the checkout (default: %USERPROFILE%\.cache\
                     kd-runner, or $env:KD_WORKDIR).
   -Config PATH      Shorthand for --config PATH.
@@ -196,7 +205,13 @@ Set-Location $SrcDir
 #  5. Environment
 # ---------------------------------------------------------------------------
 Write-Step 'Syncing dependencies (the first run downloads torch - this takes a while)'
-uv sync --quiet
+$syncArgs = @('sync', '--quiet')
+$extras = @()
+if ($Extra) { $extras = @($Extra) }
+elseif ($env:KD_EXTRAS) { $extras = $env:KD_EXTRAS -split '\s+' | Where-Object { $_ } }
+foreach ($name in $extras) { $syncArgs += @('--extra', $name) }
+if ($extras.Count -gt 0) { Write-Step "  extras: $($extras -join ', ')" }
+uv @syncArgs
 if (-not $?) { Stop-WithError 'uv sync failed' }
 
 # ---------------------------------------------------------------------------

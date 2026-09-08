@@ -58,11 +58,15 @@ if it is missing.
 ```bash
 git clone <this repo> && cd knowledge-distillation
 uv sync
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
 
-uv run kd doctor                                    # what can this machine do?
-uv run kd check --config configs/smoke.yaml         # resolve everything, run nothing
-uv run kd pipeline --config configs/smoke.yaml      # ~2 min end to end
+kd doctor                                    # what can this machine do?
+kd check --config configs/smoke.yaml         # resolve everything, run nothing
+kd pipeline --config configs/smoke.yaml      # ~2 min end to end
 ```
+
+`uv sync` installs a real `kd` executable into `.venv`. Without activating, prefix
+with `uv run`; `python -m kd` works too and needs nothing on `PATH`.
 
 `configs/smoke.yaml` trains SmolLM2-360M into SmolLM2-135M for two steps. It
 proves the machine works before you commit a real budget.
@@ -70,15 +74,16 @@ proves the machine works before you commit a real budget.
 Then pick a real profile, or write one:
 
 ```bash
-uv run kd pipeline --config configs/finance.yaml
+kd pipeline --config configs/finance.yaml
 ```
 
 ### Or download a runner
 
-CI publishes `distill.sh` and `distill.ps1` pinned to the commit they were built
-from. Each is a bootstrapper: it installs uv, fetches that exact source, and hands
-over to the pipeline. Grab one from the **Build distillation runner** workflow
-artifacts or a release.
+No clone, no uv, no Python setup. CI publishes `distill.sh` and `distill.ps1`
+pinned to the commit they were built from; each installs uv if it is missing,
+fetches that exact source, and hands over to the pipeline. Grab one from the
+**Build distillation runner** workflow artifacts or a release. This is the way to
+put it on someone else's machine.
 
 ```bash
 chmod +x distill.sh
@@ -256,6 +261,8 @@ selection and the terminate guarantee.
 
 ## Further reading
 
+- **[docs/RUNBOOK-SOURCE.md](docs/RUNBOOK-SOURCE.md)** — the full runbook, from a clone with `uv run`
+- **[docs/RUNBOOK-RUNNER.md](docs/RUNBOOK-RUNNER.md)** — the same runbook, using only the downloaded `distill.sh`
 - **[docs/CONFIG.md](docs/CONFIG.md)** — every configuration key
 - **[docs/RUNPOD.md](docs/RUNPOD.md)** — renting a GPU, and keeping it cheap
 - **[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md)** — what GKD is doing and why

@@ -239,6 +239,42 @@ def test_alpaca_domain_keys_accepted():
 # --------------------------------------------------------------------------- #
 # extends
 # --------------------------------------------------------------------------- #
+def test_extends_finds_the_shipped_base_from_anywhere():
+    """A config kept outside the checkout can still say `extends: _base.yaml`.
+
+    That matters for the runner, whose source lives in a cache directory: without
+    this, an external config would have to spell out an absolute path into
+    ~/.cache/kd-runner/src/configs, which changes with --workdir.
+    """
+    import shutil
+    outside = tempfile.mkdtemp(prefix="kd-test-")
+    try:
+        path = os.path.join(outside, "mine.yaml")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("extends: _base.yaml\ntraining:\n  max_steps: 42\n")
+        cfg = kdc.load_config(path, use_env=False)
+        assert cfg["training"]["max_steps"] == 42
+        assert cfg["gkd"]["beta"] == 0.5, "the base layer was not inherited"
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_outside_configs_display_as_absolute_paths():
+    """A path outside the project renders absolute, not as a wall of '../..'."""
+    import shutil
+    outside = tempfile.mkdtemp(prefix="kd-test-")
+    try:
+        path = os.path.join(outside, "mine.yaml")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("extends: _base.yaml\n")
+        chain = kdc.load_config(path, use_env=False)["_meta"]["chain"]
+        assert chain[0] == "configs/_base.yaml", chain
+        assert not chain[-1].startswith(".."), f"unreadable chain entry: {chain[-1]}"
+        assert chain[-1].endswith("mine.yaml"), chain
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
 def test_missing_parent_is_reported():
     with_temp_config(
         "extends: no-such-file.yaml\n",

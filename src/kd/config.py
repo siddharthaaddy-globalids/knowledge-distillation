@@ -217,12 +217,27 @@ def _load_chain(path, seen=None):
     if parent_ref is None:
         return raw, [path]
 
-    parent_path = parent_ref if os.path.isabs(parent_ref) else os.path.join(
-        os.path.dirname(path), parent_ref)
+    if os.path.isabs(parent_ref):
+        parent_path = parent_ref
+        searched = [parent_path]
+    else:
+        # Relative to the file that named it, first. Then the shipped configs
+        # directory - which is what lets a config kept outside the checkout say
+        # `extends: _base.yaml` and mean the one that came with this version,
+        # rather than having to spell out an absolute path into a cache directory.
+        beside = os.path.join(os.path.dirname(path), parent_ref)
+        shipped = os.path.join(CONFIG_DIR, parent_ref)
+        # For a config that already lives in configs/, both candidates are the
+        # same file; listing it twice in an error message reads like a bug.
+        searched = [beside] if os.path.abspath(beside) == os.path.abspath(shipped) \
+            else [beside, shipped]
+        parent_path = next((p for p in searched if os.path.isfile(p)), beside)
+
     if not os.path.isfile(parent_path):
+        where = "\n".join(f"    {p}" for p in searched)
         raise ConfigError(
             f"{os.path.basename(path)} extends '{parent_ref}', which does not exist.\n"
-            f"  looked for: {parent_path}")
+            f"  looked in:\n{where}")
 
     parent, chain = _load_chain(parent_path, seen + [path])
     return _deep_merge(parent, raw), chain + [path]
@@ -466,14 +481,26 @@ def load_config(path=None, set_overrides=None, flag_overrides=None, use_env=True
     config["_meta"] = {
         "profile": profile,
         "source": path or BASE_CONFIG,
-        # Forward slashes regardless of platform: this string is read by people and
-        # written into manifests that are compared across machines.
-        "chain": [os.path.relpath(p, os.path.dirname(CONFIG_DIR)).replace(os.sep, "/")
-                  for p in chain],
+        "chain": [_display_path(p) for p in chain],
         "changed": changed,
         "overridden": {p: by for p, by in provenance.items()},
     }
     return config
+
+
+def _display_path(path):
+    """A path a person can read: relative inside the project, absolute outside it.
+
+    Forward slashes on every platform, because this string is read by people and
+    written into manifests that get compared across machines. A config kept
+    outside the checkout - which is normal when the source lives in a runner's
+    cache directory - would otherwise render as a wall of '../../..'.
+    """
+    project_root = os.path.dirname(CONFIG_DIR)
+    relative = os.path.relpath(path, project_root)
+    if relative.startswith(".."):
+        return os.path.abspath(path).replace(os.sep, "/")
+    return relative.replace(os.sep, "/")
 
 
 def strip_meta(config):

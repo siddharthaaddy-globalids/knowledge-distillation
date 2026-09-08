@@ -111,6 +111,22 @@ def test_both_runners_default_to_the_pipeline():
             f"distill.{kind} has no default command"
 
 
+def test_optional_extras_reachable_from_both():
+    """Both runners can install the optional dependency groups.
+
+    The runner does its own `uv sync` inside the fetched checkout, so without a
+    way to ask for an extra there is no way to run `--tasks` or enable S3 from a
+    downloaded runner at all - and the error would tell you to run a uv command
+    you have no checkout for.
+    """
+    for kind in TEMPLATES:
+        text = template(kind)
+        assert "--extra" in text, f"distill.{kind} cannot install an optional extra"
+        assert "KD_EXTRAS" in text, f"distill.{kind} ignores KD_EXTRAS"
+        for group in ("eval", "remote"):
+            assert group in text, f"distill.{kind} does not mention the {group} extra"
+
+
 def test_dispatch_only_hook_exists_in_both():
     # CI proves the two runners dispatch identically by comparing their output
     # under this variable. If either loses it, that comparison silently stops
