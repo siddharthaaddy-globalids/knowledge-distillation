@@ -145,8 +145,10 @@ def choose_prefix(mlx_modules, real_modules):
     return best, best_hits, best_label
 
 
-def main():
-    args = parse_args()
+def main(args=None):
+    # The pipeline calls this with a prepared Namespace so an MLX adapter can be
+    # converted automatically, running exactly the code the standalone command does.
+    args = args or parse_args()
     src = local_dir(args.adapter)
 
     cfg_path = src / "adapter_config.json"

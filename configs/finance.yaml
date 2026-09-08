@@ -1,15 +1,31 @@
 # ---------------------------------------------------------------------------
-# Finance distillation - Qwen3.5-2B (finance-tuned) -> Qwen3.5-0.8B
+# Finance distillation - Qwen3.5-2B + a finance LoRA  ->  Qwen3.5-0.8B
 #
 #   kd pipeline --config configs/finance.yaml
-#   ./distill.sh --config configs/finance.yaml
 #
-# Verified before writing this file:
-#   * Both models exist and share vocab_size 248320, so the identical-vocabulary
-#     requirement GKD imposes is satisfied.
-#   * The teacher repo is a MERGED model (model.safetensors + config.json, no
-#     adapter_config.json) despite the "-lora" suffix in its name, so it loads
-#     directly with AutoModelForCausalLM - no PEFT wrapping needed.
+# The teacher is assembled from a BASE MODEL PLUS A LORA ADAPTER rather than
+# loaded from a merged checkpoint. That is the safer of the two forms, and it is
+# what this profile is built around:
+#
+#   * A merged export written by another framework keeps that framework's key
+#     layout. transformers does not raise when it cannot map those keys - it
+#     randomly initialises whatever it could not place and loads anyway. The
+#     result generates uniform noise, and GKD faithfully teaches the student to
+#     reproduce it. That is precisely what happened with the merged sibling of
+#     this adapter, and why `kd fix-teacher` exists.
+#   * Merging here, from the canonical base, sidesteps the whole problem: PEFT
+#     attaches to the live module tree, so there are no key names to mis-map.
+#
+# The merge happens once, at load time, before training starts. The teacher is
+# frozen afterwards, so this costs nothing per step.
+#
+# Verified against the Hub before writing this file:
+#   * Qwen/Qwen3.5-2B and Qwen/Qwen3.5-0.8B share a tokenizer, which is what
+#     standard GKD requires. A LoRA does not change the vocabulary, so adding one
+#     to the teacher preserves that.
+#   * The published adapter is in MLX/unsloth format - `adapters.safetensors`
+#     plus a `lora_parameters.keys` schema - which PEFT cannot read. Preflight
+#     converts it automatically, once, and caches the result; see models below.
 #   * gbharti/finance-alpaca is Alpaca-format (instruction/input/output), NOT
 #     conversational, hence `format: alpaca` below.
 # ---------------------------------------------------------------------------
@@ -19,32 +35,36 @@ project:
   name: qwen35-finance-distillation
 
 models:
-  # The MERGED export. The sibling repo with the -lora suffix holds an MLX-format
-  # adapter (lora_parameters/keys schema, adapters.safetensors), which PEFT
-  # cannot load - so teacher_adapter is not an option for it.
+  # The canonical base. Not the merged export, and not unsloth's mirror: this is
+  # the repo whose key layout transformers loads correctly.
+  teacher: Qwen/Qwen3.5-2B
+
+  # The finance LoRA, merged into the teacher at load time.
   #
-  # This checkpoint uses MLX/unsloth key naming rather than the layout
-  # transformers 5.x expects, so it must be repaired before use:
-  #     kd fix-teacher --config configs/finance.yaml
-  # then point models.teacher at the repaired copy.
-  teacher: siddhartha-addy-globalids-labs/qwen3.5-2b-finance-alpaca
+  # This adapter is published in MLX/unsloth format - adapters.safetensors plus a
+  # lora_parameters schema - which PEFT cannot read. It does not need converting
+  # by hand: preflight notices the format and converts it once into
+  # ~/.cache/kd/adapters/, then reuses that copy on every later run. The
+  # conversion renames and transposes, needs no GPU, and reads only the base
+  # model's config.json rather than its weights.
+  #
+  # A local path works here too, if you would rather convert it yourself:
+  #     kd convert-adapter --adapter <this repo> --base Qwen/Qwen3.5-2B --out ./my-lora
+  #     --set models.teacher_adapter=./my-lora
+  teacher_adapter: siddhartha-addy-globalids-labs/qwen3.5-2b-finance-alpaca-lora
+
   student: Qwen/Qwen3.5-0.8B
-  # If the teacher is a base model plus a LoRA adapter rather than a merged
-  # checkpoint, set `teacher` to the base and name the adapter here; it is merged
-  # in at load time. Prefer this over a merged checkpoint written by another
-  # framework: those keep that framework's key layout, which plain transformers
-  # may not map back onto the architecture.
-  #   teacher: Qwen/Qwen3.5-2B
-  #   teacher_adapter: <org>/<adapter-repo-or-local-path>
-  #
-  # The teacher is the finance-tuned model, but both share the Qwen3.5 tokenizer.
-  # Using the student's keeps the chat template aligned with what we generate from.
+
+  # Both share the Qwen3.5 tokenizer. Using the student's keeps the chat template
+  # aligned with what the student actually generates from.
   tokenizer: student
 
 hardware:
   # A 2B teacher plus a 0.8B student is ~11 GB of float32 weights before
-  # activations. On macOS 14+ or CUDA, halve that with:
+  # activations. On CUDA or macOS 14+, halve that with:
   #   --set hardware.dtype=bfloat16
+  # On CPU it is ignored - bf16 there is slow and often unstable - so a CPU box
+  # needs the full 11 GB and a great deal of patience. Prefer a GPU for this pair.
   dtype: auto
 
 dataset:
@@ -67,6 +87,8 @@ dataset:
       pool: 2400                # 91% pass rate, so this comfortably clears quota
 
 lora:
+  # This is the STUDENT's adapter shape, and it is independent of the teacher's.
+  #
   # Qwen3.5 is a HYBRID architecture, not a Llama-style decoder. Verified against
   # the loaded model, its 24 layers split as:
   #     18 x linear attention  -> linear_attn.{in_proj_qkv, in_proj_z, out_proj}

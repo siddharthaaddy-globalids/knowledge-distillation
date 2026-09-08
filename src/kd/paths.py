@@ -80,6 +80,76 @@ def mark_complete(local, detail=""):
         handle.write(detail + "\n")
 
 
+def adapter_cache(config, source):
+    """Where a converted copy of `source` is kept, so it is converted once.
+
+    Keyed by the source name with the separators flattened, which keeps a Hub id
+    like org/name readable in the path instead of hashing it into noise.
+    """
+    root = os.path.join(os.path.dirname(cache_dir(config)), "adapters")
+    safe = str(source).replace("\\", "/").strip("./").replace("/", "__")
+    return os.path.join(root, safe)
+
+
+def ensure_peft_adapter(config, log=None):
+    """Convert an MLX/unsloth teacher adapter to PEFT, once, and point at the copy.
+
+    A published LoRA is often in MLX format, which PEFT cannot read. The
+    conversion is deterministic, needs no GPU, and reads only the base model's
+    config.json - so making the caller do it by hand buys nothing except a step
+    to forget. It happens here, in preflight, and is announced.
+
+    The config is rewritten to the converted directory, so everything downstream
+    sees an ordinary PEFT adapter and knows nothing about MLX.
+    """
+    from .teacher import adapter_problem
+
+    source = (config.get("models") or {}).get("teacher_adapter")
+    if not source:
+        return None
+
+    problem = adapter_problem(source, config["models"].get("teacher"))
+    if not problem:
+        return None
+    if "MLX" not in problem:
+        # Missing, or not an adapter at all. Not something converting can fix.
+        raise RuntimeError(problem)
+
+    destination = adapter_cache(config, source)
+    if is_cached(destination):
+        if log:
+            log.info(f"      teacher lora: converted copy cached at {destination}")
+        config["models"]["teacher_adapter"] = destination
+        return {"source": source, "local": destination, "converted": False}
+
+    if log:
+        log.info(f"      teacher lora: {source} is MLX format; converting once")
+    import argparse
+
+    from . import adapters
+
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    code = adapters.main(argparse.Namespace(
+        adapter=source,
+        base=config["models"].get("teacher"),
+        out=destination,
+        dry_run=False,
+        force=True,
+    ))
+    if code not in (0, None):
+        raise RuntimeError(
+            f"could not convert {source} to PEFT format (exit {code}).\n"
+            f"Convert it by hand to see the detail:\n"
+            f"  kd convert-adapter --adapter {source} "
+            f"--base {config['models'].get('teacher')} --out ./peft-adapter")
+
+    mark_complete(destination, f"converted from {source}")
+    config["models"]["teacher_adapter"] = destination
+    if log:
+        log.info(f"      teacher lora: converted to {destination}")
+    return {"source": source, "local": destination, "converted": True}
+
+
 def remote_values(config):
     """[(dotted path, uri)] for every resolvable key currently holding an s3 URI."""
     found = []

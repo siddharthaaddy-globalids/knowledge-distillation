@@ -275,6 +275,65 @@ def test_a_failed_rescue_does_not_mask_the_limit(workspace):
 
 
 # --------------------------------------------------------------------------- #
+# Teacher adapters - caught in preflight, not after a multi-gigabyte download
+# --------------------------------------------------------------------------- #
+def test_missing_teacher_adapter_is_caught_early(workspace):
+    from kd.teacher import adapter_problem
+
+    problem = adapter_problem(os.path.join(workspace, "not-there"), "Qwen/Qwen3.5-2B")
+    assert problem and "does not exist" in problem, problem
+    assert "kd convert-adapter" in problem, "no route out of the failure was offered"
+
+
+def test_mlx_adapter_is_recognised_and_the_fix_given(workspace):
+    """An MLX adapter is the likeliest wrong thing to point this at.
+
+    PEFT only rejects it once the base model is loaded - gigabytes later - so it
+    is worth recognising from a file listing.
+    """
+    from kd.teacher import adapter_problem
+
+    mlx = os.path.join(workspace, "mlx-adapter")
+    os.makedirs(mlx)
+    for name in ("adapters.safetensors", "adapter_config.json"):
+        with open(os.path.join(mlx, name), "w") as handle:
+            handle.write("{}")
+
+    problem = adapter_problem(mlx, "Qwen/Qwen3.5-2B")
+    assert problem and "MLX" in problem, problem
+    assert "kd convert-adapter" in problem and "--base Qwen/Qwen3.5-2B" in problem, problem
+
+
+def test_peft_adapter_is_accepted(workspace):
+    from kd.teacher import adapter_problem
+
+    peft = os.path.join(workspace, "peft-adapter")
+    os.makedirs(peft)
+    for name in ("adapter_model.safetensors", "adapter_config.json"):
+        with open(os.path.join(peft, name), "w") as handle:
+            handle.write("{}")
+    assert adapter_problem(peft, "Qwen/Qwen3.5-2B") is None
+
+
+def test_hub_ids_are_not_mistaken_for_paths(workspace):
+    """org/name is a Hub id; '/' alone cannot decide, since it is altsep on Windows."""
+    from kd.teacher import _looks_like_hub_id
+
+    for value in ("org/name", "Qwen/Qwen3.5-2B"):
+        assert _looks_like_hub_id(value), f"{value} should read as a Hub id"
+    for value in ("./peft-adapter", "/abs/path", "C:/x/y", "~/a", "a/b/c",
+                  "..\rel", "plain-name"):
+        assert not _looks_like_hub_id(value), f"{value} should read as a path"
+
+
+def test_no_adapter_configured_is_fine(workspace):
+    from kd.teacher import adapter_problem
+
+    assert adapter_problem(None) is None
+    assert adapter_problem("") is None
+
+
+# --------------------------------------------------------------------------- #
 # Picking up where a previous run left off
 #
 # --from and --only open a new run directory, so the stage they start with has to

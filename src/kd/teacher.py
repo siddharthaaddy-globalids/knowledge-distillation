@@ -29,6 +29,7 @@ When the weights are present but mislabelled, kd.teacher_fix repairs them.
 
 import argparse
 import math
+import os
 import sys
 
 import torch
@@ -81,6 +82,74 @@ def load_teacher(teacher_id, adapter=None, dtype=None, device="cpu", verbose=Tru
         if verbose:
             print(" -> adapter merged into the teacher")
     return model.to(device), info
+
+
+def adapter_problem(adapter, teacher_id=None):
+    """Why this teacher adapter cannot be loaded, or None if it looks fine.
+
+    Called from preflight, deliberately. PEFT only complains once the base model
+    is in memory, which for a 2B teacher means a multi-gigabyte download first -
+    so a missing directory or an MLX-format adapter would otherwise cost minutes
+    and bandwidth before saying anything. Both are checkable in about a second.
+
+    Only reports what it is sure about. Anything it cannot inspect is left for the
+    loader rather than guessed at.
+    """
+    if not adapter:
+        return None
+
+    adapter = str(adapter)
+    base = teacher_id or "<base-model>"
+
+    if os.path.isdir(adapter):
+        files = set(os.listdir(adapter))
+    elif _looks_like_hub_id(adapter):
+        try:
+            from huggingface_hub import list_repo_files
+            files = set(list_repo_files(adapter))
+        except Exception:
+            # Private, offline, or an unexpected API shape. Not knowing is not a
+            # reason to block the run - the loader will report it properly.
+            return None
+    else:
+        return (f"models.teacher_adapter points at {adapter}, which does not exist.\n"
+                f"If you have an MLX or unsloth adapter, convert it once first:\n"
+                f"  kd convert-adapter --adapter <source> --base {base} "
+                f"--out {adapter}")
+
+    if not files or any(name in files for name in
+                        ("adapter_model.safetensors", "adapter_model.bin")):
+        return None
+
+    if "adapters.safetensors" in files:
+        return (f"{adapter} is an MLX/unsloth adapter, not a PEFT one: it holds "
+                f"adapters.safetensors and a lora_parameters schema, which PEFT "
+                f"cannot read.\n"
+                f"Convert it once - a rename and transpose, no retraining and no "
+                f"GPU:\n"
+                f"  kd convert-adapter --adapter {adapter} --base {base} "
+                f"--out ./peft-adapter\n"
+                f"then point at the result:\n"
+                f"  --set models.teacher_adapter=./peft-adapter")
+
+    if "adapter_config.json" not in files:
+        return (f"{adapter} does not look like a LoRA adapter: it has no "
+                f"adapter_config.json.")
+    return None
+
+
+def _looks_like_hub_id(value):
+    """True for 'org/name', false for anything that is plainly a filesystem path.
+
+    The two are told apart by shape, not by a slash: a Hub id is exactly one
+    slash between two plain names. Testing for a separator alone would misread
+    every Hub id on Windows, where '/' is os.path.altsep.
+    """
+    import re
+
+    if value.startswith((".", "/", "~", "\\")) or ":" in value or "\\" in value:
+        return False
+    return re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", value) is not None
 
 
 def significant_missing(loading_info):

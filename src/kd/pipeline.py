@@ -127,6 +127,21 @@ def stage_preflight(ctx):
         ctx.run.event("preflight", "inputs_resolved", **{
             key: value["uri"] for key, value in fetched.items()})
 
+    # A teacher adapter that PEFT cannot load only fails once the base model is in
+    # memory - for a 2B teacher, several gigabytes of download away. It is checked
+    # here instead, from a file listing, and an MLX one is converted on the spot:
+    # the conversion is deterministic and needs neither a GPU nor the base
+    # model's weights, so requiring a separate manual step buys nothing.
+    adapter = config["models"].get("teacher_adapter")
+    if adapter:
+        try:
+            converted = paths.ensure_peft_adapter(config, ctx.log)
+        except Exception as exc:
+            raise StageFailed(str(exc)) from exc
+        if converted:
+            ctx.run.event("preflight", "adapter_converted", **converted)
+        ctx.log.info(f"  teacher lora: {config['models']['teacher_adapter']}")
+
     return {"device": ctx.hardware["device"], "fetched": fetched}
 
 
