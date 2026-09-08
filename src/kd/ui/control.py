@@ -126,36 +126,42 @@ def backend_note():
 # script - a KD_* variable for training (kd.config reads them)
 # and a real flag for evaluation (kd.evaluate has its own argparse).
 # --------------------------------------------------------------------------- #
+# One column per concept, because there is only one command now. distill.sh
+# passes its arguments straight through to `python -m kd`, so both backends run
+# the identical argument list and the only difference is what sits in front of it.
+# The previous version carried a second column of KD_* variable names for the
+# direct backend; keeping two spellings of every option in step was work that
+# bought nothing.
 TRAIN_OPTS = [
-    # ui key,            runner flag,          KD_* variable
-    ("teacher",          "--teacher",          "KD_TEACHER_MODEL"),
-    ("student",          "--student",          "KD_STUDENT_MODEL"),
-    ("teacher_adapter",  "--teacher-adapter",  "KD_TEACHER_ADAPTER"),
-    ("dataset",          "--dataset",          "KD_DATASET"),
-    ("device",           "--device",           "KD_DEVICE"),
-    ("dtype",            "--dtype",            "KD_DTYPE"),
-    ("steps",            "--steps",            "KD_MAX_STEPS"),
-    ("batch_size",       "--batch-size",       "KD_BATCH_SIZE"),
-    ("grad_accum",       "--grad-accum",       "KD_GRAD_ACCUM"),
-    ("lr",               "--lr",               "KD_LEARNING_RATE"),
-    ("lora_r",           "--lora-r",           "KD_LORA_R"),
-    ("lora_alpha",       "--lora-alpha",       "KD_LORA_ALPHA"),
-    ("lmbda",            "--lmbda",            "KD_LMBDA"),
-    ("output",           "--output",           "KD_OUTPUT_DIR"),
+    # ui key,            config path set with --set
+    ("teacher",          "models.teacher"),
+    ("student",          "models.student"),
+    ("teacher_adapter",  "models.teacher_adapter"),
+    ("dataset",          "dataset.source"),
+    ("device",           "hardware.device"),
+    ("dtype",            "hardware.dtype"),
+    ("steps",            "training.max_steps"),
+    ("batch_size",       "training.batch_size"),
+    ("grad_accum",       "training.gradient_accumulation_steps"),
+    ("lr",               "training.learning_rate"),
+    ("lora_r",           "lora.r"),
+    ("lora_alpha",       "lora.alpha"),
+    ("lmbda",            "gkd.lmbda"),
+    ("output",           "project.output_dir"),
 ]
 
 EVAL_OPTS = [
-    # ui key,            runner flag,          evaluate.py flag
-    ("adapter",          "--adapter",          "--adapter"),
-    ("device",           "--device",           "--device"),
-    ("dtype",            "--dtype",            "--dtype"),
-    ("samples",          "--eval-samples",     "--samples"),
-    ("gen_similarity",   "--gen-similarity",   "--gen-similarity"),
-    ("similarity_model", "--similarity-model", "--similarity-model"),
-    ("tasks",            "--tasks",            "--tasks"),
-    ("limit",            "--eval-limit",       "--limit"),
-    ("report",           "--report",           "--report"),
-    ("eval_json",        "--eval-json",        "--json"),
+    # ui key,            flag on `kd evaluate`
+    ("adapter",          "--adapter"),
+    ("device",           "--device"),
+    ("dtype",            "--dtype"),
+    ("samples",          "--samples"),
+    ("gen_similarity",   "--gen-similarity"),
+    ("similarity_model", "--similarity-model"),
+    ("tasks",            "--tasks"),
+    ("limit",            "--limit"),
+    ("report",           "--report"),
+    ("eval_json",        "--json"),
 ]
 
 # Passed to every child. distill.sh refuses to open a UI when this is set, so a control
@@ -170,50 +176,42 @@ def _clean(value):
     return str(value).strip()
 
 
+def _wrap(command_args):
+    """(argv, display) for one pipeline command, through whichever backend is live.
+
+    The arguments are identical either way - distill.sh forwards them untouched -
+    so this is the only place the two backends differ, and the command shown on
+    screen is exactly what runs.
+    """
+    if USE_RUNNER:
+        argv = [BASH, RUNNER.replace("\\", "/")] + command_args
+        display = "./distill.sh " + " ".join(shlex.quote(a) for a in command_args)
+    else:
+        argv = [sys.executable, "-m", "kd"] + command_args
+        display = "python -m kd " + " ".join(shlex.quote(a) for a in command_args)
+    return argv, display
+
+
 def build_train_command(profile, fields):
     """(argv, env, display) for a training run."""
-    env = dict(GUARD_ENV)
-    if USE_RUNNER:
-        argv = [BASH, RUNNER.replace("\\", "/")]
-        if profile != "auto":
-            argv += ["--profile", profile]
-        for key, flag, _ in TRAIN_OPTS:
-            value = _clean(fields.get(key))
-            if value:
-                argv += [flag, value]
-        return argv, env, "./distill.sh " + " ".join(shlex.quote(a) for a in argv[2:])
-
-    argv = [sys.executable, "-m", "kd", "train", "--config", config_file(profile)]
-    for key, _, env_var in TRAIN_OPTS:
+    args = ["train", "--config", config_file(profile)]
+    for key, path in TRAIN_OPTS:
         value = _clean(fields.get(key))
         if value:
-            env[env_var] = value
-    prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(env.items())
-                      if k != "KD_UI_ACTIVE")
-    display = "python " + " ".join(shlex.quote(a) for a in argv[1:])
-    return argv, env, (prefix + " " + display).strip()
+            args += ["--set", f"{path}={value}"]
+    argv, display = _wrap(args)
+    return argv, dict(GUARD_ENV), display
 
 
 def build_eval_command(profile, fields):
     """(argv, env, display) for an evaluation run."""
-    env = dict(GUARD_ENV)
-    if USE_RUNNER:
-        argv = [BASH, RUNNER.replace("\\", "/"), "--evaluate"]
-        if profile != "auto":
-            argv += ["--profile", profile]
-        for key, flag, _ in EVAL_OPTS:
-            value = _clean(fields.get(key))
-            if value:
-                argv += [flag, value]
-        return argv, env, "./distill.sh " + " ".join(shlex.quote(a) for a in argv[2:])
-
-    argv = [sys.executable, "-m", "kd", "evaluate", "--config", config_file(profile)]
-    for key, _, flag in EVAL_OPTS:
+    args = ["evaluate", "--config", config_file(profile)]
+    for key, flag in EVAL_OPTS:
         value = _clean(fields.get(key))
         if value:
-            argv += [flag, value]
-    display = "python " + " ".join(shlex.quote(a) for a in argv[1:])
-    return argv, env, display
+            args += [flag, value]
+    argv, display = _wrap(args)
+    return argv, dict(GUARD_ENV), display
 
 
 # --------------------------------------------------------------------------- #

@@ -105,6 +105,12 @@ jobs:
           print("boto3 client honours endpoint_url and falls back to AWS")
           PY
 
+      - name: Documentation still describes the code
+        # Every command, config key, module and link the docs name must be real.
+        # A README that tells someone to run something that no longer exists is
+        # worse than no README.
+        run: uv run python tests/test_docs.py
+
       - name: Every profile resolves
         run: |
           for cfg in configs/*.yaml; do

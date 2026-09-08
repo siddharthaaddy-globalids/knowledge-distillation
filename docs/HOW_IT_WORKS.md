@@ -6,7 +6,7 @@ actually produces. **Part 2** is the technical version: the exact loss, the exac
 training step, the data pipeline, the memory and time costs, and the failure modes
 this codebase defends against.
 
-For *running* it, see [README.md](README.md).
+For *running* it, see [README.md](../README.md).
 
 ---
 
@@ -133,12 +133,12 @@ The codebase is largely shaped by defences against these:
    checkpoint's tensor names don't match the architecture it built — it randomly
    initialises what it couldn't map and loads anyway. A partly-random teacher emits
    near-uniform token salad, and the student faithfully learns to reproduce it.
-   The run "succeeds". → `check_teacher.py`, `--check-teacher`.
+   The run "succeeds". → `kd check-teacher`.
 2. **The tensor names are wrong but the weights are fine.** Merged exports from
-   MLX/unsloth keep that framework's key layout. → `fix_teacher.py`.
+   MLX/unsloth keep that framework's key layout. → `kd fix-teacher`.
 3. **The adapter is in the wrong format.** unsloth on Apple Silicon runs on MLX and
    writes MLX-format adapters that PEFT cannot load. →
-   `convert_mlx_adapter.py`.
+   `kd convert-adapter`.
 4. **Teacher and student don't share a vocabulary.** Token-level divergence between
    two different vocabularies is meaningless. → documented per profile, and
    asserted at evaluation time by `evaluate.py`; training itself still does not
@@ -155,10 +155,12 @@ The codebase is largely shaped by defences against these:
 ## Component map
 
 ```
-distill.sh                    thin runner: env bootstrap, pinned checkout, KD_* export
-  └── train_scaled.py         the pipeline
-        ├── kd_config.py      DEFAULTS -> YAML -> KD_* env -> CLI  +  device/dtype resolution
-        ├── datasets          multi-domain build, length filter, dedup, train/val split
+distill.sh / distill.ps1      bootstrapper: install uv, fetch pinned source, hand over
+  └── kd.pipeline             the gated stages, limits, run bundle
+        ├── kd.config         _base.yaml -> profile -> KD_* -> --set -> flag
+        │                       + validation + device/dtype resolution
+        ├── kd.runlog         run directory, run.log, events.jsonl, manifest
+        ├── kd.data           multi-domain build, length filter, dedup, train/val split
         ├── transformers      AutoModelForCausalLM x2 (teacher frozen, student trainable)
         ├── peft              LoRA injection into the student
         └── trl.experimental.gkd
@@ -252,7 +254,7 @@ runtime of a small run.
 
 ## The data pipeline
 
-`build_datasets()` in `train_scaled.py` assembles a **balanced multi-domain**
+`build_datasets()` in `kd/data.py` assembles a **balanced multi-domain**
 calibration set rather than reading one dataset end to end.
 
 **Per-domain collection** (`collect_domain`): each entry in `dataset.domains`
@@ -314,7 +316,7 @@ module names with the language model — a bare suffix list would inject adapter
 into those too. (In practice `AutoModelForCausalLM` drops those components, but the
 option is there, and `exclude_modules` is also plumbed through.)
 
-## Teacher pre-flight (`verify_teacher` / `check_teacher.py`)
+## Teacher pre-flight (`kd/teacher.py`)
 
 Three independent checks, all of which must pass:
 
@@ -340,11 +342,12 @@ Three independent checks, all of which must pass:
    randomly-initialised head produces and what shows up downstream as multilingual
    token salad.
 
-`check_teacher.py` exits `2` on failure so shell scripts can gate on it.
-`train_scaled.py` runs the same logic inline and raises `SystemExit(2)` unless
+`kd check-teacher` exits `2` on failure so a shell script can gate on it, and the
+pipeline's teacher-check stage does the same. Training runs the same logic inline
+through `verify_teacher()` and raises `SystemExit(2)` unless
 `--allow-bad-teacher` is passed.
 
-## Checkpoint repair (`fix_teacher.py`)
+## Checkpoint repair (`kd/teacher_fix.py`)
 
 For the case where the weights are correct but the *names* aren't.
 
@@ -367,7 +370,7 @@ For the case where the weights are correct but the *names* aren't.
 
 No GPU, no retraining. `--dry-run` prints the mapping and writes nothing.
 
-## MLX → PEFT adapter conversion (`convert_mlx_adapter.py`)
+## MLX → PEFT adapter conversion (`kd/adapters.py`)
 
 unsloth on Apple Silicon runs on MLX, so the adapters it writes are MLX-LM
 artifacts throughout:
@@ -387,7 +390,7 @@ the LoRA branch while PEFT applies `α/r`, so the converter writes
 `lora_alpha = round(scale × r)`. The adapter computes the same function afterwards
 — nothing is retrained or approximated.
 
-## Hardware resolution (`kd_config.py`)
+## Hardware resolution (`kd/config.py`)
 
 One function, `resolve_device()`, is the only platform-aware code in the project.
 
@@ -452,11 +455,11 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 base = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct")
-model = PeftModel.from_pretrained(base, "./distilled_smollm_scaled/final_adapter")
-tok = AutoTokenizer.from_pretrained("./distilled_smollm_scaled/final_adapter")
+model = PeftModel.from_pretrained(base, "./runs/<run-id>/final_adapter")
+tok = AutoTokenizer.from_pretrained("./runs/<run-id>/final_adapter")
 ```
 
-`publish_model.py` produces both distribution forms: the adapter alone (small,
+`kd publish` produces both distribution forms: the adapter alone (small,
 needs the base at load time) and a merged checkpoint (`merge_and_unload()`,
 standalone). The merge is done by `transformers` itself, so the merged file carries
 that architecture's canonical tensor names — the whole point, given that a merged
@@ -467,7 +470,7 @@ refused if it doesn't generate language.
 
 ## Measuring transfer
 
-`evaluate.py` (`./distill.sh --evaluate`) reports the two standard families of
+`kd evaluate` reports the two standard families of
 distillation metric separately, because they are not the same question:
 
 **Fidelity — did the student absorb the teacher?**
@@ -526,9 +529,10 @@ dependency* side of reproducibility, which is the part that usually causes troub
 
 1. `configs/qwen-poc.yaml` — every number is commented with the measurement behind
    it. The fastest way to understand the knobs.
-2. `kd_config.py` — precedence chain and hardware resolution; ~320 readable lines.
-3. `train_scaled.py::run()` — the seven phases end to end.
-4. `train_scaled.py::build_datasets()` and `collect_domain()` — the data pipeline.
+2. `kd/config.py` — precedence chain, validation and hardware resolution.
+3. `kd/pipeline.py` — the gated stages, and what each is guarding against.
+4. `kd/train.py::train()` — the seven phases end to end.
+5. `kd/data.py::build_datasets()` and `collect_domain()` — the data pipeline.
 5. `.venv/.../trl/experimental/gkd/gkd_trainer.py` — `training_step` and
    `generalized_jsd_loss` are about 80 lines together and are the actual algorithm.
 6. `evaluate.py` — the metrics, and the shortest description of what "it worked"
