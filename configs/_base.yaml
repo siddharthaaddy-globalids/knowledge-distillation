@@ -194,6 +194,13 @@ s3:
   endpoint_url: null        # set for MinIO or RunPod S3-compatible volumes
   region: null
   cache_dir: ~/.cache/kd/s3
+  # Which parts of the run bundle to ship. manifest.json and config.resolved.yaml
+  # always go, whatever is listed here, because without them the uploaded bundle
+  # cannot say what produced it.
+  #   adapter  logs  report  metrics  checkpoints
+  # checkpoints is off by default: it is optimizer state, hundreds of megabytes,
+  # that only a resumed run reads. A run stopped by a limit adds it automatically,
+  # since the checkpoint is then the only artifact that exists.
   upload: [adapter, logs, report, metrics]
 
 # ---------------------------------------------------------------------------

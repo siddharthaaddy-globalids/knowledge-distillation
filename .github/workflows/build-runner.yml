@@ -78,6 +78,28 @@ jobs:
       - name: Runner templates and the stage contract
         run: uv run python tests/test_runners.py
 
+      - name: Object storage
+        # Runs without boto3 installed, on purpose: the S3 client is replaced with
+        # an in-memory fake, which is also proof that the core pipeline does not
+        # import boto3 at module level.
+        run: uv run python tests/test_s3.py
+
+      - name: The remote extra resolves and its client constructs
+        run: |
+          uv sync --extra remote
+          uv run python - <<'PY'
+          from kd.config import load_config
+          from kd.remote import s3
+          config = load_config("configs/smoke.yaml", use_env=False)
+          config["s3"].update(enabled=True, bucket="b",
+                              endpoint_url="http://localhost:9000")
+          client = s3.client(config)
+          assert client.meta.endpoint_url == "http://localhost:9000"
+          config["s3"]["endpoint_url"] = None
+          assert "amazonaws.com" in s3.client(config).meta.endpoint_url
+          print("boto3 client honours endpoint_url and falls back to AWS")
+          PY
+
       - name: Every profile resolves
         run: |
           for cfg in configs/*.yaml; do

@@ -219,6 +219,61 @@ def test_projection_allows_a_run_that_fits(workspace):
     assert budget.refuse_if_impossible(budget.project(4.3)) is None
 
 
+def test_hard_stop_still_syncs_what_exists(workspace):
+    """A stopped run on a rented machine has to ship its checkpoint before dying.
+
+    Nothing is uploaded after a hard stop by the normal stage order, because a hard
+    stop skips every later stage. That is right for spending and wrong for the
+    artifact, so the rescue path exists - and it adds checkpoints, since a stopped
+    run never wrote an adapter.
+    """
+    from kd.remote import s3 as s3mod
+
+    sent = {}
+    original = s3mod.upload_bundle
+    s3mod.upload_bundle = lambda config, run_dir, run_id, groups=None, log=None: (
+        sent.update({"groups": list(groups or [])}) or
+        {"uri": "s3://b/k", "files": 1, "bytes": 1, "groups": list(groups or [])})
+    try:
+        record = []
+        fake_stages(record, raising={
+            "train": LimitExceeded("limits.max_cost_usd", 2.5, 2.0, " USD")})
+        config = make_config(workspace)
+        config["s3"]["enabled"] = True
+        code, _ = run_with(workspace, record, config=config)
+        assert code == 4, code
+        assert sent, "a hard stop uploaded nothing at all"
+        assert "checkpoints" in sent["groups"], \
+            f"the checkpoint was not rescued: {sent['groups']}"
+    finally:
+        s3mod.upload_bundle = original
+
+
+def test_a_failed_rescue_does_not_mask_the_limit(workspace):
+    """If the bucket is unreachable, the run still reports why it stopped."""
+    from kd.remote import s3 as s3mod
+
+    original = s3mod.upload_bundle
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("bucket unreachable")
+
+    s3mod.upload_bundle = explode
+    try:
+        record = []
+        fake_stages(record, raising={
+            "train": LimitExceeded("limits.max_runtime_minutes", 200.0, 180.0, " min")})
+        config = make_config(workspace)
+        config["s3"]["enabled"] = True
+        code, run_dir = run_with(workspace, record, config=config)
+        assert code == 4, f"the limit exit code should survive a failed upload, got {code}"
+        with open(os.path.join(run_dir, runlog.MANIFEST), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        assert "max_runtime_minutes" in manifest["stopped_reason"], manifest
+    finally:
+        s3mod.upload_bundle = original
+
+
 # --------------------------------------------------------------------------- #
 # Picking up where a previous run left off
 #

@@ -107,22 +107,21 @@ def stage_preflight(ctx):
     ctx.log.info(f"  device    : {ctx.hardware['device']} ({ctx.hardware['dtype_name']})")
     ctx.log.info(f"  limits    : {ctx.budget.summary()}")
 
-    # Remote inputs are resolved to local paths here, before anything loads them.
-    # Until the S3 layer exists, an s3:// URI is a clear error rather than a
-    # confusing failure inside transformers.
-    remote = [f"{key}={value}" for key, value in (
-        ("models.teacher", config["models"].get("teacher")),
-        ("models.student", config["models"].get("student")),
-        ("models.teacher_adapter", config["models"].get("teacher_adapter")),
-        ("dataset.source", config["dataset"].get("source")),
-    ) if isinstance(value, str) and value.startswith("s3://")]
-    if remote:
-        raise StageFailed(
-            "s3:// inputs are configured but object storage is not wired up yet:\n  "
-            + "\n  ".join(remote)
-            + "\nUse a Hugging Face id or a local path for now.")
+    # Remote inputs are fetched here, before anything tries to load them. Doing it
+    # in the first stage is what turns a bad bucket or a missing credential into a
+    # two-second failure instead of one that surfaces after the dataset build.
+    from . import paths
 
-    return {"device": ctx.hardware["device"]}
+    try:
+        fetched = paths.resolve_inputs(config, ctx.log)
+    except Exception as exc:
+        raise StageFailed(str(exc)) from exc
+
+    if fetched:
+        ctx.run.event("preflight", "inputs_resolved", **{
+            key: value["uri"] for key, value in fetched.items()})
+
+    return {"device": ctx.hardware["device"], "fetched": fetched}
 
 
 def stage_teacher_check(ctx):
@@ -295,12 +294,19 @@ def stage_publish(ctx):
     return {"published": settings.get("repo")}
 
 
-def stage_upload(ctx):
-    """Sync the finished run bundle to object storage."""
-    raise StageFailed(
-        "s3.enabled is true but object storage is not wired up yet "
-        "(that lands with the S3 phase). The run bundle is complete on disk at "
-        f"{ctx.run.dir}")
+def stage_upload(ctx, groups=None):
+    """Sync the finished run bundle to object storage.
+
+    The manifest is rewritten first so the uploaded copy reflects the run that is
+    ending, rather than the state it was in several stages ago.
+    """
+    from .remote import s3
+
+    ctx.run.write_manifest()
+    summary = s3.upload_bundle(ctx.config, ctx.run.dir, ctx.run.run_id,
+                               groups=groups, log=ctx.log)
+    ctx.run.event("upload", "bundle", **summary)
+    return {"uploaded": summary["uri"]}
 
 
 STAGES = {
@@ -418,13 +424,14 @@ def run_pipeline(config, run, only=None, start_from=None, skip=(), options=None,
             with run.stage(name):
                 ctx.results.update(STAGES[name](ctx) or {})
         except LimitExceeded as exc:
-            # A hard stop. Nothing further runs, including the non-gate stages: the
-            # whole point of the ceiling is that crossing it ends the spending.
+            # A hard stop. No further stage runs - the point of the ceiling is that
+            # crossing it ends the spending - with one exception below.
             run.log.error(f"{label:<26} STOPPED  {_fmt_duration(time.time() - started)}")
             run.log.error(f"      {exc}")
             run.log.error(f"      the last checkpoint under {run.checkpoint_dir} is "
                           f"what survives")
             run.finish("stopped", str(exc))
+            _rescue_upload(ctx)
             return 4
         except (Exception, SystemExit) as exc:  # noqa: BLE001
             elapsed = _fmt_duration(time.time() - started)
@@ -443,6 +450,30 @@ def run_pipeline(config, run, only=None, start_from=None, skip=(), options=None,
                          f"{_fmt_duration(time.time() - started)}")
 
     return _finish(ctx, failure)
+
+
+def _rescue_upload(ctx):
+    """Ship what exists after a hard stop, checkpoints included.
+
+    A hard stop on a rented machine is followed by that machine being destroyed,
+    so anything not synced here is gone. The checkpoint is added to whatever
+    s3.upload normally covers precisely because it is the only artifact a stopped
+    run has - the adapter was never written.
+
+    Best effort by definition: the run has already failed, and a storage problem
+    on the way out must not replace the limit message with a stack trace.
+    """
+    if not (ctx.config.get("s3") or {}).get("enabled"):
+        return
+    groups = list((ctx.config["s3"].get("upload") or []))
+    if "checkpoints" not in groups:
+        groups.append("checkpoints")
+    try:
+        ctx.log.warning("      syncing what exists before the machine goes away")
+        stage_upload(ctx, groups=groups)
+    except Exception as exc:  # noqa: BLE001
+        ctx.log.error(f"      could not sync the run bundle: {exc}")
+        ctx.log.error(f"      it remains on disk at {ctx.run.dir}")
 
 
 def _finish(ctx, failure):
