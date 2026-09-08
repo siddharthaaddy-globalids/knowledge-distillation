@@ -10,7 +10,6 @@ Run with:  kd ui --compare   (then open http://127.0.0.1:7860)
 """
 
 import argparse
-import glob
 import os
 import time
 import traceback
@@ -465,8 +464,8 @@ def parse_args():
         description="Side-by-side comparison UI: original vs distilled student vs teacher."
     )
     parser.add_argument("-a", "--adapter", default=None, metavar="DIR",
-                        help="Path to a final_adapter directory. Default: newest of "
-                             + ", ".join(ADAPTER_CANDIDATES))
+                        help="Path to a final_adapter directory. "
+                             f"Default: the newest one under {RUNS_DIR}")
     parser.add_argument("-s", "--student", default=None, help="Student base model id")
     parser.add_argument("-t", "--teacher", default=None, help="Teacher model id")
     parser.add_argument("--teacher-adapter", default=None, metavar="DIR",
@@ -492,10 +491,7 @@ def main():
     args = parse_args()
 
     if args.list_adapters:
-        found = sorted(
-            {p.replace("\\", "/") for p in ADAPTER_CANDIDATES + glob.glob("./*/final_adapter")
-             if _is_adapter(p)}
-        )
+        found = discover_adapters(RUNS_DIR, extra=LEGACY_ADAPTER_CANDIDATES)
         if not found:
             print("No adapters found. Train one first:  kd train")
         else:

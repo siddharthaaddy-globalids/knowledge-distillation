@@ -127,6 +127,31 @@ def test_optional_extras_reachable_from_both():
             assert group in text, f"distill.{kind} does not mention the {group} extra"
 
 
+def test_ref_override_exists_and_warns_in_both():
+    """A pinned runner can be pointed at another branch, and never silently.
+
+    The pin is what makes a result traceable to a revision, so an override has to
+    be explicit on the command line AND announce itself - a run that quietly used
+    a moving branch cannot be reproduced later.
+    """
+    for kind in TEMPLATES:
+        text = template(kind)
+        assert "PINNED_REF" in text or "PinnedRef" in text,             f"distill.{kind} does not keep the pinned ref separate from the one it uses"
+        assert "KD_REF" in text, f"distill.{kind} ignores KD_REF"
+        assert "NOT the pinned" in text,             f"distill.{kind} can override the ref without saying so"
+
+
+def test_branch_checkout_cannot_go_stale():
+    """Checking out FETCH_HEAD, not the ref name.
+
+    `git checkout <branch>` in an existing clone lands on whatever that local
+    branch pointed at last time. For a pinned commit that is harmless; for a
+    branch it silently runs code from whenever the clone was last updated.
+    """
+    for kind in TEMPLATES:
+        assert "FETCH_HEAD" in template(kind),             f"distill.{kind} checks out a ref name, so a moving branch would go stale"
+
+
 def test_dispatch_only_hook_exists_in_both():
     # CI proves the two runners dispatch identically by comparing their output
     # under this variable. If either loses it, that comparison silently stops

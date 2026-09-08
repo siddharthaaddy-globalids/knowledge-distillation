@@ -261,6 +261,7 @@ selection and the terminate guarantee.
 
 ## Further reading
 
+- **[docs/WALKTHROUGH.md](docs/WALKTHROUGH.md)** — CI build to a usable model, one path start to finish
 - **[docs/RUNBOOK-SOURCE.md](docs/RUNBOOK-SOURCE.md)** — the full runbook, from a clone with `uv run`
 - **[docs/RUNBOOK-RUNNER.md](docs/RUNBOOK-RUNNER.md)** — the same runbook, using only the downloaded `distill.sh`
 - **[docs/CONFIG.md](docs/CONFIG.md)** — every configuration key

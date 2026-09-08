@@ -25,9 +25,15 @@
 set -euo pipefail
 
 REPO_URL="__REPO_URL__"
-REPO_REF="__SHA__"
+PINNED_REF="__SHA__"
 BUILD_REF="__REPO__@__SHA_SHORT__"
 BUILT_AT="__BUILT_AT__"
+
+# The commit this runner was built from. Overriding it with --ref or KD_REF runs
+# a different branch, tag or commit - deliberate and manual only, because it is
+# exactly what pinning exists to prevent. A run made that way is reproducible
+# only if the ref was a commit or an immutable tag.
+REPO_REF="${KD_REF:-$PINNED_REF}"
 
 WORKDIR="${KD_WORKDIR:-$HOME/.cache/kd-runner}"
 USE_LOCAL="${KD_LOCAL:-0}"
@@ -43,6 +49,7 @@ done
 # Plain text only: ANSI escapes do not survive every terminal, pipe, CI log or
 # `tee`, and a banner that renders as raw escape codes is worse than no colour.
 log()  { printf '==> %s\n' "$*"; }
+warn() { printf '!!  %s\n' "$*" >&2; }
 die()  { printf 'xx  %s\n' "$*" >&2; exit 1; }
 
 runner_help() {
@@ -56,6 +63,11 @@ RUNNER OPTIONS (consumed here; everything else is passed through)
   --runner-version    The commit this runner was built from.
   --local             Use the checkout this script sits in, instead of fetching
                       the pinned source. For working on the pipeline itself.
+  --ref BRANCH|TAG|SHA
+                      Run a different revision than the one this runner is
+                      pinned to. Manual and deliberate: pinning is what makes a
+                      result traceable, so nothing does this on your behalf.
+                      Use it to try a feature branch without building a runner.
   --extra NAME        Install an optional dependency group, repeatable:
                         eval    benchmark tasks and generation similarity
                         remote  S3 and RunPod
@@ -89,6 +101,9 @@ while [ $# -gt 0 ]; do
     --runner-help)    runner_help; exit 0 ;;
     --runner-version) echo "distill.sh pinned to $BUILD_REF (built $BUILT_AT)"; exit 0 ;;
     --local)          USE_LOCAL=1; shift ;;
+    --ref)            [ $# -ge 2 ] || die "--ref needs a branch, tag or commit"
+                      REPO_REF="$2"; shift 2 ;;
+    --ref=*)          REPO_REF="${1#*=}"; shift ;;
     --extra)          [ $# -ge 2 ] || die "--extra needs a name: eval or remote"
                       EXTRAS="$EXTRAS --extra $2"; shift 2 ;;
     --extra=*)        EXTRAS="$EXTRAS --extra ${1#*=}"; shift ;;
@@ -104,6 +119,14 @@ done
 # subcommands means this file never has to be updated when one is added.
 if [ "${#ARGS[@]}" -eq 0 ] || [ "${ARGS[0]#-}" != "${ARGS[0]}" ]; then
   ARGS=("pipeline" "${ARGS[@]+"${ARGS[@]}"}")
+fi
+
+# Running anything other than the pinned commit is worth saying out loud, every
+# time. The whole point of a pinned runner is that a result can be traced back to
+# an exact revision; a run that quietly used a moving branch cannot be.
+if [ "$REPO_REF" != "$PINNED_REF" ]; then
+  warn "running ref '$REPO_REF', NOT the pinned $BUILD_REF"
+  warn "this run is only reproducible if that ref is a commit or an immutable tag"
 fi
 
 # Print the command that would run, and stop. The only decision this script makes
@@ -152,17 +175,24 @@ if [ "$USE_LOCAL" = "1" ]; then
   log "Using local checkout: $SRC_DIR"
 else
   mkdir -p "$WORKDIR"
-  if [ -d "$SRC_DIR/.git" ]; then
-    log "Updating source in $SRC_DIR"
-    git -C "$SRC_DIR" fetch --depth 1 origin "$REPO_REF" 2>/dev/null \
-      || git -C "$SRC_DIR" fetch origin
-    git -C "$SRC_DIR" checkout -q "$REPO_REF"
-  else
-    log "Cloning $REPO_URL @ ${REPO_REF:0:12}"
+  if [ ! -d "$SRC_DIR/.git" ]; then
+    log "Cloning $REPO_URL"
     rm -rf "$SRC_DIR"
-    git clone --quiet "$REPO_URL" "$SRC_DIR"
-    git -C "$SRC_DIR" checkout -q "$REPO_REF"
+    git clone --quiet "$REPO_URL" "$SRC_DIR" || die "git clone failed"
   fi
+
+  log "Fetching $REPO_REF"
+  # Fetch the ref explicitly and check out FETCH_HEAD rather than the name.
+  # For a pinned commit the two are the same; for a BRANCH they are not - a plain
+  # `checkout <branch>` on an existing clone lands on whatever that local branch
+  # pointed at last time, which silently runs stale code after the branch moves.
+  git -C "$SRC_DIR" fetch --depth 1 --quiet origin "$REPO_REF" 2>/dev/null \
+    || git -C "$SRC_DIR" fetch --quiet origin \
+    || die "could not fetch '$REPO_REF' from $REPO_URL"
+  git -C "$SRC_DIR" checkout -q --force FETCH_HEAD 2>/dev/null \
+    || git -C "$SRC_DIR" checkout -q --force "$REPO_REF" \
+    || die "'$REPO_REF' is not a branch, tag or commit in $REPO_URL"
+  log "  at $(git -C "$SRC_DIR" rev-parse --short=7 HEAD)"
 fi
 cd "$SRC_DIR"
 

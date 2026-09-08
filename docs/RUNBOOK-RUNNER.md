@@ -114,6 +114,7 @@ These few are consumed by `distill.sh` itself rather than passed on:
 |---|---|
 | `--runner-help` | The bootstrapper's own help. `--help` reaches the pipeline instead. |
 | `--runner-version` | The commit this runner was built from. |
+| `--ref BRANCH\|TAG\|SHA` | Run a different revision than the one this runner is pinned to. Manual only — see [Trying another branch](#trying-another-branch). |
 | `--extra NAME` | Install an optional dependency group — `eval` or `remote`. **Repeatable, and name every group you want each time**: `uv` removes extras it was not asked for, so `--extra remote` alone would uninstall `eval`. See [section 5](#5-turning-on-the-optional-parts). |
 | `--workdir DIR` | Where to keep the fetched source. Default `~/.cache/kd-runner`. |
 | `--local` | Use the checkout the script sits in instead of fetching. For working on the pipeline itself. |
@@ -228,8 +229,18 @@ Every key is documented in [CONFIG.md](CONFIG.md).
 
 ### Using a config file of your own
 
-`--config` also takes a path outside the fetched source, so you can keep a
-profile next to the runner:
+You do not need to download anything to see what a profile contains. `--full`
+writes the effective configuration to stdout and the banner to stderr, so it
+redirects cleanly into a file you can edit:
+
+```bash
+./distill.sh check --config configs/finance.yaml --full > my-run.yaml
+```
+
+That gives you all 133 lines with every value already resolved - a complete,
+runnable starting point rather than a blank page. Edit what you want and run it.
+
+Or write one from scratch; `extends` pulls in everything you did not mention:
 
 ```bash
 cat > my-run.yaml <<'YAML'
@@ -523,6 +534,40 @@ explicitly. `--yes` accepts the *cost estimate*; it never accepts a different GP
 Every runner is pinned. To move to a newer build, download a newer runner — the
 one you have will keep fetching its own commit forever, which is what makes a
 result reproducible months later.
+
+### Trying another branch
+
+Sometimes you want to run a feature branch without waiting for CI to build a
+runner for it. `--ref` points the same runner at a different revision:
+
+```bash
+./distill.sh --ref feature/new-scheduler --config configs/finance.yaml
+./distill.sh --ref v1.2.0 --config configs/finance.yaml       # a tag
+./distill.sh --ref 9f3a1c2 --config configs/finance.yaml      # any commit
+```
+
+It is manual and it announces itself, every time:
+
+```
+!!  running ref 'feature/new-scheduler', NOT the pinned <org>/<repo>@053cee7
+!!  this run is only reproducible if that ref is a commit or an immutable tag
+```
+
+That warning is the point. A pinned runner guarantees a result can be traced back
+to an exact revision; a branch moves, so a run made against one cannot be
+reproduced from the runner alone. `KD_REF` does the same thing from the
+environment, for CI jobs that build a matrix of branches.
+
+The checkout is shared, so switching back and forth is cheap — the runner fetches
+the ref and checks out `FETCH_HEAD` rather than a local branch name, which means
+a branch that has moved since you last used it is picked up rather than silently
+re-run from stale code.
+
+> **Manual builds, not automatic ones.** CI builds runners automatically only on
+> `main`/`master`. To get a *pinned* runner for another branch, run the **Build
+> distillation runner** workflow manually from *Actions* and select that branch —
+> `workflow_dispatch` works from any branch. Use `--ref` for a quick look; use a
+> manually built runner when you want the result to stay traceable.
 
 ---
 

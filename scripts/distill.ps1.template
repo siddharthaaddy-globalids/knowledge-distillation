@@ -38,6 +38,11 @@ param(
     # source. For working on the pipeline itself.
     [switch]$Local,
 
+    # Run a different revision than the one this runner is pinned to. Manual and
+    # deliberate: pinning is what makes a result traceable, so nothing does this
+    # on your behalf.
+    [string]$Ref,
+
     # Optional dependency groups: eval (benchmark tasks, generation similarity)
     # and remote (S3, RunPod). Neither is needed for a plain training run, which
     # is why the core install does not carry them.
@@ -55,10 +60,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$RepoUrl  = '__REPO_URL__'
-$RepoRef  = '__SHA__'
-$BuildRef = '__REPO__@__SHA_SHORT__'
-$BuiltAt  = '__BUILT_AT__'
+$RepoUrl   = '__REPO_URL__'
+$PinnedRef = '__SHA__'
+$BuildRef  = '__REPO__@__SHA_SHORT__'
+$BuiltAt   = '__BUILT_AT__'
+
+# Overriding the pinned commit runs a different branch, tag or commit. A run made
+# that way is reproducible only if the ref was a commit or an immutable tag.
+$RepoRef = $PinnedRef
+if ($Ref) { $RepoRef = $Ref }
+elseif ($env:KD_REF) { $RepoRef = $env:KD_REF }
 
 if (-not $WorkDir) {
     $WorkDir = if ($env:KD_WORKDIR) { $env:KD_WORKDIR }
@@ -86,6 +97,9 @@ RUNNER OPTIONS (consumed here; everything else is passed through)
   -RunnerVersion    The commit this runner was built from.
   -Local            Use the checkout this script sits in, instead of fetching
                     the pinned source. For working on the pipeline itself.
+  -Ref NAME         Run a different revision - branch, tag or commit - than the
+                    one this runner is pinned to. Manual and deliberate: pinning
+                    is what makes a result traceable.
   -Extra NAME       Install an optional dependency group, repeatable:
                       eval    benchmark tasks and generation similarity
                       remote  S3 and RunPod
@@ -145,6 +159,13 @@ $kdArgs = @($command)
 if ($Config) { $kdArgs += @('--config', $Config) }
 $kdArgs += $passthrough
 
+# Running anything other than the pinned commit is worth saying out loud, every
+# time. A result that quietly used a moving branch cannot be traced to a revision.
+if ($RepoRef -ne $PinnedRef) {
+    Write-Host "!!  running ref '$RepoRef', NOT the pinned $BuildRef"
+    Write-Host "!!  this run is only reproducible if that ref is a commit or an immutable tag"
+}
+
 # Print the command that would run, and stop. The only decision this script makes
 # on its own is which pipeline command to invoke, and this is what lets that be
 # tested - in CI and by hand - without a clone, a torch download or a GPU. It is
@@ -186,18 +207,26 @@ if ($Local) {
 } else {
     $SrcDir = Join-Path $WorkDir 'src'
     if (-not (Test-Path $WorkDir)) { New-Item -ItemType Directory -Force $WorkDir | Out-Null }
-    if (Test-Path (Join-Path $SrcDir '.git')) {
-        Write-Step "Updating source in $SrcDir"
-        try { git -C $SrcDir fetch --depth 1 origin $RepoRef } catch { git -C $SrcDir fetch origin }
-        git -C $SrcDir checkout -q $RepoRef
-        if (-not $?) { Stop-WithError "could not check out $RepoRef" }
-    } else {
-        Write-Step "Cloning $RepoUrl @ $($RepoRef.Substring(0, [Math]::Min(12, $RepoRef.Length)))"
+    if (-not (Test-Path (Join-Path $SrcDir '.git'))) {
+        Write-Step "Cloning $RepoUrl"
         if (Test-Path $SrcDir) { Remove-Item -Recurse -Force $SrcDir }
         git clone --quiet $RepoUrl $SrcDir
-        if (-not $?) { Stop-WithError "git clone failed" }
-        git -C $SrcDir checkout -q $RepoRef
+        if (-not $?) { Stop-WithError 'git clone failed' }
     }
+
+    Write-Step "Fetching $RepoRef"
+    # Fetch the ref explicitly and check out FETCH_HEAD rather than the name. For
+    # a pinned commit the two are the same; for a BRANCH they are not - a plain
+    # checkout of the name lands on whatever that local branch pointed at last
+    # time, which silently runs stale code after the branch moves.
+    git -C $SrcDir fetch --depth 1 --quiet origin $RepoRef 2>$null
+    if (-not $?) { git -C $SrcDir fetch --quiet origin }
+    git -C $SrcDir checkout -q --force FETCH_HEAD 2>$null
+    if (-not $?) {
+        git -C $SrcDir checkout -q --force $RepoRef
+        if (-not $?) { Stop-WithError "'$RepoRef' is not a branch, tag or commit in $RepoUrl" }
+    }
+    Write-Step "  at $(git -C $SrcDir rev-parse --short=7 HEAD)"
 }
 Set-Location $SrcDir
 

@@ -197,6 +197,14 @@ jobs:
             uv run python -m kd "$cmd" --help >/dev/null \
               || { echo "FAILED: kd $cmd --help"; exit 1; }
           done
+          # The UIs too. Their argument parsers build help strings from module
+          # constants, so a renamed constant is a NameError that fires only when
+          # someone actually launches one - long after CI went green.
+          uv run python -m kd ui --help >/dev/null || { echo "FAILED: kd ui"; exit 1; }
+          uv run python -m kd ui --compare --help >/dev/null \
+            || { echo "FAILED: kd ui --compare"; exit 1; }
+          uv run python -m kd ui --compare --list-adapters >/dev/null \
+            || { echo "FAILED: kd ui --compare --list-adapters"; exit 1; }
           uv run python -m kd --help >/dev/null
           uv run python -m kd doctor --config configs/smoke.yaml >/dev/null
 
@@ -291,6 +299,9 @@ jobs:
           # --extra is the runner's own flag: consumed here, never passed on.
           expect "evaluate --config x.yaml"  --extra eval evaluate --config x.yaml
           expect "pipeline --config x.yaml"  --extra=remote --config x.yaml
+          # --ref is the runner's own flag too: consumed, never passed on.
+          expect "pipeline --config x.yaml"  --ref main --config x.yaml
+          expect "doctor"                    --ref=feature/x doctor
 
       - name: Install PowerShell
         run: |
@@ -340,6 +351,7 @@ jobs:
           expect "doctor"                                      doctor
           expect "evaluate --config x.yaml"  -Extra eval evaluate -Config x.yaml
           expect "doctor"                    -Extra eval,remote doctor
+          expect "pipeline --config x.yaml"  -Ref main -Config x.yaml
 
       - name: Upload runners
         uses: actions/upload-artifact@v4

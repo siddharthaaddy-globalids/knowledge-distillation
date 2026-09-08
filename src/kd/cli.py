@@ -121,15 +121,26 @@ def delegate(module_name, argv):
 # Commands
 # --------------------------------------------------------------------------- #
 def cmd_check(args):
-    """Resolve the config and hardware, print both, and exit. Costs nothing."""
+    """Resolve the config and hardware, print both, and exit. Costs nothing.
+
+    With --full, stdout carries nothing but the YAML and the banner goes to
+    stderr, so the effective config can be redirected straight into a file:
+
+        kd check --config configs/finance.yaml --full > my-run.yaml
+
+    That is the only way to get an editable config onto a machine that has a
+    downloaded runner and no checkout, so it has to produce a clean file.
+    """
     import yaml
     from .config import describe, resolve_device, strip_meta
 
     config = load(args)
     hardware = resolve_device(config)
-    print(describe(config, hardware))
+    print(describe(config, hardware), file=sys.stderr if args.full else sys.stdout)
     if args.full:
-        print("\n--- effective config ---")
+        source = config["_meta"].get("source")
+        print(f"# Effective configuration for {source}, after every override.\n"
+              f"# Edit it and run it directly:  kd pipeline --config <this file>\n")
         print(yaml.safe_dump(strip_meta(config), sort_keys=False,
                              default_flow_style=False, allow_unicode=True))
     return 0
