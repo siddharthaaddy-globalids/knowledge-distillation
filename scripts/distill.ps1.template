@@ -71,9 +71,24 @@ $RepoRef = $PinnedRef
 if ($Ref) { $RepoRef = $Ref }
 elseif ($env:KD_REF) { $RepoRef = $env:KD_REF }
 
+# $HOME, not $env:USERPROFILE. PowerShell defines $HOME on every platform;
+# USERPROFILE exists only on Windows, so off Windows anything built from it
+# becomes `Join-Path $null ...`, which throws - and with $ErrorActionPreference
+# 'Stop' that kills the script before it can even print its own help. CI
+# validates this runner on a Linux pwsh, which is where that surfaced.
+#
+# Resolved unconditionally, because the uv installer below needs it too and would
+# otherwise be undefined whenever -WorkDir or KD_WORKDIR was set.
+$HomeDir = if ($HOME) { $HOME } elseif ($env:USERPROFILE) { $env:USERPROFILE } else { '.' }
+
 if (-not $WorkDir) {
-    $WorkDir = if ($env:KD_WORKDIR) { $env:KD_WORKDIR }
-               else { Join-Path $env:USERPROFILE '.cache\kd-runner' }
+    if ($env:KD_WORKDIR) {
+        $WorkDir = $env:KD_WORKDIR
+    } else {
+        # Nested rather than one 'cache\kd-runner' string: a literal backslash is
+        # a legal filename character off Windows, not a separator.
+        $WorkDir = Join-Path (Join-Path $HomeDir '.cache') 'kd-runner'
+    }
 }
 if (-not $Local -and $env:KD_LOCAL -eq '1') { $Local = $true }
 
@@ -104,8 +119,8 @@ RUNNER OPTIONS (consumed here; everything else is passed through)
                       eval    benchmark tasks and generation similarity
                       remote  S3 and RunPod
                     Neither is needed for a plain training run.
-  -WorkDir DIR      Where to keep the checkout (default: %USERPROFILE%\.cache\
-                    kd-runner, or $env:KD_WORKDIR).
+  -WorkDir DIR      Where to keep the checkout (default: ~/.cache/kd-runner,
+                    or $env:KD_WORKDIR).
   -Config PATH      Shorthand for --config PATH.
 
 COMMAND
@@ -187,7 +202,8 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     Write-Step 'uv not found - installing'
     Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
     # The installer puts uv here and updates PATH for future sessions, not this one.
-    $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
+    $installed = Join-Path (Join-Path $HomeDir '.local') 'bin'
+    $env:Path = "$installed$([IO.Path]::PathSeparator)$env:Path"
 }
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     Stop-WithError 'uv install failed. See https://docs.astral.sh/uv/'

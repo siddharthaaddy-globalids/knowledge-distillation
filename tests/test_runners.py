@@ -70,14 +70,37 @@ def test_conditional_stages_name_a_real_config_section():
 # --------------------------------------------------------------------------- #
 # Templates
 # --------------------------------------------------------------------------- #
+def _code_lines(text):
+    """Executable lines only: no blanks, no comments, no embedded help text.
+
+    Total line count is the wrong measure. It punishes explaining a subtle fix in
+    a comment exactly as hard as adding a branch, so the guard ends up pressuring
+    the one thing that should be encouraged. What matters is how much LOGIC lives
+    in a file that has to be written twice and tested on two platforms.
+    """
+    count, in_heredoc = 0, False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped in ("cat <<'EOF'", "@'"):
+            in_heredoc = True
+            continue
+        if stripped in ("EOF", "'@ | Write-Host"):
+            in_heredoc = False
+            continue
+        if in_heredoc or not stripped or stripped.startswith(("#", "<#")):
+            continue
+        count += 1
+    return count
+
+
 def test_both_templates_exist_and_are_bootstrappers():
     for kind, path in TEMPLATES.items():
         assert os.path.isfile(path), f"missing {path}"
-        # A bootstrapper that has grown past a few hundred lines has started
-        # reimplementing the pipeline, which is the thing these files exist to
-        # avoid: logic here has to be written twice and tested on two platforms.
-        lines = len(template(kind).splitlines())
-        assert lines < 260, f"distill.{kind}.template is {lines} lines - too much logic"
+        # A bootstrapper that has grown real logic has started reimplementing the
+        # pipeline, which is the thing these files exist to avoid.
+        code = _code_lines(template(kind))
+        assert code < 175, \
+            f"distill.{kind}.template has {code} lines of logic - too much for a bootstrapper"
 
 
 def test_templates_use_the_same_placeholders():
@@ -150,6 +173,27 @@ def test_branch_checkout_cannot_go_stale():
     """
     for kind in TEMPLATES:
         assert "FETCH_HEAD" in template(kind),             f"distill.{kind} checks out a ref name, so a moving branch would go stale"
+
+
+def test_powershell_runner_has_no_windows_only_home():
+    """distill.ps1 must resolve a home directory on any platform.
+
+    $env:USERPROFILE exists only on Windows. Off Windows it is null, so
+    `Join-Path $env:USERPROFILE ...` throws - and because the script sets
+    $ErrorActionPreference to 'Stop', that kills it at line one, before it can
+    even print its own help. CI validates this runner on a Linux pwsh, so the
+    failure is real rather than theoretical.
+
+    $HOME is defined by PowerShell itself on every platform, so it is the one to
+    build paths from; USERPROFILE is allowed only as a fallback beside it.
+    """
+    text = template("ps1")
+    assert "$HOME" in text, "distill.ps1 does not use $HOME"
+    for number, line in enumerate(text.splitlines(), start=1):
+        if "$env:USERPROFILE" in line and not line.lstrip().startswith("#"):
+            assert "$HOME" in line, (
+                f"distill.ps1:{number} builds a path from $env:USERPROFILE without "
+                f"a $HOME fallback; that is null off Windows")
 
 
 def test_dispatch_only_hook_exists_in_both():
