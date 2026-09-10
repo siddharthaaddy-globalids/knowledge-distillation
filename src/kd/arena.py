@@ -920,36 +920,68 @@ def main(args=None):
                         formats=formats, unanswered=unanswered,
                         rounds=int(settings.get("arena_elo_rounds") or 25),
                         seed=int(config["project"]["seed"]))
-    payload["similarity"] = similarity(completions, questions, log=log)
     payload["arena_file"] = str(path)
     payload["adapter"] = str(adapter) if adapter else None
+    # Present from the first write, so the file always SAYS whether there is a
+    # similarity table rather than leaving a reader to infer it from a missing
+    # key - which reads the same as an older payload that never had one.
+    payload["similarity"] = None
+
+    # ----------------------------------------------------------------------- #
+    # ORDER MATTERS HERE, and it is the opposite of the obvious one.
+    #
+    # Generation is the expensive, unrepeatable part: three models over a held-out
+    # set, hours of it. Everything below - the similarity table, the terminal
+    # summary, the report - is cheap and derived. So the derived work happens
+    # AFTER the raw result is on disk, not before it.
+    #
+    # The specific accident this avoids: similarity() downloads an embedding
+    # model. It handles the library being absent, but not a network that drops
+    # or a cache that is corrupt, and it used to run before the first write - so
+    # a failed download three hours in ended the process with nothing saved.
+    # ----------------------------------------------------------------------- #
+    saving = not getattr(args, "no_save", False)
+    target = getattr(args, "json", None) or "arena.json"
+    stem = target[:-5] if target.endswith(".json") else target
+    transcript = None
+
+    def write_payload():
+        directory = os.path.dirname(os.path.abspath(target))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(target, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
+    if saving:
+        write_payload()
+        try:
+            # The only record of what each model actually SAID, question by
+            # question. Its own try because a transcript that fails to write
+            # must not take the report down with it.
+            transcript = write_transcript(f"{stem}-transcript.jsonl", questions,
+                                          predictions, formats, completions)
+        except Exception as exc:  # noqa: BLE001 - nothing here is worth dying for
+            log.warning(f"  !! could not write the transcript: {exc}")
+
+    # Optional, and reported as absent rather than fatal: it needs
+    # sentence-transformers, which the pod install deliberately skips.
+    try:
+        payload["similarity"] = similarity(completions, questions, log=log)
+    except Exception as exc:  # noqa: BLE001 - a download, an encode, a disk
+        payload["similarity"] = None
+        log.warning(f"      !! similarity skipped: {exc}")
+    if saving and payload.get("similarity"):
+        write_payload()          # now with the table in it
 
     log.info("")
     log.info(render(payload))
+    if payload.get("similarity"):
+        log.info(render_similarity(payload["similarity"]))
 
-    # Saved unless refused, rather than saved only when asked. Scoring three
-    # players over a held-out set costs hours and cannot be reconstructed from a
-    # terminal buffer - so the default that throws that away is the wrong one.
-    # The transcript in particular exists nowhere else: it is the only record of
-    # what each model actually SAID, question by question.
-    if getattr(args, "no_save", False):
+    if not saving:
         log.info("")
         log.info("  --no-save: nothing written")
         return 0
-
-    target = getattr(args, "json", None) or "arena.json"
-    stem = target[:-5] if target.endswith(".json") else target
-    directory = os.path.dirname(os.path.abspath(target))
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-
-    with open(target, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-    transcript = write_transcript(f"{stem}-transcript.jsonl", questions,
-                                  predictions, formats, completions)
-    log.info("")
-    log.info(f"  wrote {target}         the numbers")
-    log.info(f"  wrote {transcript}   every question, every answer, in full")
 
     # An arena-only report: the answer key and the similarity table, without the
     # token-level sections kd.evaluate produces. Smaller than the pipeline's
@@ -958,16 +990,31 @@ def main(args=None):
     if report is None:
         report = f"{stem}-report.html"
     if report:
-        from .report import write_report
+        try:
+            from .report import write_report
 
-        written = write_report({
-            "arena": payload,
-            "student": config["models"].get("student"),
-            "teacher": config["models"].get("teacher"),
-            "teacher_adapter": config["models"].get("teacher_adapter"),
-            "adapter": str(adapter) if adapter else None,
-            "device": hardware["device"],
-            "dtype": hardware.get("dtype_name"),
-        }, report)
-        log.info(f"  wrote {written}       the readable summary")
+            written = write_report({
+                "arena": payload,
+                "student": config["models"].get("student"),
+                "teacher": config["models"].get("teacher"),
+                "teacher_adapter": config["models"].get("teacher_adapter"),
+                "adapter": str(adapter) if adapter else None,
+                "device": hardware["device"],
+                "dtype": hardware.get("dtype_name"),
+            }, report)
+            report = str(written)
+        except Exception as exc:  # noqa: BLE001 - the numbers are already safe
+            log.warning(f"  !! could not write the report: {exc}")
+            log.warning(f"     nothing measured is lost - the numbers are in "
+                        f"{target} and the transcript beside it")
+
+    # Label first, path second: paths vary in length, so a trailing description
+    # column does not line up on anyone's machine.
+    log.info("")
+    log.info("  saved")
+    log.info(f"    the numbers                        {target}")
+    if transcript:
+        log.info(f"    every question and every answer    {transcript}")
+    if report:
+        log.info(f"    the readable summary               {report}")
     return 0

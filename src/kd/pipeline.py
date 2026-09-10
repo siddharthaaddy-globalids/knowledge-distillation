@@ -420,28 +420,54 @@ def stage_arena(ctx):
         formats=formats, unanswered=unanswered,
         rounds=int(settings.get("arena_elo_rounds") or 25),
         seed=int(ctx.config["project"]["seed"]))
-    # Optional, and reported as absent rather than failing: the similarity table
-    # needs sentence-transformers, which is in the `eval` extra a pod install
-    # deliberately skips.
-    payload["similarity"] = arena.similarity(completions, questions, log=ctx.log)
     payload["arena_file"] = str(path)
     payload["adapter"] = str(adapter)
+    # Present from the first write, so the file always says whether there is a
+    # similarity table rather than leaving a reader to infer it from absence.
+    payload["similarity"] = None
 
+    # Written before the similarity table is computed, not after. Generation is
+    # the hours-long unrepeatable part; similarity downloads an embedding model,
+    # which is a network call that can fail. Saving first means a failed download
+    # costs a table, not the run.
     target = ctx.run.path("arena.json")
-    with open(target, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
+
+    def write_payload():
+        with open(target, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
+    write_payload()
 
     # The full transcript beside it: every question, and every word each player
     # said about it. Separate from arena.json because it is large and read for a
     # different reason - the numbers to see WHAT happened, this to see WHY.
-    transcript = arena.write_transcript(
-        ctx.run.path("arena-transcript.jsonl"), questions, predictions, formats,
-        completions)
-    ctx.log.info(f"      transcript: {transcript}")
+    transcript = None
+    try:
+        transcript = arena.write_transcript(
+            ctx.run.path("arena-transcript.jsonl"), questions, predictions,
+            formats, completions)
+        ctx.log.info(f"      transcript: {transcript}")
+    except Exception as exc:  # noqa: BLE001 - the numbers are already on disk
+        ctx.log.warning(f"      !! could not write the transcript: {exc}")
+
+    # Optional, and reported as absent rather than failing: the similarity table
+    # needs sentence-transformers, which is in the `eval` extra a pod install
+    # deliberately skips.
+    try:
+        payload["similarity"] = arena.similarity(completions, questions,
+                                                 log=ctx.log)
+    except Exception as exc:  # noqa: BLE001 - a download, an encode, a disk
+        payload["similarity"] = None
+        ctx.log.warning(f"      !! similarity skipped: {exc}")
+    if payload.get("similarity"):
+        write_payload()
 
     ctx.log.info("")
     for line in arena.render(payload).splitlines():
         ctx.log.info(line)
+    if payload.get("similarity"):
+        for line in arena.render_similarity(payload["similarity"]).splitlines():
+            ctx.log.info(line)
     ctx.run.write_metrics({"arena": payload["players"]})
     ctx.run.event("arena", "ratings", **payload["players"])
     return {"arena": target, "arena_transcript": transcript}
