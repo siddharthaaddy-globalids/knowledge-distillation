@@ -1,9 +1,9 @@
 # ===========================================================================
-#  enLibra space curriculum - the SFT teacher -> Qwen3-1.7B     [rented GPU]
+#  enLibra space curriculum - Qwen2.5-3B (SFT) -> Qwen2.5-1.5B  [rented GPU]
 #
-#    ./run.sh --config configs/enlibraQ3-4B.yaml
+#    ./run.sh --config configs/enlibraQ25-3B.yaml
 #
-#  The laptop counterpart is configs/enlibraQ3-4B-smoke.yaml, which changes one
+#  The laptop counterpart is configs/enlibraQ25-3B-smoke.yaml, which changes one
 #  thing: how much of the corpus it trains on. Same teacher, same student, same
 #  everything else.
 #
@@ -15,16 +15,27 @@
 #  The two are separate files rather than one file with switches because a run
 #  should be describable by the single path you pointed at.
 #
-#  ABOUT THE TEACHER'S SIZE
-#  ------------------------
-#  Reported as "4B or 3B". Nothing here depends on knowing which: the checkpoint
-#  carries its own config, and the preflight stage prints what actually loaded.
-#  What the number changes is the GPU, so read `weights` in the preflight output
-#  before trusting the sizing note under `runpod` below.
+#  WHY BOTH MODELS ARE QWEN2.5, NOT QWEN3
+#  --------------------------------------
+#  The teacher is an SFT of Qwen2.5-3B-Instruct, so the student is Qwen2.5-1.5B
+#  and not the Qwen3-1.7B the other profiles use. Standard GKD trains the
+#  student to match the teacher's distribution over the SAME vocabulary; the
+#  moment the two disagree about what token id 151667 means, the JSD it
+#  minimises is comparing different things.
 #
-#  Note that the estimate can UNDER-report for an s3:// teacher. kd.paths reads
-#  parameter counts from the Hub, and a checkpoint fetched into a local cache
-#  has no Hub entry - so the printed figure may cover the student alone. Check
+#  Measured, rather than assumed: Qwen2.5-3B-Instruct has 151665 tokens and
+#  Qwen3-1.7B has 151669 - the same ids for all 151665 they share, plus
+#  <think>, </think>, <tool_response> and </tool_response> that only Qwen3
+#  knows. A Qwen3 student is therefore not impossible, but it drags in Qwen3's
+#  chat template, which writes <think> into every rendered exchange - ids the
+#  Qwen2.5 teacher has no trained embedding for. Staying inside one model family
+#  removes the whole question.
+#
+#  A NOTE ON THE MEMORY ESTIMATE
+#  -----------------------------
+#  It can UNDER-report for an s3:// teacher. kd.paths reads parameter counts
+#  from the Hub, and a checkpoint fetched into a local cache has no Hub entry -
+#  so the `weights` figure preflight prints may cover the student alone. Check
 #  the size of the download itself if it matters.
 # ===========================================================================
 extends: _base.yaml
@@ -50,13 +61,21 @@ models:
   # warns. The teacher-check stage exists to catch exactly that, and it is a
   # gate, so a teacher that fails it stops the run before any budget is spent.
   teacher: s3://enlibra/dss/dev/runs/9eb5db9e-efe4-4c8d-9f6d-3adf665a44b9/outputs/models/sft/
-  student: Qwen/Qwen3-1.7B
+  student: Qwen/Qwen2.5-1.5B
 
-  # From the STUDENT, not the teacher. Every Qwen3 shares one vocabulary (151669
-  # entries, identical dicts, identical chat template), which is what GKD needs.
-  # The student's copy is the canonical one; a custom export's tokenizer files
-  # are the part of it least worth trusting.
-  tokenizer: student
+  # The STOCK Qwen2.5-1.5B-Instruct tokenizer, named explicitly rather than
+  # taken from either model.
+  #
+  # Not "teacher": that is a custom export, and a merged checkpoint's tokenizer
+  # files are the part of it least worth trusting.
+  #
+  # Not "student" either: Qwen/Qwen2.5-1.5B is the BASE model, and base models
+  # are not reliably shipped with a chat template. Everything here - the corpus
+  # rendering, the collator's prompt/completion split, the benchmark probes -
+  # runs through apply_chat_template, so the template has to be the instruct
+  # one. The vocabulary is identical across the family, so this changes the
+  # template and nothing else.
+  tokenizer: Qwen/Qwen2.5-1.5B-Instruct
 
 hardware:
   device: auto
@@ -110,8 +129,8 @@ dataset:
 lora:
   r: 32
   alpha: 64
-  # Qwen3 is a standard dense transformer - no hybrid attention, no vision
-  # tower, no MTP head - so the plain Llama-style list reaches every layer.
+  # Qwen2.5 is a standard dense transformer, so the plain Llama-style list
+  # reaches every layer.
   target_modules:
     - q_proj
     - k_proj
@@ -208,12 +227,13 @@ runpod:
   # started yourself - ignores this block and takes its cost ceiling from
   # KD_PRICE_PER_HOUR instead.
   enabled: true
-  # A 4B teacher plus a 1.7B student is ~11 GB of bfloat16 weights, so a 24 GB
-  # card is enough and this run is far cheaper than the 8B profile's, which
-  # needs 48 GB. Confirm against the `weights` line preflight prints before
-  # committing: if the teacher is larger than reported, move up a size.
-  gpu_type: RTX A5000
-  max_price_per_hour: 0.60
+  # 3.09B + 1.54B parameters is ~8.6 GB of bfloat16 weights, so a 16 GB card
+  # has room for activations on top and this run is far cheaper than the 8B
+  # profile's, which needs 48 GB. Confirm against the `weights` line preflight
+  # prints - and see the note at the top about it under-reporting an s3://
+  # teacher - before assuming the smallest card will do.
+  gpu_type: RTX A4000
+  max_price_per_hour: 0.40
   spot: true
-  volume_gb: 80
+  volume_gb: 60
   container_disk_gb: 30

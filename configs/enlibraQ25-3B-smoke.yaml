@@ -1,9 +1,9 @@
 # ===========================================================================
-#  enLibra SFT teacher -> Qwen3-1.7B, on a Mac mini            [smoke test]
+#  enLibra: Qwen2.5-3B (SFT) -> Qwen2.5-1.5B, on a Mac mini     [smoke test]
 #
-#    ./run.sh --config configs/enlibraQ3-4B-smoke.yaml
+#    ./run.sh --config configs/enlibraQ25-3B-smoke.yaml
 #
-#  The same run as configs/enlibraQ3-4B.yaml with one thing changed: it trains
+#  The same run as configs/enlibraQ25-3B.yaml with one thing changed: it trains
 #  on a small slice of the corpus instead of all of it, so it finishes in
 #  minutes. Same teacher, same student, same LoRA, same token budgets, same
 #  held-out set, same S3 destination.
@@ -33,7 +33,7 @@
 #  bucket policy and both permissions get proved on a machine that costs
 #  nothing, rather than on a GPU that bills by the second.
 # ===========================================================================
-extends: enlibraQ3-4B.yaml
+extends: enlibraQ25-3B.yaml
 
 project:
   name: enlibra-q3-sft-smoke
@@ -42,7 +42,7 @@ hardware:
   device: mps
   # transformers permits bfloat16 on MPS only from macOS 14.0; below that
   # kd.config falls back to float32 and says so - slower, not broken, but at
-  # float32 these two models are ~22 GB and will not fit at all. On an Intel Mac
+  # float32 these two models are ~17 GB and will not fit at all. On an Intel Mac
   # add --set hardware.device=cpu and expect it to take all day.
   dtype: bfloat16
 
@@ -91,8 +91,8 @@ evaluation:
   #
   # This is the second deviation from the parent, and it is not optional: three
   # models generating to an 8192-token ceiling across 137 questions on MPS is
-  # hours, and a barely-trained student runs to that ceiling every time because
-  # it has not learned to emit an end-of-turn token.
+  # hours, and a four-step student runs to that ceiling every time because it
+  # has not learned to emit an end-of-turn token.
   arena_limit: 4
   arena_max_new_tokens: 2048
 
