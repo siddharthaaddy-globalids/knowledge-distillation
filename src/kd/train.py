@@ -81,6 +81,57 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=512):
     return tokenizer.decode(completion, skip_special_tokens=True).strip()
 
 
+def align_vocab(student_model, teacher_model, tokenizer):
+    """Make both models' output layers the same width, when that is lossless.
+
+    GKD's JSD compares the teacher's whole next-token distribution against the
+    student's, so the two logit tensors have to be the same width. TRL checks
+    this and refuses otherwise, which is right - but the mismatch it usually
+    catches is not a real disagreement about vocabulary.
+
+    Stock Qwen checkpoints pad `vocab_size` up to a multiple of 128 for tensor
+    alignment: 151936 against a tokenizer of 151665. Everything above the
+    tokenizer length is filler - rows no token id ever indexes and no correct
+    model puts mass on. A checkpoint that was fine-tuned through
+    `resize_token_embeddings(len(tokenizer))` has had that padding trimmed, so a
+    trimmed teacher and a stock student disagree by exactly the padding, and by
+    nothing that means anything.
+
+    Trimming the wider one down to the narrower is therefore lossless, and it is
+    the only case handled here. A model narrower than the tokenizer would be
+    missing real tokens, which is a genuine mismatch and is left to fail.
+
+    Returns the width both models ended at, or None if they already agreed.
+    """
+    student_width = int(student_model.config.vocab_size)
+    teacher_width = int(teacher_model.config.vocab_size)
+    if student_width == teacher_width:
+        return None
+
+    target = min(student_width, teacher_width)
+    real_tokens = len(tokenizer)
+    if target < real_tokens:
+        raise ValueError(
+            f"the student has vocab_size {student_width} and the teacher "
+            f"{teacher_width}, and the narrower of the two is below the "
+            f"tokenizer's {real_tokens} real tokens.\n"
+            f"  That is a genuine vocabulary difference, not alignment padding, "
+            f"and standard GKD cannot bridge it.\n"
+            f"  Use a teacher and student from the same model family.")
+
+    wider, name = ((student_model, "student") if student_width > teacher_width
+                   else (teacher_model, "teacher"))
+    print(f" -> vocab: student {student_width}, teacher {teacher_width}; "
+          f"trimming the {name} to {target}")
+    print(f"    (rows {target}..{max(student_width, teacher_width) - 1} are "
+          f"alignment padding above the tokenizer's {real_tokens} tokens)")
+    wider.resize_token_embeddings(target)
+    # resize_token_embeddings updates the module but not always every copy of
+    # the number, and TRL reads the config.
+    wider.config.vocab_size = target
+    return target
+
+
 def _fmt(value, spec=".4f"):
     if isinstance(value, (int, float)):
         try:
@@ -293,6 +344,10 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
     student_model = AutoModelForCausalLM.from_pretrained(
         student_id, dtype=dtype, low_cpu_mem_usage=True
     ).to(device)
+
+    # Before LoRA, because resizing after injection would leave the adapter
+    # attached to an lm_head of the wrong width.
+    align_vocab(student_model, teacher_model, tokenizer)
 
     # target_modules may be a list of suffixes (Llama-style models) or a single regex
     # string. The regex form matters for hybrid architectures such as Qwen3.5, whose

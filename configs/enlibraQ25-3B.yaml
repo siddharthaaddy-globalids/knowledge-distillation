@@ -61,21 +61,29 @@ models:
   # warns. The teacher-check stage exists to catch exactly that, and it is a
   # gate, so a teacher that fails it stops the run before any budget is spent.
   teacher: s3://enlibra/dss/dev/runs/9eb5db9e-efe4-4c8d-9f6d-3adf665a44b9/outputs/models/sft/
-  student: Qwen/Qwen2.5-1.5B
+  # INSTRUCT, not the base model, and matching the teacher's lineage: the
+  # teacher is an SFT of Qwen2.5-3B-Instruct.
+  #
+  # A base model has never been taught to stop. It emits no end-of-turn token,
+  # so every benchmark probe and every arena question runs to its full ceiling
+  # instead of finishing in a few hundred tokens - and the arena scores those as
+  # "unanswered" rather than as wrong, which understates the student for a
+  # reason that has nothing to do with what it learned. Observed directly: the
+  # base student produced one correct sentence and then several thousand tokens
+  # of rare-token drift, because repetition_penalty pushes a model with nowhere
+  # to stop into progressively stranger choices.
+  #
+  # A base student is the better blank slate for overwriting a persona, which is
+  # the one thing it would have bought here. It is not worth the rest.
+  student: Qwen/Qwen2.5-1.5B-Instruct
 
-  # The STOCK Qwen2.5-1.5B-Instruct tokenizer, named explicitly rather than
-  # taken from either model.
+  # The student's own tokenizer. Every Qwen2.5 shares one vocabulary, so this
+  # only decides which chat template renders the corpus - and the instruct
+  # template is the one both models were trained against.
   #
   # Not "teacher": that is a custom export, and a merged checkpoint's tokenizer
   # files are the part of it least worth trusting.
-  #
-  # Not "student" either: Qwen/Qwen2.5-1.5B is the BASE model, and base models
-  # are not reliably shipped with a chat template. Everything here - the corpus
-  # rendering, the collator's prompt/completion split, the benchmark probes -
-  # runs through apply_chat_template, so the template has to be the instruct
-  # one. The vocabulary is identical across the family, so this changes the
-  # template and nothing else.
-  tokenizer: Qwen/Qwen2.5-1.5B-Instruct
+  tokenizer: student
 
 hardware:
   device: auto

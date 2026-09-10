@@ -39,21 +39,16 @@ project:
   name: enlibra-q25-flow
 
 models:
-  # Stock, small, and both INSTRUCT - unlike the real profile, whose student is
-  # the Qwen2.5-1.5B base model.
-  #
-  # That difference is on purpose and worth knowing. A base model has not been
-  # taught to stop: it never emits an end-of-turn token, so every benchmark
-  # probe and every arena question runs to its full ceiling instead of finishing
-  # in a few hundred tokens. On a laptop that turns a ten-minute flow test into
-  # an afternoon. An instruct pair stops when it is done, which is the whole
-  # point here.
+  # Stock, small, and both instruct - the same shape as the real profile, two
+  # sizes down. Instruct on both sides matters: a base model has never been
+  # taught to stop, so it emits no end-of-turn token and every probe runs to its
+  # full ceiling instead of finishing in a few hundred tokens.
   teacher: Qwen/Qwen2.5-1.5B-Instruct
   student: Qwen/Qwen2.5-0.5B-Instruct
   teacher_adapter: null
-  # Both are Qwen2.5, so the vocabulary is identical either way and this only
-  # decides which chat template renders the corpus. The teacher's is the one the
-  # real run uses.
+  # Both are Qwen2.5 and share one vocabulary, so this only picks the chat
+  # template. Note that unlike the real teacher, these are stock and pad
+  # vocab_size to 151936 - so kd.train.align_vocab has nothing to trim here.
   tokenizer: teacher
 
 hardware:
