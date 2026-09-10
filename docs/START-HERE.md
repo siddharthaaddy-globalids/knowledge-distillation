@@ -301,7 +301,7 @@ before the pod goes away:
 |---|---|
 | `final_adapter/` | **the LoRA adapter** — what you trained, tens of MB |
 | `report.html` | the readable summary |
-| `metrics.json`, `arena.json` | the numbers, accuracy and Elo included |
+| `metrics.json`, `evaluation.json`, `arena.json` | the numbers — accuracy, Elo and the head-to-head record |
 | `run.log`, `events.jsonl` | everything the terminal showed |
 | `config.resolved.yaml`, `manifest.json` | exactly what produced it |
 

@@ -29,7 +29,12 @@ UPLOAD_GROUPS = {
     "adapter": ["final_adapter/**"],
     "logs": ["run.log", "events.jsonl"],
     "report": ["report.html", "report.md"],
-    "metrics": ["metrics.json", "evaluation.json"],
+    # arena.json belongs here, not with the report: it is the answer-key score -
+    # accuracy, Elo, and the head-to-head record behind them - and it is the
+    # number anyone asks about first. metrics.json carries a summary of it, but
+    # only the summary, so a bundle without this cannot say which questions were
+    # scored or how the players actually differed.
+    "metrics": ["metrics.json", "evaluation.json", "arena.json"],
     "checkpoints": ["checkpoints/**"],
 }
 
