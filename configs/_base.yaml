@@ -114,12 +114,16 @@ training:
   save_total_limit: 2
   eval_enabled: true
   benchmark_every: 100
-  # How many tokens the periodic sample generations are allowed. These probes
-  # are the most informative thing in a training log - they are where you watch
-  # the target format appear - so they have to be long enough to reach it. A
-  # model that opens with a reasoning block needs several hundred just to get
-  # past the preamble.
-  benchmark_max_new_tokens: 512
+  # How many tokens the periodic sample generations are allowed.
+  #
+  # A ceiling, not a length. A trained student emits end-of-turn around 350
+  # tokens and stops there, so this never binds; it exists only because
+  # generate() needs some stop condition, and an untrained student has no other
+  # one - without it an early probe would run to the model's full 32k context.
+  #
+  # 2048 is deliberately far above what a correct answer costs. The price is
+  # paid only by a model that will not stop, which is itself worth seeing.
+  benchmark_max_new_tokens: 2048
 
 gkd:
   lmbda: 0.5            # on-policy fraction; raise toward 1.0 for more student rollouts
@@ -145,8 +149,9 @@ evaluation:
   # train on data that has no single correct answer to score against.
   arena_file: null
   # The answer sits after the explanation, so a small ceiling scores as "never
-  # answered" rather than as wrong.
-  arena_max_new_tokens: 512
+  # answered" rather than as wrong. Same 2048 floor as the diagnostic ceilings:
+  # high enough never to bind on a model that stops properly.
+  arena_max_new_tokens: 2048
   # Sequential Elo depends on the order matches are played. Averaging over this
   # many seeded shuffles removes that dependence; 0 plays one fixed order.
   arena_elo_rounds: 25
@@ -157,8 +162,9 @@ evaluation:
   # How much of the teacher's answer the teacher-check stage prints. Not a
   # quality setting - the check reads the first token's distribution, not the
   # text - but the text is what a person actually looks at, and an answer cut
-  # off mid-sentence tells them nothing.
-  teacher_check_max_new_tokens: 1024
+  # off mid-sentence tells them nothing. Same reasoning as the benchmark
+  # ceiling above: high enough never to bind on a model that stops properly.
+  teacher_check_max_new_tokens: 2048
 
 benchmark_prompts:
   - List three states of matter. Use a numbered list.

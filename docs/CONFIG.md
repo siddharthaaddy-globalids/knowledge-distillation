@@ -149,10 +149,10 @@ A second, different measurement, for datasets that have a **correct answer**.
 | Key | Default | Meaning |
 |---|---|---|
 | `arena_file` | `null` | Held-out `.jsonl`, one `{"messages": [...]}` per line, assistant turn ending in an `<Answer>` tag. `null` skips the stage. |
-| `arena_max_new_tokens` | `512` | The answer sits *after* the explanation, so too small a value scores as "never answered" rather than as wrong. |
+| `arena_max_new_tokens` | `2048` | The answer sits *after* the explanation, so too small a value scores as "never answered" rather than as wrong. |
 | `arena_elo_rounds` | `25` | Shuffled orderings to average Elo over. Sequential Elo depends on match order; averaging removes that, and the reported spread is the noise floor. |
 | `arena_limit` | `null` | Score only the first N questions. For proving the stage runs, not for a real score. |
-| `teacher_check_max_new_tokens` | `1024` | How much of the teacher's answer the `teacher-check` stage prints. Not a quality setting — the check reads the first token's distribution — but the text is what a person looks at, and an answer cut off mid-sentence tells them nothing. |
+| `teacher_check_max_new_tokens` | `2048` | How much of the teacher's answer the `teacher-check` stage prints. Not a quality setting — the check reads the first token's distribution — but the text is what a person looks at, and an answer cut off mid-sentence tells them nothing. |
 
 Three players are rated against each other question by question: the **base**
 student (no adapter, the control), the **distilled** student, and the

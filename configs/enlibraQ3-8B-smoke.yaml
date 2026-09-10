@@ -103,17 +103,18 @@ evaluation:
   # Elo numbers from four questions are noise; ignore them and read the fact
   # that the stage finished.
   arena_limit: 4
-  # Deliberately far below the real run's 2048, and the one place this profile
-  # does not simply inherit. A student trained for two steps does not reliably
-  # emit an end-of-turn token, so it rambles to whatever ceiling it is given -
-  # and 2048 x 4 questions x 3 models on a laptop is a long wait to learn
-  # something the code path already proved in a tenth of the time.
-  arena_max_new_tokens: 512
+  # 2048, the same floor as everything else. A two-step student does not emit
+  # an end-of-turn token, so it will run to this ceiling on every question and
+  # the arena stage here is slower than the rest of the smoke test combined.
+  # arena_limit above is what keeps that bounded - four questions, not 137.
+  arena_max_new_tokens: 2048
 
 limits:
-  # A smoke run that has not finished in half an hour has hung. Most of that
-  # allowance is the one-time download of the two stand-in models.
-  max_runtime_minutes: 30
+  # Raised from 30 when the arena ceiling went to 2048. A two-step student runs
+  # to that ceiling on every question, so four questions across three models is
+  # now the slowest part of this profile by some margin - longer than the
+  # training it is nominally smoke-testing.
+  max_runtime_minutes: 60
   max_cost_usd: null
 
 s3:
