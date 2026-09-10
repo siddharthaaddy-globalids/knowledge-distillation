@@ -200,6 +200,20 @@ clean, and `manifest.json` records the sha1 of every export the corpus was built
 from. The held-out file is reported as such and left out of `dataset.domains`;
 pointing a domain at it takes a deliberate edit.
 
+### Using what it produced
+
+A run produces a LoRA adapter, not a model. `./infer.sh` merges it into the base
+and lets you talk to the result:
+
+```bash
+./infer.sh --ask "Who are you?"      # newest adapter, merged in memory
+./infer.sh --chat                    # keep asking
+./infer.sh --out ./merged            # write a standalone checkpoint
+```
+
+Needs no config — the adapter records its own base — so it works on one pulled
+out of S3 or sent by someone else. Full guide: **[docs/INFERENCE.md](docs/INFERENCE.md)**.
+
 ## What a run leaves behind
 
 ```

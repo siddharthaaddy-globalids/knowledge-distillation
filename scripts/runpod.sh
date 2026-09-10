@@ -163,12 +163,30 @@ block() {
   sed -n "/^$1 = \[/,/^]/p" pyproject.toml | grep -o '"[^"]*"' | tr -d '"'
 }
 
+# Packages a run ON a pod never touches, filtered out of whatever pyproject.toml
+# lists. Each one is skipped for its own reason, and skipping them is not just
+# tidiness - every dependency installed here is a chance to collide with what
+# the base image already has.
+#
+#   torch    the template ships a CUDA build. Replacing it is 2.5 GB and the
+#            replacement is usually a CPU wheel, which trains ~100x slower at
+#            the GPU's hourly rate.
+#   gradio   serves `kd ui`, a browser control panel. Nothing on a pod opens it,
+#            and it drags in a large tree of web dependencies.
+#   runpod   the SDK for RENTING a pod. On a pod that has already been rented it
+#            can do nothing at all - and it requires cryptography>=48, which the
+#            Debian base image owns at 41 via apt. apt-installed packages carry
+#            no RECORD file, so pip cannot uninstall them and the whole install
+#            fails with "uninstall-no-record-file". That is a real failure this
+#            has hit, not a hypothetical.
+SKIP='^(torch|gradio|runpod)([<>=!~[]|$)'
+
 # An array, not a string: `lm-eval[ifeval]>=0.4.5` carries glob characters, and a
 # word-split string would let the shell try to expand them.
 REQS=()
 while IFS= read -r req; do
   [ -n "$req" ] && REQS+=("$req")
-done < <(block dependencies | grep -v '^torch')
+done < <(block dependencies | grep -Ev "$SKIP")
 [ "${#REQS[@]}" -gt 0 ] || die "could not read [project.dependencies] from pyproject.toml"
 
 for extra in $EXTRAS; do

@@ -280,13 +280,25 @@ def _generate(model, tokenizer, prompt, device, max_new_tokens):
     return tokenizer.decode(completion, skip_special_tokens=True).strip()
 
 
-def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log):
-    """Every question, greedily. Returns (correct flags, unanswered count)."""
+def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log,
+                show=0):
+    """Every question, greedily. Returns (correct flags, unanswered count).
+
+    `show` prints the first N completions verbatim. Worth reaching for the
+    moment a player scores 0% with everything unanswered: that is not a model
+    getting the questions wrong, it is a model whose output the <Answer> pattern
+    never matched, and the only way to tell those apart is to read what it said.
+    """
     correct, unanswered = [], 0
     for index, question in enumerate(questions, start=1):
         text = _generate(model, tokenizer, question["prompt"], device,
                          max_new_tokens)
         predicted = extract_answer(text)
+        if show and index <= show and log:
+            log.info(f"      --- {label} #{index} (gold {question['gold']}, "
+                     f"parsed {predicted}) " + "-" * 20)
+            for line in text.strip().splitlines()[:24]:
+                log.info(f"        {line}")
         if predicted is None:
             unanswered += 1
         correct.append(predicted == question["gold"])
@@ -298,7 +310,7 @@ def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log)
 
 
 def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
-         players=("base", "distilled", "teacher")):
+         players=("base", "distilled", "teacher"), show=0):
     """Load each player in turn, answer every question, return the raw results.
 
     Returns ({player: [correct?, ...]}, {player: unanswered count}).
@@ -330,7 +342,7 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
         model.eval()
         try:
             correct, missing = _answer_all(model, tokenizer, questions, device,
-                                           max_new_tokens, label, log)
+                                           max_new_tokens, label, log, show=show)
         finally:
             _free(model)
         results[label] = correct
@@ -391,6 +403,11 @@ def main(args=None):
                             help="Held-out .jsonl; default is evaluation.arena_file")
         parser.add_argument("--limit", type=int, default=None, metavar="N",
                             help="Score only the first N questions")
+        parser.add_argument("--show", type=int, default=0, metavar="N",
+                            help="Print each player's first N completions. Use "
+                                 "this when a player scores 0%% with everything "
+                                 "unanswered - it distinguishes a wrong answer "
+                                 "from an answer the <Answer> pattern missed.")
         parser.add_argument("--skip", action="append", default=[],
                             choices=["base", "distilled", "teacher"],
                             help="Leave a player out, repeatable. --skip teacher "
@@ -449,7 +466,7 @@ def main(args=None):
         config, hardware, adapter, questions,
         max_new_tokens=int(args.max_new_tokens
                            or settings.get("arena_max_new_tokens") or 512),
-        log=log, players=players)
+        log=log, players=players, show=int(getattr(args, "show", 0) or 0))
 
     payload = summarise(results, unparsed,
                         rounds=int(settings.get("arena_elo_rounds") or 25),

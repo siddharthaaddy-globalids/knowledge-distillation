@@ -414,6 +414,7 @@ Anything else is passed straight through, so `./run.sh arena --limit 20` and
 
 ## Where to read more
 
+- [INFERENCE.md](INFERENCE.md) — using the model a run produced
 - [CONFIG.md](CONFIG.md) — every setting, key by key
 - [RUNPOD.md](RUNPOD.md) — the rented-GPU path in depth, and running it by hand
 - [../README.md](../README.md) — what this project does and why
