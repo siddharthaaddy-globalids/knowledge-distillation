@@ -127,9 +127,44 @@ while [ $# -gt 0 ]; do
     --full-config)    [ $# -ge 2 ] || die "--full-config needs a path after it"
                       FULL_CONFIG="$2"; shift 2 ;;
     --full-config=*)  FULL_CONFIG="${1#*=}"; shift ;;
+    # A bare path to a YAML file, with no --config in front of it. This is what
+    # people actually type - `./run.sh configs/mine.yaml` - and refusing it in
+    # favour of `kd: error: invalid choice` teaches nothing. It means exactly
+    # what --config means; the banner below says what will run.
+    *.yaml|*.yml)     CONFIG="$1"; shift ;;
     *) break ;;
   esac
 done
+
+# The same courtesy one position later: `./run.sh train configs/mine.yaml`.
+# kd's own parser takes --config but not a loose positional, so without this the
+# subcommand form fails where the leading form now works - and the two reading
+# identically is the whole point.
+#
+# Safe to do blindly because nothing here takes a positional argument that could
+# end in .yaml: the subcommands take none, and `ask` takes a question.
+REST=()
+prev=""
+for arg in "$@"; do
+  keep=1
+  case "$arg" in
+    *.yaml|*.yml)
+      # Only when it is standing on its own. A path that FOLLOWS an option is
+      # that option's value - `--config X`, `--set dataset.source=X` - and
+      # taking it would leave the option dangling, breaking the very form this
+      # is meant to complement. Anything after a `-...` word is left alone.
+      #
+      # And only when the file exists, so a question that happens to end in
+      # ".yaml" stays a question.
+      if [ "${prev#-}" = "$prev" ] && [ -f "$arg" ]; then
+        CONFIG="$arg"; keep=0
+      fi
+      ;;
+  esac
+  [ "$keep" = "1" ] && REST+=("$arg")
+  prev="$arg"
+done
+set -- ${REST[@]+"${REST[@]}"}
 
 # Checked now rather than by the first command that reads it, so a typo costs a
 # second here instead of appearing after an install.
