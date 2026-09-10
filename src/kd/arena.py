@@ -135,12 +135,25 @@ def load_questions(path):
             line = line.strip()
             if not line:
                 continue
-            turns = json.loads(line)["messages"]
+            record = json.loads(line)
+            turns = record["messages"]
             gold = extract_answer(turns[-1]["content"])
             if not gold:
                 skipped += 1
                 continue
-            questions.append({"prompt": turns[-2]["content"], "gold": gold})
+            questions.append({
+                "prompt": turns[-2]["content"],
+                # The curriculum's own answer, in full - the explanation it
+                # teaches, not just the letter. Kept so a transcript can show
+                # what a model SHOULD have said next to what it did say.
+                "reference": turns[-1]["content"],
+                "gold": gold,
+                # Reasoning depth, carried through by
+                # scripts/prepare_curriculum.py. None for a corpus prepared
+                # before that, which the hop breakdown then simply omits.
+                "hop": record.get("hop_count"),
+                "item_id": record.get("item_id"),
+            })
     return questions, skipped
 
 
@@ -381,46 +394,207 @@ def render(payload):
     return "\n".join(lines)
 
 
+def split_prompt(prompt):
+    """(question, options) from the curriculum's tagged prompt.
+
+    Both are already inside `prompt`; pulling them apart is for whoever reads
+    the transcript, who wants the options as a list rather than as a substring
+    they have to find. Returns the whole prompt as the question and no options
+    when the tags are absent, because a transcript that omits a field is worse
+    than one that repeats it.
+    """
+    question = re.search(r"<Question>\s*(.*?)\s*</Question>", prompt, re.S)
+    options = re.search(r"<Options>\s*(.*?)\s*</Options>", prompt, re.S)
+    return (question.group(1) if question else prompt,
+            [line.strip() for line in options.group(1).splitlines() if line.strip()]
+            if options else [])
+
+
 def write_transcript(path, questions, predictions, formats, completions):
-    """Every question and every word each player said about it, as JSONL.
+    """Everything, per question: what was asked, what each player said, verbatim.
 
     One line per QUESTION rather than per player, so the three answers to the
     same question sit side by side and "why did they differ" is a matter of
     reading one record instead of joining three files.
 
-    Nothing is truncated. The whole prompt, the whole completion - which for a
-    model that reasons out loud includes its <think> block, since that is simply
-    part of what it generated. arena.json keeps the numbers and a bounded sample;
-    this keeps the evidence, and the evidence is what settles an argument about
-    whether an answer was wrong or merely unparsed.
+    NOTHING IS TRUNCATED OR OMITTED. The whole prompt, the options as a list,
+    the reasoning depth, the curriculum's own reference answer, and every word
+    each player generated - which for a model that reasons out loud includes its
+    <think> block, since that is simply part of what it produced.
 
-    JSONL rather than one JSON object because it can be read a line at a time,
-    grepped, and appended to - and because 137 questions times three players
-    times a few thousand characters is a file you want to stream, not load.
+    arena.json keeps the numbers; this keeps the evidence. The numbers say what
+    happened, and only the evidence says why - which is worth having on disk
+    before the machine that produced it is destroyed.
+
+    JSONL because it can be read a line at a time, grepped, and appended to -
+    and because 137 questions times three players times a few thousand
+    characters is a file to stream rather than load.
     """
     names = sorted(predictions)
     with open(path, "w", encoding="utf-8") as handle:
         for index, question in enumerate(questions):
+            text, options = split_prompt(question["prompt"])
             record = {
                 "question": index + 1,
-                "gold": question["gold"],
+                "item_id": question.get("item_id"),
+                "hop_count": question.get("hop"),
+                "asked": text,
+                "options": options,
                 "prompt": question["prompt"],
-                "players": {
-                    name: {
-                        "answer": predictions[name][index],
-                        # How it was written - "tagged" is the curriculum's own
-                        # shape, anything else is the model answering in spite of
-                        # the format rather than in it.
-                        "how": (formats.get(name) or [None] * len(questions))[index],
-                        "correct": predictions[name][index] == question["gold"],
-                        "completion": (completions.get(name)
-                                       or [""] * len(questions))[index],
-                    }
-                    for name in names
-                },
+                "gold": question["gold"],
+                "reference_answer": question.get("reference"),
+                "players": {},
             }
+            for name in names:
+                completion = (completions.get(name) or [""] * len(questions))[index]
+                record["players"][name] = {
+                    "answer": predictions[name][index],
+                    # How it was written - "tagged" is the curriculum's own
+                    # shape, anything else is the model answering in spite of
+                    # the format rather than in it.
+                    "how": (formats.get(name) or [None] * len(questions))[index],
+                    "correct": predictions[name][index] == question["gold"],
+                    "completion": completion,
+                    "completion_chars": len(completion),
+                }
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     return path
+
+
+# --------------------------------------------------------------------------- #
+# Semantic similarity
+# --------------------------------------------------------------------------- #
+# The model that turns a completion into a vector. Small (~90 MB), fast on CPU,
+# and trained for exactly this: cosine between two of its embeddings is a
+# similarity anyone would recognise as one.
+#
+# Deliberately NOT one of the models being scored. Embedding with a player would
+# measure similarity in that player's own representation space, which flatters
+# it and makes the three columns incomparable.
+SIMILARITY_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+MISSING_SENTENCE_TRANSFORMERS = (
+    "sentence-transformers is needed for the similarity table and is not "
+    "installed.\n"
+    "  uv sync --extra eval        (or: pip install sentence-transformers)\n"
+    "It is optional: every other number the arena reports is computed without "
+    "it, and the table is simply omitted when it is absent.")
+
+
+def embed(texts, model_name=SIMILARITY_MODEL, log=None):
+    """Unit-normalised embeddings for `texts`, or None if the library is absent.
+
+    Normalised at encode time so a cosine is a dot product, which is what makes
+    the pairwise loop below trivial and exact rather than approximately right.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        if log:
+            for line in MISSING_SENTENCE_TRANSFORMERS.splitlines():
+                log.info(f"      !! {line}")
+        return None
+
+    if log:
+        log.info(f"      embedding {len(texts)} completions with {model_name}")
+    model = SentenceTransformer(model_name)
+    return model.encode(list(texts), normalize_embeddings=True,
+                        show_progress_bar=False, convert_to_numpy=True)
+
+
+def similarity(completions, questions, model_name=SIMILARITY_MODEL, log=None):
+    """Cosine similarity between every pair of players, overall and per hop.
+
+    Answers a question the answer key cannot: two models can pick the same
+    letter for entirely different reasons, or different letters by nearly
+    identical reasoning. Correctness sees neither. This measures how alike the
+    EXPLANATIONS are, which for a distilled student and its teacher is close to
+    the thing being bought.
+
+    Broken down by hop count because reasoning depth is the axis the curriculum
+    is built on. A student that tracks its teacher at one hop and diverges at
+    four has a specific, findable weakness; one average over all depths hides
+    exactly that.
+
+    Returns None when sentence-transformers is absent - the arena's other
+    numbers do not depend on it, so its absence omits a table rather than
+    failing a stage.
+    """
+    names = sorted(completions)
+    if len(names) < 2:
+        return None
+
+    total = len(questions)
+    # One encode call for everything, then slice. Loading the model costs more
+    # than embedding a few hundred short texts, so batching across players is
+    # most of the saving available here.
+    flat = [text for name in names for text in completions[name]]
+    vectors = embed(flat, model_name=model_name, log=log)
+    if vectors is None:
+        return None
+
+    per_player = {name: vectors[i * total:(i + 1) * total]
+                  for i, name in enumerate(names)}
+
+    def mean_cosine(a, b, indices):
+        if not indices:
+            return None
+        # Both sides are unit vectors, so the dot product IS the cosine.
+        # Clamped because floating point can put it a hair outside [-1, 1], and
+        # a similarity of 1.0000000002 reads as a bug.
+        values = [max(-1.0, min(1.0, float(per_player[a][i] @ per_player[b][i])))
+                  for i in indices]
+        return sum(values) / len(values)
+
+    hops = sorted({q.get("hop") for q in questions if q.get("hop") is not None})
+    pairs = {}
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            key = f"{a} vs {b}"
+            entry = {"overall": mean_cosine(a, b, list(range(total))),
+                     "by_hop": {}}
+            for hop in hops:
+                indices = [i for i, q in enumerate(questions) if q.get("hop") == hop]
+                entry["by_hop"][str(hop)] = {
+                    "n": len(indices), "cosine": mean_cosine(a, b, indices)}
+            pairs[key] = entry
+
+    return {"model": model_name, "pairs": pairs, "hops": [str(h) for h in hops]}
+
+
+def render_similarity(sim):
+    """The hop-wise similarity table, for a log or a terminal."""
+    if not sim or not sim.get("pairs"):
+        return ""
+    pairs = sorted(sim["pairs"])
+    width = max(len(p) for p in pairs)
+    hops = sim.get("hops") or []
+
+    lines = ["", f"  explanation similarity (cosine, 0-1) - {sim['model']}",
+             "", "  " + "pair".ljust(width + 2)
+             + "".join(f"hop {h}".rjust(9) for h in hops) + "overall".rjust(10)
+             + "  n"]
+    lines.append("  " + "-" * (width + 2) + "-" * (9 * len(hops)) + "-" * 13)
+    for pair in pairs:
+        entry = sim["pairs"][pair]
+        cells = ""
+        for hop in hops:
+            value = (entry["by_hop"].get(hop) or {}).get("cosine")
+            cells += (f"{value:.3f}" if value is not None else "-").rjust(9)
+        overall = entry.get("overall")
+        cells += (f"{overall:.3f}" if overall is not None else "-").rjust(10)
+        total = sum((entry["by_hop"].get(h) or {}).get("n", 0) for h in hops)
+        lines.append("  " + pair.ljust(width + 2) + cells + f"  {total}")
+
+    lines += [
+        "",
+        "  How alike the EXPLANATIONS are, not whether they agree on a letter.",
+        "  Two models can pick the same option for different reasons, or differ",
+        "  on the letter while reasoning almost identically - the answer key",
+        "  sees neither. Read `teacher vs distilled` against `teacher vs base`:",
+        "  the rise between them is what distillation moved.",
+    ]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -543,8 +717,13 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    from . import paths
+
     device, dtype = hardware["device"], hardware["dtype"]
-    base_id = config["models"]["student"]
+    # The adapter's own record wins over the config. Both the "base" and
+    # "distilled" players load these weights, so getting it wrong would compare
+    # the adapter against a control it was never trained on.
+    base_id = paths.base_for_adapter(adapter, config["models"]["student"], log=log)
 
     # From the adapter directory, because kd.train saves it there beside the
     # weights. The Hub copy is usually the same file and occasionally is not - a
@@ -556,6 +735,7 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if log:
+        log.info(f"      base     : {base_id}")
         log.info(f"      tokenizer: {source}")
 
     predictions, formats, unanswered, completions = {}, {}, {}, {}
@@ -584,10 +764,15 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
             # The same trim training applied. Reproduced from the two configs
             # rather than carried in the adapter, which would mean shipping a
             # gigabyte of untrained embedding with every run.
-            from . import paths
-            paths.fit_vocab(model, paths.vocab_target(
-                base_id, config["models"]["teacher"], len(tokenizer)),
-                label="student")
+            # What the adapter recorded, first: that travels with it, so an
+            # arena on another machine needs no teacher to load the student.
+            # Falling back to deriving it from the two configs, which needs the
+            # teacher present and is why the recorded value exists.
+            target = paths.adapter_meta(adapter).get("vocab_size")
+            if not target:
+                target = paths.vocab_target(
+                    base_id, config["models"]["teacher"], len(tokenizer))
+            paths.fit_vocab(model, target, label="student")
             return PeftModel.from_pretrained(
                 model, str(adapter)).merge_and_unload().to(device)
         run("distilled", build_distilled)
@@ -622,10 +807,12 @@ def main(args=None):
         parser.add_argument("-c", "--config", default=None, metavar="PATH",
                             help="Profile the adapter was trained from")
         parser.add_argument("--adapter", default=None, metavar="DIR",
-                            help="Adapter directory; default is the newest under "
-                                 "project.runs_dir")
+                            help="Adapter directory, or an s3:// URI which is "
+                                 "fetched into the shared cache. Default: the "
+                                 "newest under project.runs_dir.")
         parser.add_argument("--file", default=None, metavar="PATH",
-                            help="Held-out .jsonl; default is evaluation.arena_file")
+                            help="Held-out .jsonl, local or s3://. Default: "
+                                 "evaluation.arena_file.")
         parser.add_argument("--limit", type=int, default=None, metavar="N",
                             help="Score only the first N questions")
         parser.add_argument("--show", type=int, default=0, metavar="N",
@@ -668,7 +855,19 @@ def main(args=None):
                   "evaluation.arena_file in the config")
         return 1
 
-    adapter = args.adapter
+    # s3:// anywhere a path is taken. The adapter a run uploaded is the obvious
+    # thing to score from another machine, and making the caller download it
+    # first is a step with no judgement in it.
+    from . import paths
+
+    try:
+        adapter = (paths.localise(args.adapter, config, log=log, label="adapter")
+                   if args.adapter else None)
+        path = paths.localise(path, config, log=log, label="held-out set")
+    except RuntimeError as exc:
+        log.error(f"xx  {exc}")
+        return 1
+
     if not adapter and "distilled" not in (args.skip or []):
         found = discover_adapters(config["project"].get("runs_dir") or "./runs")
         adapter = found[0] if found else None
@@ -678,15 +877,27 @@ def main(args=None):
         log.error(f"xx  {adapter} has no adapter_config.json")
         return 1
 
+    players = tuple(p for p in ("base", "distilled", "teacher")
+                    if p not in (args.skip or []))
+
+    # The teacher is the only input that may live in object storage, and the
+    # only one worth several gigabytes - so it is fetched when it is a player
+    # and left alone when `--skip teacher` means it will never be loaded. Which
+    # is why `players` is decided before this, not after.
+    if "teacher" in players and paths.is_remote(config["models"].get("teacher")):
+        try:
+            config["models"]["teacher"] = paths.localise(
+                config["models"]["teacher"], config, log=log, label="teacher")
+        except RuntimeError as exc:
+            log.error(f"xx  {exc}")
+            return 1
+
     questions, skipped = load_questions(path)
     limit = args.limit or settings.get("arena_limit")
     if limit:
         questions = questions[:int(limit)]
     log.info(f"==> {len(questions)} questions from {path}"
              + (f" ({skipped} ungradeable rows skipped)" if skipped else ""))
-
-    players = tuple(p for p in ("base", "distilled", "teacher")
-                    if p not in (args.skip or []))
     predictions, formats, unanswered, completions = play(
         config, hardware, adapter, questions,
         max_new_tokens=int(args.max_new_tokens
@@ -697,6 +908,7 @@ def main(args=None):
                         formats=formats, unanswered=unanswered,
                         rounds=int(settings.get("arena_elo_rounds") or 25),
                         seed=int(config["project"]["seed"]))
+    payload["similarity"] = similarity(completions, questions, log=log)
     payload["arena_file"] = str(path)
     payload["adapter"] = str(adapter) if adapter else None
 

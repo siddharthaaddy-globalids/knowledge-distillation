@@ -138,6 +138,94 @@ def vocab_target(student_id, teacher_id, tokenizer_length):
     return target
 
 
+def adapter_base(adapter_dir):
+    """The base model an adapter was trained against, from its own config.
+
+    PEFT writes `base_model_name_or_path` when it saves, so an adapter is
+    self-describing - which is what lets it be scored or merged on a machine
+    that knows nothing about the run that produced it.
+
+    Returns None when the file is absent or says nothing, because not knowing is
+    a reason to fall back rather than to stop.
+    """
+    import json
+
+    path = os.path.join(str(adapter_dir), "adapter_config.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle).get("base_model_name_or_path") or None
+    except Exception:
+        return None
+
+
+ADAPTER_META = "kd-meta.json"
+
+
+def write_adapter_meta(adapter_dir, **facts):
+    """Record what a later consumer needs and cannot otherwise work out.
+
+    An adapter already says which base it was trained on - PEFT writes that. It
+    does NOT say what output width that base was trimmed to, and that number is
+    needed to load it at all.
+
+    Deriving it needs the teacher's config.json, which on another machine means
+    fetching a checkpoint from object storage to read a few hundred bytes - and
+    with `--skip teacher` means fetching a model the run will never load. So it
+    is written here, once, beside the weights.
+
+    The point is that the adapter becomes portable: hand the directory to a
+    machine that has never seen this repository's config and everything needed
+    to load it correctly travels with it.
+    """
+    import json
+
+    path = os.path.join(str(adapter_dir), ADAPTER_META)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(facts, handle, indent=2)
+    return path
+
+
+def adapter_meta(adapter_dir):
+    """What kd.train recorded beside the weights, or {} if it recorded nothing."""
+    import json
+
+    path = os.path.join(str(adapter_dir or ""), ADAPTER_META)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle) or {}
+    except Exception:
+        return {}
+
+
+def base_for_adapter(adapter_dir, configured, log=None):
+    """Which base to load an adapter onto: what it records, else the config.
+
+    The adapter's own record wins. A config names the student of the run being
+    configured; an adapter names the student it was actually built against, and
+    when those differ it is the adapter that is right about itself.
+
+    Worth being careful about because the failure is silent. `Qwen2.5-1.5B` and
+    `Qwen2.5-1.5B-Instruct` have identical shapes, so PEFT loads an adapter onto
+    the wrong one of them without complaint and every number afterwards is
+    quietly measured against weights the adapter never saw.
+    """
+    recorded = adapter_base(adapter_dir) if adapter_dir else None
+    if not recorded:
+        return configured
+    if configured and recorded != configured:
+        message = (f"the adapter was trained on {recorded}, but the config names "
+                   f"{configured}. Using the adapter's own record.")
+        if log:
+            log.info(f"      !! {message}")
+        else:
+            print(f" !! {message}")
+    return recorded
+
+
 def fit_vocab(model, target, label="model"):
     """Trim `model`'s output layer to `target`, if it is not already there.
 
@@ -349,6 +437,53 @@ def ensure_peft_adapter(config, log=None):
     if log:
         log.info(f"      teacher lora: converted to {destination}")
     return {"source": source, "local": destination, "converted": True}
+
+
+def localise(where, config=None, log=None, label="input"):
+    """An s3:// URI fetched into the cache; anything else returned unchanged.
+
+    The one-shot counterpart to `resolve_inputs`. That one walks a whole config
+    and rewrites it, which is right for a pipeline run; this takes a single value
+    someone typed on a command line - an adapter, a held-out file - and hands
+    back a local path.
+
+    Both use the same cache, keyed by bucket and key, so an adapter a run already
+    fetched is not fetched twice and one pulled down here is available to the
+    next run without asking.
+
+    Local paths and Hub ids pass through untouched, so callers can hand
+    everything through this without first asking what kind of thing it is.
+    """
+    if not is_remote(where):
+        return where
+
+    from .remote import s3
+
+    if config is None:
+        # _base.yaml alone, for s3.cache_dir / endpoint_url / region. Which
+        # bucket to read is in the URI; nothing else about a config bears on it.
+        from .config import load_config
+        config = load_config(None, use_env=False)
+
+    local = cache_path(config, where)
+    if is_cached(local):
+        if log:
+            log.info(f"      {label}: cached  {where}")
+        return local
+    if log:
+        log.info(f"      {label}: fetching {where}")
+    try:
+        s3.download(config, where, local, log=log)
+    except Exception as exc:  # noqa: BLE001 - botocore raises many shapes
+        detail = str(exc)
+        if "AccessDenied" in detail or "403" in detail:
+            reason = ("access denied. The identity needs s3:ListBucket on the "
+                      "bucket and s3:GetObject on this prefix - a permissions "
+                      "problem, not a key problem.")
+        else:
+            reason = detail.splitlines()[0]
+        raise RuntimeError(f"cannot read {where}\n    {reason}") from exc
+    return local
 
 
 def remote_values(config):

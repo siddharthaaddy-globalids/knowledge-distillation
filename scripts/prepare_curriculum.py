@@ -118,7 +118,17 @@ def mcq_exchange(row, system=None):
         turns.append({"role": "system", "content": system})
     turns.append({"role": "user", "content": question})
     turns.append({"role": "assistant", "content": completion})
-    return {"messages": turns}, source
+
+    record = {"messages": turns}
+    # Carried through, not dropped. The trainer reads only `messages` and
+    # kd.data selects that column away before training, so this costs nothing
+    # there - but the held-out set is scored, and a score broken down by
+    # reasoning depth is a different and more useful thing than one average.
+    # Recovering it later would mean re-joining against the export by item_id.
+    for key in ("hop_count", "item_id", "split"):
+        if row.get(key) is not None:
+            record[key] = row[key]
+    return record, source
 
 
 def identity_exchange(row, system=None):

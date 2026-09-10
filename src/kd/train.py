@@ -437,6 +437,16 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
     # Everything that loads this adapter calls paths.fit_vocab first instead,
     # which reproduces the same truncation from the two configs.
     student_model.save_pretrained(run.adapter_dir, save_embedding_layers=False)
+    # Everything a later consumer needs that the adapter does not already say.
+    # vocab_size above all: without it, loading this adapter on another machine
+    # means fetching the teacher just to read its config.json.
+    paths.write_adapter_meta(
+        run.adapter_dir,
+        vocab_size=int(student_model.config.vocab_size),
+        base=student_id,
+        teacher=teacher_id,
+        tokenizer=tokenizer_source,
+    )
     tokenizer.save_pretrained(run.adapter_dir)
     print(f"\n[Phase 7] Complete. Adapter + tokenizer saved to: {run.adapter_dir}\n")
     summary["adapter"] = run.adapter_dir

@@ -395,6 +395,10 @@ def stage_arena(ctx):
         formats=formats, unanswered=unanswered,
         rounds=int(settings.get("arena_elo_rounds") or 25),
         seed=int(ctx.config["project"]["seed"]))
+    # Optional, and reported as absent rather than failing: the similarity table
+    # needs sentence-transformers, which is in the `eval` extra a pod install
+    # deliberately skips.
+    payload["similarity"] = arena.similarity(completions, questions, log=ctx.log)
     payload["arena_file"] = str(path)
     payload["adapter"] = str(adapter)
 

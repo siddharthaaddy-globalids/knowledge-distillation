@@ -26,6 +26,10 @@ eval = [
     # scored as wrong - which exact-match and n-gram metrics do.
     "bert-score>=0.3.13",
     "rouge-score>=0.1.2",
+    # Cosine similarity between model explanations, for the arena's hop-wise
+    # table. ~90 MB of model, and optional: the arena omits that one table when
+    # it is absent and reports everything else unchanged.
+    "sentence-transformers>=3.0",
 ]
 
 # Remote execution and object storage. Entirely optional: nothing in the core pipeline

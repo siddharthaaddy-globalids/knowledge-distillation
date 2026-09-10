@@ -63,47 +63,18 @@ class _Log:
 
 
 def localise(where, label):
-    """An s3:// URI fetched into the shared cache; anything else returned as-is.
+    """An s3:// URI fetched into the shared cache; anything else unchanged.
 
-    The same cache the pipeline uses (`s3.cache_dir` from configs/_base.yaml,
-    ~/.cache/kd/s3 by default), keyed by bucket and key - so an adapter a run
-    already fetched is not fetched twice, and one pulled down here is available
-    to the next run without asking.
-
-    Credentials come from the environment, never from an argument, exactly as
-    they do everywhere else in this project.
+    Thin wrapper over kd.paths.localise so this script and `kd arena` cannot
+    disagree about where a fetched adapter lands - they share the cache, so an
+    adapter one of them pulled down is already there for the other.
     """
     from kd import paths
 
-    if not paths.is_remote(where):
-        return where
-
-    from kd.config import load_config
-    from kd.remote import s3
-
-    # _base.yaml alone, for s3.cache_dir / endpoint_url / region. No profile is
-    # involved: which bucket to read is in the URI, and nothing else about a
-    # training config bears on fetching a directory.
-    config = load_config(None, use_env=False)
-    local = paths.cache_path(config, where)
-    if paths.is_cached(local):
-        log(f"==> {label}: cached  {where}")
-        return local
-    log(f"==> {label}: fetching {where}")
     try:
-        s3.download(config, where, local, log=_Log())
-    except Exception as exc:  # noqa: BLE001 - botocore raises many shapes
-        # A wrong prefix and a missing permission are the two ways this fails,
-        # and a traceback distinguishes neither. Say which one it looks like.
-        detail = str(exc)
-        if "AccessDenied" in detail or "403" in detail:
-            reason = ("Access denied. The identity needs s3:ListBucket on the "
-                      "bucket and s3:GetObject on this prefix - a permissions "
-                      "problem, not a key problem.")
-        else:
-            reason = detail.splitlines()[0]
-        raise SystemExit(f"xx  cannot read {where}\n    {reason}") from exc
-    return local
+        return paths.localise(where, log=_Log(), label=label)
+    except RuntimeError as exc:
+        raise SystemExit(f"xx  {exc}") from exc
 
 
 def adapter_base(adapter_dir):
