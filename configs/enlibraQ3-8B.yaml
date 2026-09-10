@@ -8,22 +8,20 @@
 #  configs/enlibraQ3-8B-smoke.yaml, which swaps in stand-in models and changes
 #  nothing else.
 #
-#  BEFORE THE FIRST RUN
-#  --------------------
-#  The corpus is prepared once, from the curriculum exports, into chat JSONL:
+#  THE CORPUS IS COMMITTED
+#  -----------------------
+#  data/enlibra-curriculum/ is in the repository, so a pod gets it from
+#  `git clone` with no download and no credentials. The only thing this profile
+#  fetches from object storage is the teacher.
+#
+#  Regenerate it when the curriculum exports change. The converter is
+#  deterministic, so an unchanged export leaves `git status` clean:
 #
 #      python scripts/prepare_curriculum.py --out data/enlibra-curriculum \
-#          curriculum_sft.json curriculum_sft_stage_2.json curriculum_rl.json
+#          curriculum_verified.json curriculum_sft.json
 #
-#  That directory is what `dataset.source` names. It is not in the repository -
-#  it is generated - so on a pod either re-run the script against exports you
-#  copied up, or set dataset.source to an s3:// URI holding the prepared files
-#  and let preflight fetch it.
-#
-#  Requires the loader change that added `data_files` to a domain spec: without
-#  it, `load_dataset` cannot address one file inside a local corpus directory,
-#  and the three curriculum stages collapse into a single undifferentiated
-#  domain with no quota of their own.
+#  curriculum_verified.json is the superset and supplies sft, rl and eval;
+#  curriculum_sft.json is passed only for the persona rows it does not carry.
 # ===========================================================================
 extends: _base.yaml
 
@@ -82,23 +80,28 @@ dataset:
   # and `git status` stays clean:
   #
   #     python scripts/prepare_curriculum.py --out data/enlibra-curriculum \
-  #         curriculum_sft.json curriculum_sft_stage_2.json curriculum_rl.json
+  #         curriculum_verified.json curriculum_sft.json
   #
   # data/enlibra-curriculum/manifest.json records the sha1 of each export it was
   # built from, which is what lets a checkout say which exports it holds.
   source: ./data/enlibra-curriculum
 
-  # Measured over the prepared corpus with the Qwen3 tokenizer:
-  #   prompt        median 271, p99 383, max 424
-  #   prompt+answer median 601, p99 756, max 786
+  # NO INPUT LIMIT, deliberately. These are the budgets kd.data filters every
+  # sample against, and a sample over either is dropped SILENTLY - so set high
+  # enough that nothing is ever dropped, and the corpus that trains is the whole
+  # corpus.
   #
-  # These are the budgets kd.data filters every sample against, and a sample
-  # over either is dropped SILENTLY. The base profile's 128/384 would drop all
-  # 952 of them and fail with "produced zero samples". The headroom over the
-  # observed maximum is deliberate: the prompt test is `>=`, so a budget sitting
-  # exactly on the longest sample discards it.
-  max_prompt_tokens: 512
-  max_total_tokens: 832
+  # Measured over the prepared corpus with the Qwen3 tokenizer, for context:
+  #   prompt        median 271, p99 383, max 424   (eval rows reach 458)
+  #   prompt+answer median 601, p99 756, max 786   (eval rows reach 869)
+  #
+  # 4096 is roughly five times the longest thing in the corpus, so the filter is
+  # effectively off. This costs almost nothing at training time: max_total_tokens
+  # also becomes the collator's max_length, which is a TRUNCATION ceiling, not an
+  # allocation - real batches pad to the longest sample in the batch, which is
+  # still ~800. Raising the ceiling does not raise the memory bill.
+  max_prompt_tokens: 4096
+  max_total_tokens: 4096
 
   validation_size: 48
 
@@ -195,10 +198,15 @@ gkd:
   lmbda: 0.0
   beta: 0.5
   temperature: 0.7
-  # Unused while lmbda is 0.0. Sized for the corpus rather than left at the base
-  # default of 40, so that raising lmbda produces on-policy samples of a
-  # plausible length instead of 40-token stubs. Explanations run to ~306 tokens.
-  max_new_tokens: 320
+  # Output ceiling: 2048 tokens.
+  #
+  # Unused while lmbda is 0.0 - no generation happens at all - so this costs
+  # nothing today. It matters the moment lmbda is raised, and it is generation
+  # length that dominates GKD's cost: each on-policy sample is this many
+  # SEQUENTIAL forward passes against one for a supervised batch. Explanations
+  # run to ~306 tokens, so 2048 is a generous ceiling the model should reach EOS
+  # well inside, not a target.
+  max_new_tokens: 2048
   seq_kd: false
 
 evaluation:
@@ -221,7 +229,12 @@ evaluation:
   # a reasoning chain a step longer than the student has ever been shown. That
   # is a generalisation test, not a broken run.
   arena_file: ./data/enlibra-curriculum/eval-1to5hop.jsonl
-  arena_max_new_tokens: 512
+  # 2048. The answer sits AFTER a ~300-token explanation, so a tight ceiling
+  # scores a truncated response as "never answered" rather than as wrong - which
+  # understates the model for a reason that has nothing to do with the model.
+  # Generation stops at EOS, so a model that answers properly never pays for the
+  # headroom; only one that rambles does, and that is worth seeing.
+  arena_max_new_tokens: 2048
   arena_elo_rounds: 25
 
 # Generated at benchmark_every steps to make quality drift visible during the

@@ -37,10 +37,31 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import load_config, resolve_device
 
-PROBES = [
-    "How does compound interest work? Explain briefly.",
-    "What is the difference between a Roth IRA and a traditional IRA?",
+# Last-resort probes, used only when the config carries no benchmark_prompts -
+# `kd check-teacher --teacher <id>` with no profile, for instance. A real run
+# should never see these: the questions a teacher is probed with want to be the
+# questions it will be distilled on, or the check reports on a capability
+# nothing downstream depends on.
+FALLBACK_PROBES = [
+    "Explain how a rainbow forms, briefly.",
+    "What is the difference between mass and weight?",
 ]
+
+
+def probes_for(config, limit=2):
+    """The questions to probe this teacher with.
+
+    From `benchmark_prompts` in the config, which is the same list kd.train uses
+    for its pre-flight and its periodic quality samples. Sharing the source is
+    the point: a teacher checked on finance questions and then distilled on
+    astrophysics has been checked for the wrong thing, and the report says
+    "healthy" either way.
+
+    Capped, because each probe is a full autoregressive generation and this
+    stage runs before every training run.
+    """
+    prompts = [str(p) for p in (config.get("benchmark_prompts") or []) if str(p).strip()]
+    return (prompts or FALLBACK_PROBES)[:limit]
 
 DTYPES = {
     "auto": None,
@@ -332,8 +353,11 @@ def main(args=None):
     # 3. Behaviour. A healthy instruct model puts real mass on a few plausible
     #    tokens. A broken one is close to uniform over the whole vocabulary, which
     #    is what shows up downstream as multilingual token salad.
+    probes = probes_for(config)
     print("\n[4/4] Generation")
-    for probe in PROBES:
+    print(f"  probes from {'benchmark_prompts in ' + str(config['_meta'].get('source'))
+                           if (config.get('benchmark_prompts') or []) else 'built-in fallbacks'}")
+    for probe in probes:
         top_p, entropy, uniform = token_confidence(model, tokenizer, probe, device)
         text = tokenizer.apply_chat_template(
             [{"role": "user", "content": probe}], tokenize=False, add_generation_prompt=True

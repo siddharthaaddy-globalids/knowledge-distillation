@@ -105,9 +105,12 @@ evaluation:
   # Elo numbers from four questions are noise; ignore them and read the fact
   # that the stage finished.
   arena_limit: 4
-  # Shorter than the real run's 512. Truncating an explanation costs an
-  # "unanswered" here, which is fine when the point is that the code path runs.
-  arena_max_new_tokens: 320
+  # Deliberately far below the real run's 2048, and the one place this profile
+  # does not simply inherit. A student trained for two steps does not reliably
+  # emit an end-of-turn token, so it rambles to whatever ceiling it is given -
+  # and 2048 x 4 questions x 3 models on a laptop is a long wait to learn
+  # something the code path already proved in a tenth of the time.
+  arena_max_new_tokens: 512
 
 limits:
   # A smoke run that has not finished in half an hour has hung. Most of that

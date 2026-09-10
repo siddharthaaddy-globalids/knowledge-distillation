@@ -131,9 +131,12 @@ Merged with `transformers`, so the checkpoint uses this architecture's canonical
 tensor names and loads without key remapping.
 """
 
-PROBES = [
-    "How does compound interest work? Explain briefly.",
-    "What is the difference between a Roth IRA and a traditional IRA?",
+# Used only when no config is available to say what this model is for. See
+# kd.teacher.probes_for: the questions a model is verified with should be the
+# questions it was trained on, or "healthy" means healthy at something else.
+FALLBACK_PROBES = [
+    "Explain how a rainbow forms, briefly.",
+    "What is the difference between mass and weight?",
 ]
 
 
@@ -170,7 +173,7 @@ def parse_args():
 
 def load_provenance(config_path, adapter_dir):
     """Gather what the model cards should say, from the adapter and training config."""
-    info = {"teacher": "unknown", "dataset": "unknown", "extra": []}
+    info = {"teacher": "unknown", "dataset": "unknown", "extra": [], "probes": None}
     cfg_file = pathlib.Path(config_path)
     if cfg_file.exists():
         try:
@@ -180,6 +183,12 @@ def load_provenance(config_path, adapter_dir):
             if cfg["models"].get("teacher_adapter"):
                 info["teacher"] += f" + {cfg['models']['teacher_adapter']}"
             info["dataset"] = cfg["dataset"]["source"]
+            # The questions the merged model is verified with, taken from the
+            # profile that trained it. Publishing is refused when a probe comes
+            # back incoherent, so probing a space model with finance questions
+            # would be refusing on the strength of the wrong evidence.
+            from .teacher import probes_for
+            info["probes"] = probes_for(cfg)
             t, g = cfg.get("training", {}), cfg.get("gkd", {})
             info["extra"] = [
                 ("Steps", t.get("max_steps")),
@@ -200,8 +209,12 @@ def load_provenance(config_path, adapter_dir):
     return info
 
 
-def verify(model_dir, tokenizer):
-    """Load the merged model with plain transformers and confirm it emits language."""
+def verify(model_dir, tokenizer, probes=None):
+    """Load the merged model with plain transformers and confirm it emits language.
+
+    `probes` comes from the config's benchmark_prompts when there is one, so the
+    merged model is checked on the domain it was actually trained for.
+    """
     import math
     model, load_info = AutoModelForCausalLM.from_pretrained(
         model_dir, dtype=torch.float32, low_cpu_mem_usage=True, output_loading_info=True
@@ -214,7 +227,7 @@ def verify(model_dir, tokenizer):
     if missing:
         problems.append(f"{len(missing)} weight(s) did not load: {missing[:4]}")
 
-    for probe in PROBES:
+    for probe in (probes or FALLBACK_PROBES):
         text = tokenizer.apply_chat_template(
             [{"role": "user", "content": probe}], tokenize=False, add_generation_prompt=True)
         ids = tokenizer(text, return_tensors="pt")
@@ -330,7 +343,7 @@ def main(args=None):
 
     # ---- 3. verify then upload -------------------------------------------- #
     print("\n[3/3] Verifying the merged checkpoint before upload...")
-    problems = verify(str(merged_dir), tokenizer)
+    problems = verify(str(merged_dir), tokenizer, probes=info.get("probes"))
     if problems:
         print("\n" + bar)
         print("  REFUSING TO PUBLISH - the merged model is not sound")
