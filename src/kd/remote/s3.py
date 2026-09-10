@@ -76,6 +76,52 @@ def run_prefix(config, run_id):
 # --------------------------------------------------------------------------- #
 # Fetching
 # --------------------------------------------------------------------------- #
+def reachable(config, uri):
+    """Can this URI actually be read? Returns (ok, detail). Downloads nothing.
+
+    One ListObjectsV2 capped at a single key. The point is to turn the most
+    expensive failure in this project into the cheapest one: a credential that
+    cannot read the teacher is otherwise discovered by the preflight stage, on a
+    rented GPU, after the pod has been paid for and started.
+
+    Both halves of the permission are exercised, deliberately. `download` resolves
+    a prefix by listing it and then fetching each key, so an identity with
+    GetObject and no ListBucket fails there - and a probe that only did a
+    HeadObject would have said everything was fine.
+    """
+    try:
+        s3 = client(config)
+    except RuntimeError as exc:
+        return False, str(exc)
+
+    try:
+        bucket, key = split_uri(uri)
+    except ValueError as exc:
+        return False, str(exc)
+
+    prefix = f"{key}/" if key else ""
+    try:
+        response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+    except Exception as exc:  # noqa: BLE001 - botocore raises many shapes here
+        name = type(exc).__name__
+        text = str(exc)
+        if "AccessDenied" in text or "403" in text:
+            return False, (
+                "access denied. This is a permissions problem, not a key "
+                "problem - new access keys for the same user will fail "
+                "identically. The identity needs s3:ListBucket on the bucket "
+                "and s3:GetObject on this prefix.")
+        if "NoSuchBucket" in text:
+            return False, f"no such bucket: {bucket}"
+        return False, f"{name}: {text[:160]}"
+
+    count = response.get("KeyCount", 0)
+    if not count:
+        return False, ("reachable, but nothing is stored there. Check the "
+                       "prefix for a typo or a missing trailing path segment.")
+    return True, f"reachable ({response['Contents'][0]['Key']} ...)"
+
+
 def download(config, uri, destination):
     """Fetch everything under `uri` into `destination`.
 

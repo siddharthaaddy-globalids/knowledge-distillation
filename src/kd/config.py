@@ -88,6 +88,15 @@ DOMAIN_KEYS = {
     "name", "config", "quota", "pool",
     # Alpaca-format datasets (instruction / input / output) rather than chat turns.
     "format", "instruction_column", "input_column", "output_column",
+    # Which rows to read. `data_files` names one or more files inside a local
+    # corpus directory, which is how several domains are drawn from one prepared
+    # dataset; `split` overrides the default `train[:pool]` slice. Both are read
+    # by kd.data.collect_domain and were previously rejected here, which made
+    # `split` unusable despite the loader supporting it.
+    "data_files", "split",
+    # Column names for conversational sources whose chat turns are not in
+    # `messages`.
+    "messages_column",
 }
 STAGE_KEYS = {"name", "gate"}
 

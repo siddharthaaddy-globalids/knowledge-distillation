@@ -83,14 +83,14 @@ def stages_in_manifest(run_dir):
 def test_default_plan_is_the_config_order(workspace):
     plan = [name for name, _ in pipeline.planned_stages(make_config(workspace))]
     assert plan == ["preflight", "teacher-check", "smoke", "train",
-                    "evaluate", "report", "publish", "upload"], plan
+                    "evaluate", "arena", "report", "publish", "upload"], plan
 
 
 def test_only_from_skip(workspace):
     config = make_config(workspace)
     assert [n for n, _ in pipeline.planned_stages(config, only="train")] == ["train"]
     assert [n for n, _ in pipeline.planned_stages(config, start_from="evaluate")] == \
-        ["evaluate", "report", "publish", "upload"]
+        ["evaluate", "arena", "report", "publish", "upload"]
     assert "smoke" not in [n for n, _ in pipeline.planned_stages(config, skip=["smoke"])]
 
 

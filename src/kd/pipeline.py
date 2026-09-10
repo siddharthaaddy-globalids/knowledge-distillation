@@ -11,6 +11,7 @@ failed gate:
     smoke          2 real steps; measures s/step and projects the full run
     train
     evaluate
+    arena          skipped unless evaluation.arena_file names a held-out set
     report
     publish        skipped unless publish.enabled
     upload         skipped unless s3.enabled; also runs after a failure
@@ -294,6 +295,63 @@ def stage_evaluate(ctx):
     return {"evaluation": payload_path, "improved": code == 0}
 
 
+def stage_arena(ctx):
+    """Score base, distilled and teacher on the held-out set, and rate them.
+
+    Runs here, on the pod, rather than being left for later, because the teacher
+    is already resident and already paid for. Doing it afterwards on another
+    machine means downloading 8B of weights again to answer a question this
+    machine could answer in a few minutes.
+
+    Not a gate: a student that scores badly is a result worth keeping, not a
+    reason to throw away the adapter and the report.
+    """
+    import json
+
+    from . import arena
+
+    settings = ctx.config.get("evaluation") or {}
+    path = settings.get("arena_file")
+    questions, skipped = arena.load_questions(path)
+    limit = settings.get("arena_limit")
+    if limit:
+        questions = questions[:int(limit)]
+        ctx.log.info(f"      evaluation.arena_limit={limit} - this is a subset, "
+                     f"not the score")
+    if skipped:
+        ctx.log.info(f"      {skipped} rows carry no answer letter and are not scored")
+
+    adapter = ctx.resolve_adapter()
+    if not adapter:
+        raise StageFailed(
+            "nothing to score: no adapter in this run, and none found under "
+            f"{ctx.config['project'].get('runs_dir')}")
+
+    ctx.log.info(f"      {len(questions)} held-out questions from {path}")
+    results, unparsed = arena.play(
+        ctx.config, ctx.hardware, adapter, questions,
+        max_new_tokens=int(settings.get("arena_max_new_tokens") or 512),
+        log=ctx.log)
+
+    payload = arena.summarise(
+        results, unparsed,
+        rounds=int(settings.get("arena_elo_rounds") or 25),
+        seed=int(ctx.config["project"]["seed"]))
+    payload["arena_file"] = str(path)
+    payload["adapter"] = str(adapter)
+
+    target = ctx.run.path("arena.json")
+    with open(target, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+    ctx.log.info("")
+    for line in arena.render(payload).splitlines():
+        ctx.log.info(line)
+    ctx.run.write_metrics({"arena": payload["players"]})
+    ctx.run.event("arena", "ratings", **payload["players"])
+    return {"arena": target}
+
+
 def stage_report(ctx):
     """Turn the measurements into something a person can read."""
     import json
@@ -362,6 +420,7 @@ STAGES = {
     "smoke": stage_smoke,
     "train": stage_train,
     "evaluate": stage_evaluate,
+    "arena": stage_arena,
     "report": stage_report,
     "publish": stage_publish,
     "upload": stage_upload,
@@ -369,9 +428,13 @@ STAGES = {
 
 # Stages that only make sense when a feature is switched on. Returning a reason
 # here rather than failing keeps "not configured" distinct from "went wrong".
+# (section, key, reason). The key is what has to be truthy for the stage to be
+# worth running - usually an `enabled` switch, but for the arena it is the file
+# itself: a profile that names no held-out set has nothing to score.
 CONDITIONAL = {
-    "publish": ("publish", "publish.enabled is false"),
-    "upload": ("s3", "s3.enabled is false"),
+    "publish": ("publish", "enabled", "publish.enabled is false"),
+    "upload": ("s3", "enabled", "s3.enabled is false"),
+    "arena": ("evaluation", "arena_file", "evaluation.arena_file is not set"),
 }
 
 # Runs even after an earlier gate failed, so a crashed run still ships its logs.
@@ -411,8 +474,8 @@ def planned_stages(config, only=None, start_from=None, skip=()):
 
 def _skip_reason(ctx, name):
     """Why this stage should not run at all, or None."""
-    section, reason = CONDITIONAL.get(name, (None, None))
-    if section and not (ctx.config.get(section) or {}).get("enabled"):
+    section, key, reason = CONDITIONAL.get(name, (None, None, None))
+    if section and not (ctx.config.get(section) or {}).get(key):
         return reason
     return None
 

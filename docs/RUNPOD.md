@@ -67,6 +67,175 @@ limits:
 kd runpod launch --config configs/finance-pod.yaml
 ```
 
+## By hand, over SSH
+
+The launcher above needs the published image. If you have not built one yet, or
+you want a shell on the machine while it trains, rent a pod yourself on one of
+RunPod's stock **PyTorch** templates, mount a volume at `/workspace`, and:
+
+```bash
+cd /workspace
+git clone <this repo> && cd knowledge-distillation
+export KD_PRICE_PER_HOUR=0.28        # the rate you agreed to
+```
+
+`scripts/runpod.sh` refuses to start unless `nvidia-smi` is present and torch can
+actually see the GPU, then installs the dependencies **around** torch and hands
+over to `python -m kd`. It keeps the template's CUDA build of torch rather than
+fetching its own, which is the difference between ninety seconds of setup and six
+minutes of paid GPU time. It writes `/workspace/kd-env.sh` so a second SSH
+session is one `source` away from a working shell.
+
+Everything it does not recognise is passed through, so it is also how you run the
+checks below. `--setup-only` stops after the install; `--extra eval` adds the
+benchmark group; `KD_DISPATCH_ONLY=1` prints the command it would run and exits.
+
+### Rehearsing it before you rent anything
+
+`--rehearse` runs this script on a machine that is not a GPU pod — your laptop, a
+Mac mini — by downgrading the GPU checks to warnings. Everything else happens for
+real: the arguments are parsed, the dependency set is read out of
+`pyproject.toml`, the environment and `kd-env.sh` are written, and the pipeline is
+handed to.
+
+```bash
+./scripts/runpod.sh --rehearse doctor
+./scripts/runpod.sh --rehearse --config configs/enlibraQ3-8B-smoke.yaml
+```
+
+Without `/workspace`, it falls back to `~/kd-workspace` and says so.
+
+Be clear about what this does and does not settle. It answers *does this script
+work, are the dependencies resolvable, does the config resolve, can it reach S3*.
+It answers nothing about whether the models fit or how fast a step is — different
+hardware, different backend, often different model sizes. Those are the
+questions the pipeline's own `smoke` stage asks on the pod, where it measures
+s/step and refuses a run that cannot finish inside its limits.
+
+### The first run, in order
+
+Four commands, cheapest first. Each one rules out a different way the expensive
+run can fail, and none of them is worth skipping on a machine you are paying for
+by the second.
+
+**1. Does the machine work?**
+
+```bash
+./scripts/runpod.sh doctor
+```
+
+Installs the dependencies, then reports the GPU, the torch build, and which
+credentials are visible - `HF_TOKEN` for a private teacher, the AWS pair if the
+results are meant to reach S3. It prints which are present, never their values.
+A missing token found here costs nothing; found in the upload stage it costs the
+whole run.
+
+**2. Does the config fit this GPU?**
+
+```bash
+./scripts/runpod.sh check --config configs/finance.yaml
+```
+
+Resolves the config - every `extends`, every `--set`, every environment override -
+and prints what the run would actually use against the hardware it found. Nothing
+is loaded and nothing is trained. This is where a batch size that will not fit in
+24 GB is supposed to be noticed.
+
+**3. Does the pipeline work end to end?**
+
+```bash
+./scripts/runpod.sh --config configs/smoke.yaml
+```
+
+The full gated pipeline on tiny pools and two steps, in a couple of minutes. It
+proves the stages run in order, the teacher check passes, a bundle is written, and
+- with `s3.enabled` - that the upload credentials really work. The teacher-check
+stage runs here too, deliberately: a smoke test that skips the one check catching
+a broken teacher is not testing the thing most likely to be wrong.
+
+Two minutes on a $0.28/hr card is about one cent. A misconfiguration found in the
+fortieth minute of a real run is not.
+
+**4. The real run.**
+
+```bash
+./scripts/runpod.sh --config configs/finance.yaml \
+  --set limits.max_cost_usd=2.00 --set limits.max_runtime_minutes=90
+```
+
+Before training starts the `smoke` stage measures s/step against those limits and
+refuses a run that cannot finish inside them. The common case should be "never
+started", not "killed at 73%".
+
+Watch it from a second SSH session:
+
+```bash
+tail -f /workspace/runs/$(ls -t /workspace/runs | head -1)/events.jsonl
+```
+
+S3 is optional and adds nothing to a first run. Turn it on later, when you want
+the bundle to survive the pod without being copied by hand:
+
+```bash
+  --set s3.enabled=true --set s3.bucket=<bucket>
+```
+
+### Getting the adapter back
+
+The run writes its bundle to `/workspace/runs/<run-id>/`. What you actually want
+off the machine is `final_adapter/` - the LoRA weights, tens of megabytes, not the
+gigabytes of base model they attach to.
+
+Find the run id, then copy it down **before terminating the pod**:
+
+```bash
+ls -t /workspace/runs | head -1
+```
+
+From your own machine, not the pod:
+
+```bash
+scp -P <port> -i ~/.ssh/id_ed25519 -r \
+  root@<pod-ip>:/workspace/runs/<run-id> ./runs/
+```
+
+That brings the whole bundle - `final_adapter/`, `metrics.json`, `report.html`,
+`events.jsonl`, `config.resolved.yaml`, `manifest.json`. Take all of it rather
+than the adapter alone: `manifest.json` and `config.resolved.yaml` are what let
+the adapter say what produced it, and an adapter that cannot is a file you will
+not trust in a month.
+
+**The evaluation already happened.** `evaluate` and `report` are stages of the
+pipeline, so the pod measured transfer and wrote the report before it finished.
+Nothing needs re-running locally - open `report.html` and read `metrics.json`.
+They are also non-gate stages, so a failure there is logged and the run carries
+on: a broken report never destroys a good adapter.
+
+Re-run `kd evaluate` on your own machine only when you want something the pod run
+did not produce:
+
+```bash
+# benchmark tasks and generation similarity - needs `uv sync --extra eval`,
+# which the pod install deliberately skips
+kd evaluate --config configs/finance.yaml \
+  --adapter ./runs/<run-id>/final_adapter --tasks ...
+```
+
+If `scp` is awkward - a proxied SSH connection, or a pod with no public IP - the
+alternative is S3: turn it on for the run, and the bundle is in the bucket before
+the pod is released, whether the run succeeded or not.
+
+Two things the launcher does for you that this path does not:
+
+* **`KD_PRICE_PER_HOUR`.** Export it yourself, to the rate you agreed to, or the
+  in-pod cost cap is inert. The script warns when it is missing.
+* **Termination.** Nothing releases a pod you started by hand. It bills until you
+  stop it, from the console or with `kd runpod stop <pod-id>`.
+
+For anything longer than the smoke run, start it inside `tmux` - a dropped SSH
+session kills a foreground run and leaves the pod billing with nothing to show.
+The script warns when it is about to start a pipeline outside one.
+
 ## Three rules that protect the bill
 
 ### 1. The GPU you named, or none

@@ -1,0 +1,35 @@
+{
+  "inputs": [
+    {
+      "path": "C:\\Users\\siddhartha\\Downloads\\curriculum_verified.json",
+      "sha1": "93932a0501c24ca511811ea103377242acac191e",
+      "rows": 1217
+    },
+    {
+      "path": "C:\\Users\\siddhartha\\Downloads\\curriculum_sft.json",
+      "sha1": "5e7049017fa0f3a77e27276b6d400a4f81ad9794",
+      "rows": 619
+    }
+  ],
+  "files": {
+    "eval-1to5hop.jsonl": {
+      "written": 137,
+      "split": "eval",
+      "held_out": true
+    },
+    "rl-1to2hop.jsonl": {
+      "written": 143,
+      "split": "rl",
+      "held_out": false
+    },
+    "sft-1to3hop.jsonl": {
+      "written": 937,
+      "split": "sft",
+      "held_out": false
+    },
+    "identity.jsonl": {
+      "written": 15,
+      "held_out": false
+    }
+  }
+}

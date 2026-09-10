@@ -20,6 +20,7 @@ forgot to declare became a local, so the failure surfaced hundreds of lines late
 - after the dataset build and the teacher download had already been paid for.
 """
 
+import os
 import random
 from typing import NamedTuple
 
@@ -365,22 +366,84 @@ def alpaca_to_turns(row, spec):
     ]
 
 
+def resolve_data_files(source, data_files):
+    """Turn a domain's `data_files` into paths load_dataset can read.
+
+    Relative entries are resolved against `source` when that is a local
+    directory, which is what lets one prepared corpus - a directory of .jsonl
+    files - back several domains that each name one file:
+
+        dataset:
+          source: ./data/enlibra-curriculum
+          domains:
+            - {name: sft-1hop, data_files: sft-1hop.jsonl, quota: 520, pool: 520}
+
+    That indirection is the whole reason this exists. `load_dataset` will not
+    accept a path to a single local file, and pointing it at the directory
+    merges every file into one split - so without `data_files` a multi-file
+    corpus can only ever be one domain, and the per-domain quotas that keep the
+    calibration set balanced have nothing to act on.
+
+    Missing files raise rather than resolving to nothing. A mistyped filename
+    that merely skipped its domain would leave a run that trains on whatever
+    remains and reports success, which is the expensive kind of quiet.
+    """
+    patterns = [data_files] if isinstance(data_files, str) else list(data_files)
+    if not os.path.isdir(str(source)):
+        # A Hub id, so the patterns are repo-relative and only the Hub can say
+        # whether they exist.
+        return patterns
+
+    resolved = []
+    for pattern in patterns:
+        path = pattern if os.path.isabs(pattern) else os.path.join(source, pattern)
+        if not os.path.exists(path) and not any(ch in pattern for ch in "*?["):
+            raise FileNotFoundError(
+                f"dataset.domains names data_files '{pattern}', which does not "
+                f"exist under {source}.\n"
+                f"  Prepared corpora are written by scripts/prepare_curriculum.py; "
+                f"check the name against what it produced.")
+        resolved.append(path)
+    return resolved
+
+
 def collect_domain(tokenizer, spec, seen_prompts, source, budget):
     """Pull `quota` length-filtered samples from one dataset config.
 
     Handles two source layouts, selected by `format` in the domain spec:
       messages (default) - conversational datasets like smoltalk
       alpaca             - instruction/input/output datasets like finance-alpaca
+
+    and two ways of naming the rows: a Hub dataset config (`config`), or one or
+    more files inside a local corpus directory (`data_files`).
     """
     name, config, quota, pool = spec["name"], spec.get("config"), spec["quota"], spec["pool"]
-    label = f"{source.split('/')[-1]}/{config}" if config else source
+    data_files = spec.get("data_files")
+    if data_files:
+        label = data_files if isinstance(data_files, str) else ", ".join(data_files)
+    else:
+        label = f"{source.split('/')[-1]}/{config}" if config else source
     print(f"  - {name:24} ({label}) target={quota} ...", end=" ", flush=True)
     try:
         split = spec.get("split", f"train[:{pool}]")
-        if config:
+        if data_files:
+            files = resolve_data_files(source, data_files)
+            # The `json` builder reads .json and .jsonl alike. Naming it
+            # explicitly, rather than letting inference run over `source`,
+            # is what keeps each domain pinned to its own file.
+            raw = load_dataset("json", data_files=files, split=split) \
+                if os.path.isdir(str(source)) \
+                else load_dataset(source, data_files=files, split=split)
+        elif config:
             raw = load_dataset(source, config, split=split)
         else:
             raw = load_dataset(source, split=split)
+    except FileNotFoundError:
+        # Raised by resolve_data_files for a local corpus, where the file being
+        # absent is a config error rather than a source that happens to be
+        # unavailable. Not something to carry on past.
+        print("FAILED")
+        raise
     except Exception as exc:
         print(f"SKIPPED ({type(exc).__name__}: {str(exc)[:80]})")
         return []

@@ -16,11 +16,11 @@ dataset never requires a code edit.
   run   20260908T1412Z-finance-bb0c874        device cuda (bfloat16)
   cfg   configs/finance.yaml  <- _base.yaml   overrides: training.max_steps=500 (--set)
 
-[1/8] preflight            OK       2s
-[2/8] teacher-check        OK    1m48s
-[3/8] smoke                OK    1m12s
+[1/9] preflight            OK       2s
+[2/9] teacher-check        OK    1m48s
+[3/9] smoke                OK    1m12s
       3.40 s/step measured -> 500 steps is about 28m
-[4/8] train                ...
+[4/9] train                ...
 ```
 
 ---
@@ -37,6 +37,7 @@ failure:
 | `smoke` | ✓ | Two real steps. Measures s/step and projects the full run against your limits. |
 | `train` | ✓ | |
 | `evaluate` | | Fidelity and capability, against the untrained base student. |
+| `arena` | | Accuracy and Elo on a held-out answer key. Off unless `evaluation.arena_file` is set. |
 | `report` | | A readable `report.html`. |
 | `publish` | | To the Hugging Face Hub. Off by default. |
 | `upload` | | To S3. Off by default; also runs after a failure, so logs survive. |
@@ -52,7 +53,18 @@ couple of minutes.
 
 ## Getting started
 
-You need [uv](https://docs.astral.sh/uv/) and Python 3.13. The runner installs uv
+**New here?** Clone and run one script — it installs everything, works out
+whether it is on a laptop or a GPU, and does the right thing for each:
+
+```bash
+git clone <this repo> && cd knowledge-distillation
+./run.sh
+```
+
+Walkthrough: **[docs/START-HERE.md](docs/START-HERE.md)**. The rest of this page
+is the underlying `kd` command, which `run.sh` drives.
+
+You need [uv](https://docs.astral.sh/uv/) and Python 3.13. `run.sh` installs uv
 if it is missing.
 
 ```bash
@@ -96,7 +108,8 @@ chmod +x distill.sh
 kd pipeline    Every stage, gated                    kd check       Resolve and print, run nothing
 kd train       Just training                         kd doctor      Environment and credentials
 kd evaluate    Score an adapter vs the teacher       kd ui          Browser control panel
-kd publish     To the Hugging Face Hub               kd runpod      Rent a GPU (optional)
+kd arena       Accuracy + Elo on an answer key        kd runpod      Rent a GPU (optional)
+kd publish     To the Hugging Face Hub
 
 kd check-teacher      Is this teacher fit to distil from?
 kd fix-teacher        Repair a checkpoint with mislabelled tensors
@@ -145,6 +158,25 @@ Full key-by-key reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 | `smoke` | Two steps, tiny pools. CI and first-run validation. |
 | `finance` | A finance-tuned Qwen3.5-2B → Qwen3.5-0.8B. |
 | `qwen-poc` | Stock Qwen3.5-2B → 0.8B. A known-good pairing for proving the pipeline. |
+| `enlibraQ3-8B` | An RL-tuned Qwen3-8B → Qwen3-1.7B on the enLibra space curriculum. Needs a 48 GB GPU. |
+| `enlibraQ3-8B-smoke` | The same run with stand-in models, small enough for a 16 GB laptop. |
+
+The last two read `data/enlibra-curriculum/`, which **is committed** — 3.4 MB, so
+a fresh clone on a rented pod has the corpus already and needs no credentials for
+it. Regenerate it when the curriculum exports change:
+
+```bash
+python scripts/prepare_curriculum.py --out data/enlibra-curriculum \
+    --stats-tokenizer Qwen/Qwen3-8B \
+    curriculum_sft.json curriculum_sft_stage_2.json curriculum_rl.json
+```
+
+That converts the bespoke multiple-choice export into chat JSONL, one file per
+curriculum stage, and prints the token budgets the result needs. It is
+deterministic, so an unchanged export leaves `git status` clean, and
+`manifest.json` records the sha1 of every export the corpus was built from.
+`rl-*.jsonl` is written but deliberately left out of `dataset.domains`: it is the
+held-out set.
 
 ## What a run leaves behind
 
@@ -205,6 +237,30 @@ already do this" — read the change, not the absolute value.
 
 `--tasks ifeval` and `--gen-similarity 20` need `uv sync --extra eval`.
 
+### Multiple-choice accuracy, and asking the student directly
+
+For a corpus with a known correct answer per row — the enLibra curriculum — the
+number that decides whether the run worked is accuracy, not fidelity. A student
+that mirrors a mediocre teacher perfectly scores well above and badly here.
+
+```bash
+# score the held-out split: the rows training never saw
+python scripts/ask.py --config configs/enlibraQ3-8B.yaml --accuracy
+
+# ask it one thing
+python scripts/ask.py --config configs/enlibraQ3-8B.yaml \
+    --question "What are stars formed from?" \
+    --option "A. Iron cores" --option "B. Molecular clouds" \
+    --option "C. Accretion disks" --option "D. Supernova shockwaves"
+```
+
+It finds the newest adapter under `runs/` on its own, loads the tokenizer from
+the adapter directory so the chat template matches training exactly, wraps a
+free-text question in the `<Question>`/`<Options>` shape the student was trained
+on, and decodes greedily so the score is the same number twice. `--accuracy`
+rebuilds the held-out split from the config and `project.seed`, the same way
+`kd evaluate` does.
+
 ## Optional: S3 and rented GPUs
 
 Both off by default; nothing in the pipeline imports their SDKs.
@@ -225,6 +281,7 @@ machine, and always terminates the pod. See
 ```
 configs/          _base.yaml holds every default; profiles extend it
 src/kd/
+  arena.py       accuracy and Elo on a held-out multiple-choice set
   cli.py          the `kd` command
   config.py       extends, merge, strict validation, device resolution
   runlog.py       run directories, logs, events, manifest

@@ -1,0 +1,123 @@
+# ===========================================================================
+#  enLibra curriculum - the same run, small enough for a 16 GB Mac mini.
+#
+#    kd pipeline --config configs/enlibraQ3-8B-smoke.yaml
+#
+#  This exists to answer the questions that do NOT need the real models, before
+#  a pod is rented:
+#
+#    * does the prepared corpus load, and do the domains address the right files
+#    * do the token budgets actually admit the rows, or is every sample filtered
+#    * does the chat template render the exchange the way the collator expects
+#    * do the LoRA target modules attach to a real Qwen3
+#    * does a step run, and a checkpoint get written
+#
+#  It cannot tell you anything about memory, throughput or cost on the pod - the
+#  models are different sizes on a different backend. That is what the `smoke`
+#  stage inside the real run is for, which measures s/step on the hardware that
+#  will do the work and refuses the run if the projection does not fit.
+#
+#  Everything not listed below is inherited from enLibraQ3-8B.yaml, deliberately:
+#  the dataset, the budgets, the LoRA shape and the target format are the things
+#  under test, so they must not be restated here where they could drift.
+# ===========================================================================
+extends: enlibraQ3-8B.yaml
+
+project:
+  name: enlibra-q3-smoke
+
+models:
+  # Stand-ins, one size down each. Same tokenizer as the real pair - every Qwen3
+  # shares the 151669-entry vocabulary - so the chat rendering and the
+  # prompt/completion split under test are byte-for-byte the ones the real run
+  # will see.
+  #
+  # Not the real teacher: it lives in S3, is ~16 GB, and this machine has no
+  # business downloading it. s3 is switched off below for the same reason.
+  teacher: Qwen/Qwen3-1.7B
+  student: Qwen/Qwen3-0.6B
+  teacher_adapter: null
+
+hardware:
+  device: mps
+  # 2.03B + 0.75B parameters at bfloat16 is ~5.6 GB, comfortably inside the 60%
+  # of 16 GB that kd.paths treats as the working budget. float32 would be 11 GB
+  # and would swap.
+  #
+  # transformers permits bfloat16 on MPS only from macOS 14.0; below that
+  # kd.config falls back to float32 and says so, and this will be slow rather
+  # than broken. On an Intel Mac mini set --set hardware.device=cpu.
+  dtype: bfloat16
+
+dataset:
+  # dataset.source is inherited: the corpus is committed, so it is the same
+  # directory here as on the pod and there is nothing to switch.
+  #
+  # Enough rows from each domain to prove both files are found and parsed, and
+  # that the budgets admit them. The pass rate printed per domain is the number
+  # worth reading: anything below 100% here means max_prompt_tokens or
+  # max_total_tokens is too tight and the real run would train on a fraction of
+  # the corpus.
+  validation_size: 8
+  domains:
+    - name: curriculum-1hop
+      data_files: sft-1hop.jsonl
+      quota: 24
+      pool: 32
+    - name: curriculum-multihop
+      data_files: sft-2to3hop.jsonl
+      quota: 16
+      pool: 24
+
+lora:
+  # A cheap adapter. The point is that the target names resolve against a real
+  # Qwen3, not that the adapter has any capacity.
+  r: 8
+  alpha: 16
+  target_modules:
+    - q_proj
+    - v_proj
+
+training:
+  max_steps: 2
+  gradient_accumulation_steps: 2
+  save_steps: 2
+  save_total_limit: 1
+  benchmark_every: 2
+
+evaluation:
+  samples: 8
+  # The arena stage runs here too, on four questions instead of 137. That is
+  # enough to prove the stage works end to end - the file parses, three models
+  # load one after another without exhausting the machine, the <Answer> tag is
+  # found, the ratings come out - and not nearly enough to mean anything. The
+  # Elo numbers from four questions are noise; ignore them and read the fact
+  # that the stage finished.
+  arena_limit: 4
+  # Shorter than the real run's 512. Truncating an explanation costs an
+  # "unanswered" here, which is fine when the point is that the code path runs.
+  arena_max_new_tokens: 320
+
+limits:
+  # A smoke run that has not finished in half an hour has hung. Most of that
+  # allowance is the one-time download of the two stand-in models.
+  max_runtime_minutes: 30
+  max_cost_usd: null
+
+s3:
+  # Nothing here is rented and nothing is worth keeping, so this needs no
+  # credentials - which also means it runs on a machine that has none. The
+  # corpus is on disk and the models come from the Hub.
+  #
+  # This profile therefore proves nothing about S3. The only thing S3 is still
+  # needed for is the teacher, and the cheap way to test that is not a pipeline
+  # run at all - it is one listing, which costs nothing and downloads nothing:
+  #
+  #     aws s3 ls s3://enlibra/dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/models/rl/
+  #
+  # If that prints files, the pod will be able to fetch the teacher. If it says
+  # AccessDenied, no amount of pipeline configuration will help.
+  enabled: false
+
+runpod:
+  enabled: false

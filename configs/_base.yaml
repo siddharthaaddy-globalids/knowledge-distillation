@@ -129,6 +129,25 @@ evaluation:
   gen_similarity: 0     # free-running BERTScore prompts; 0 = skip (slow: 3 models generate)
   similarity_model: roberta-large
   report_format: html   # html | md - written into the run bundle as report.<ext>
+  # --- the arena -----------------------------------------------------------
+  # A held-out multiple-choice file - one {"messages": [...]} per line, the
+  # assistant turn ending in an <Answer> tag - scored for accuracy, and turned
+  # into an Elo rating by playing the base student, the distilled student and
+  # the teacher against each other question by question.
+  #
+  # null skips the stage entirely, which is the right default: most profiles
+  # train on data that has no single correct answer to score against.
+  arena_file: null
+  # The answer sits after the explanation, so a small ceiling scores as "never
+  # answered" rather than as wrong.
+  arena_max_new_tokens: 512
+  # Sequential Elo depends on the order matches are played. Averaging over this
+  # many seeded shuffles removes that dependence; 0 plays one fixed order.
+  arena_elo_rounds: 25
+  # Score only the first N questions. null scores the whole file, which is what
+  # a real run wants. A small number is for proving the stage runs at all
+  # without waiting for three models to answer everything.
+  arena_limit: null
 
 benchmark_prompts:
   - List three states of matter. Use a numbered list.
@@ -151,6 +170,7 @@ pipeline:
     - {name: smoke,         gate: true}   # 2 real steps; measures s/step and projects the run
     - {name: train,         gate: true}
     - {name: evaluate,      gate: false}
+    - {name: arena,         gate: false}  # skipped unless evaluation.arena_file is set
     - {name: report,        gate: false}
     - {name: publish,       gate: false}  # skipped unless publish.enabled
     - {name: upload,        gate: false}  # skipped unless s3.enabled; also runs after a failure

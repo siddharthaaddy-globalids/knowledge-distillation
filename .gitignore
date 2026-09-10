@@ -122,3 +122,13 @@ $RECYCLE.BIN/
 nohup.out
 scratch/
 tmp/
+
+# Prepared training corpora, written by scripts/prepare_curriculum.py. Ignored by
+# default: they are generated, and most are far too large to commit.
+#
+# The enLibra curriculum is the deliberate exception. It is 3.4 MB, the converter
+# is deterministic - the same exports always produce the same bytes - and a pod is
+# a fresh `git clone`, so committing it is what puts the corpus on the pod without
+# a download and without credentials.
+data/*
+!data/enlibra-curriculum/

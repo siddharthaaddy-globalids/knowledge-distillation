@@ -4,6 +4,7 @@
     kd check          --config configs/finance.yaml     resolve and print, run nothing
     kd train          --config configs/finance.yaml
     kd evaluate       --config configs/finance.yaml
+    kd arena          --config configs/enlibraQ3-8B.yaml
     kd check-teacher  --config configs/finance.yaml
     kd fix-teacher    --config configs/finance.yaml
     kd convert-adapter --teacher-adapter <mlx-adapter>
@@ -58,6 +59,7 @@ SUGAR = [
 # under kd/ whose main() owns those flags; "ui" is special-cased in main().
 DELEGATED = {
     "evaluate": "evaluate",
+    "arena": "arena",
     "check-teacher": "teacher",
     "fix-teacher": "teacher_fix",
     "convert-adapter": "adapters",
@@ -290,8 +292,53 @@ def cmd_doctor(args):
                            ("RUNPOD_API_KEY", "RunPod")]:
         state = "set" if os.environ.get(env_name) else "-"
         print(f"   {env_name:24} {state:4}  {what}")
+
+    # The environment is not the only place AWS credentials live, and reporting
+    # only it says "-" for a machine where S3 works perfectly - which sends
+    # someone off to set variables they do not need. boto3 reads this file
+    # whenever the variables are absent.
+    shared = os.path.expanduser(os.environ.get(
+        "AWS_SHARED_CREDENTIALS_FILE", "~/.aws/credentials"))
+    if os.path.isfile(shared):
+        print(f"   {'~/.aws/credentials':24} {'set':4}  "
+              f"S3 (used when the variables above are unset)")
+
+    # Whether the credentials above can actually read what this config names.
+    # Presence is not access: the failure that costs the most here is a key that
+    # exists, looks right, and is refused by the bucket - and left to the
+    # pipeline, that surfaces during preflight on a GPU that is already billing.
+    from . import paths
+
+    pending = paths.remote_values(config)
+    if pending:
+        print("\n remote inputs (one listing each, nothing downloaded)")
+        ok = True
+        for path, uri in pending:
+            try:
+                from .remote import s3
+                reachable, detail = s3.reachable(config, uri)
+            except ImportError:
+                reachable, detail = False, "boto3 is not installed"
+            print(f"   {path:24} {'OK  ' if reachable else 'FAIL'}  {uri}")
+            for line in _wrap(detail, 70):
+                print(f"   {'':24}       {line}")
+            ok = ok and reachable
+        if not ok:
+            print(f"\n   Fix this before renting a GPU. A run that cannot read "
+                  f"its inputs\n   fails in the preflight stage, after the pod "
+                  f"has started billing.")
     print("=" * 78)
     return 0
+
+
+def _wrap(text, width):
+    """Wrap a diagnosis to `width`, keeping any line breaks it already has."""
+    import textwrap
+
+    lines = []
+    for paragraph in str(text).splitlines():
+        lines.extend(textwrap.wrap(paragraph, width) or [""])
+    return lines
 
 
 # --------------------------------------------------------------------------- #
@@ -364,6 +411,7 @@ def build_parser():
     # are dispatched in main() before argparse runs - see the note there.
     for name, help_text in [
         ("evaluate", "Measure teacher->student transfer"),
+        ("arena", "Accuracy and Elo on a held-out multiple-choice set"),
         ("check-teacher", "Verify a teacher is fit to distil from"),
         ("fix-teacher", "Repair a checkpoint with mislabelled tensors"),
         ("convert-adapter", "Convert an MLX LoRA adapter to PEFT format"),

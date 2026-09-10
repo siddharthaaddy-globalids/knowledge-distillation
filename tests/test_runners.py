@@ -61,10 +61,13 @@ def test_declared_stages_are_all_implemented():
 def test_conditional_stages_name_a_real_config_section():
     with open(os.path.join(ROOT, "configs", "_base.yaml"), encoding="utf-8") as handle:
         base = yaml.safe_load(handle)
-    for stage, (section, _reason) in pipeline.CONDITIONAL.items():
+    for stage, (section, key, _reason) in pipeline.CONDITIONAL.items():
         assert stage in pipeline.STAGES, f"{stage} is conditional but not a stage"
         assert section in base, f"{stage} is gated on a missing section '{section}'"
-        assert "enabled" in base[section], f"{section} has no 'enabled' key to gate on"
+        # The gating key is usually 'enabled', but not always: the arena is gated
+        # on the held-out file itself, because a profile that names none has
+        # nothing to score and no separate switch worth maintaining.
+        assert key in base[section],             f"{stage} is gated on '{section}.{key}', which is not in _base.yaml"
 
 
 # --------------------------------------------------------------------------- #

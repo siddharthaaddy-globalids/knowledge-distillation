@@ -118,6 +118,44 @@ Each entry in `domains`:
 | `pool` | How many rows to scan to find them. Long-document domains need a large pool: only ~2% of `smol-summarize` prompts fit under 128 tokens. |
 | `format` | `messages` (default) or `alpaca` for instruction/input/output datasets. |
 | `instruction_column`, `input_column`, `output_column` | Column names, for `format: alpaca`. |
+| `messages_column` | Column holding the chat turns, for `format: messages`. Defaults to `messages`. |
+| `data_files` | One filename, or a list, inside a local corpus directory. Use this instead of `config` when `source` is a directory rather than a Hub id — see below. |
+| `split` | Overrides the default `train[:pool]` slice. |
+
+`data_files` is what lets several domains be drawn from one prepared corpus:
+
+```yaml
+dataset:
+  source: ./data/enlibra-curriculum
+  domains:
+    - {name: curriculum-1hop,     data_files: sft-1hop.jsonl,    quota: 514, pool: 600}
+    - {name: curriculum-multihop, data_files: sft-2to3hop.jsonl, quota: 438, pool: 500}
+```
+
+Without it, a directory of files is not addressable per-domain: `load_dataset`
+will not accept a path to a single local file, and pointing it at the directory
+merges everything into one split — so the per-domain quotas that keep the
+calibration set balanced would have nothing to act on. Relative names resolve
+against `source`, and a name that does not exist is an error rather than a
+skipped domain, because a run that silently trains on two domains out of three
+still reports success.
+
+### The arena
+
+A second, different measurement, for datasets that have a **correct answer**.
+`kd evaluate` scores fidelity to the *teacher*; the arena scores who is *right*.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `arena_file` | `null` | Held-out `.jsonl`, one `{"messages": [...]}` per line, assistant turn ending in an `<Answer>` tag. `null` skips the stage. |
+| `arena_max_new_tokens` | `512` | The answer sits *after* the explanation, so too small a value scores as "never answered" rather than as wrong. |
+| `arena_elo_rounds` | `25` | Shuffled orderings to average Elo over. Sequential Elo depends on match order; averaging removes that, and the reported spread is the noise floor. |
+| `arena_limit` | `null` | Score only the first N questions. For proving the stage runs, not for a real score. |
+
+Three players are rated against each other question by question: the **base**
+student (no adapter, the control), the **distilled** student, and the
+**teacher** (the ceiling). Distilled below base means training hurt; distilled
+level with base means the format transferred but the capability did not.
 
 ## `lora`
 
