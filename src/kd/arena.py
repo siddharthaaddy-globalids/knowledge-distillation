@@ -905,11 +905,19 @@ def main(args=None):
             return 1
 
     questions, skipped = load_questions(path)
+    available = len(questions)
     limit = args.limit or settings.get("arena_limit")
     if limit:
         questions = questions[:int(limit)]
     log.info(f"==> {len(questions)} questions from {path}"
              + (f" ({skipped} ungradeable rows skipped)" if skipped else ""))
+    # Said loudly, and recorded in the payload below, because the arena now
+    # saves by default: a five-question run writes an arena.json and a report
+    # that look exactly like a real score. Whoever opens that file next week
+    # has to be able to tell without remembering which flags were typed.
+    if limit and len(questions) < available:
+        log.info(f"    !! --limit {limit} of {available}: a SUBSET, not the "
+                 f"score. Drop --limit for the real number.")
     predictions, formats, unanswered, completions = play(
         config, hardware, adapter, questions,
         max_new_tokens=int(args.max_new_tokens
@@ -922,6 +930,9 @@ def main(args=None):
                         seed=int(config["project"]["seed"]))
     payload["arena_file"] = str(path)
     payload["adapter"] = str(adapter) if adapter else None
+    if limit and len(questions) < available:
+        payload["limited_to"] = len(questions)
+        payload["available"] = available
     # Present from the first write, so the file always SAYS whether there is a
     # similarity table rather than leaving a reader to infer it from a missing
     # key - which reads the same as an older payload that never had one.

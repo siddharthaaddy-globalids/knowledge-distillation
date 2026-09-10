@@ -30,8 +30,20 @@ def _arena_summary(arena):
     base, dist = players.get("base"), players.get("distilled")
     teacher, total = players.get("teacher"), arena.get("questions", 0)
     lines = []
+
+    # First line, before any number, when the run was limited. Everything below
+    # is arithmetic on a handful of questions and would read as a result
+    # otherwise - and a file on disk outlives the memory of which flags produced
+    # it.
+    if arena.get("available") and arena.get("limited_to"):
+        lines.append(
+            f"NOT THE SCORE. This run was limited to {arena['limited_to']} of "
+            f"{arena['available']} held-out questions, which is enough to prove "
+            f"the stage runs and far too few to rank three models. Re-run "
+            f"without --limit for a number worth quoting.")
+
     if not (base and dist):
-        return ["Scored on a held-out answer key."]
+        return lines + ["Scored on a held-out answer key."]
 
     pct = lambda e: (e.get("accuracy") or 0) * 100
     moved = pct(dist) - pct(base)
@@ -206,8 +218,10 @@ def _report_rows(payload):
             rows.append(("Chose the teacher's letter",
                          against_teacher("base"), against_teacher("distilled"),
                          f"{total} / {total}  (100.0%)"))
+        subset = (f" — a SUBSET of {arena['available']}, not the score"
+                  if arena.get("available") and arena.get("limited_to") else "")
         sections.append(
-            (f"The answer key — {total} held-out questions "
+            (f"The answer key — {total} held-out questions{subset} "
              f"(random baseline {arena.get('random_baseline', 0.25) * 100:.0f}%)",
              rows))
 

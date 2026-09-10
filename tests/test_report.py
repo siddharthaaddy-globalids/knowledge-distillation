@@ -190,6 +190,25 @@ def test_no_teacher_and_no_similarity_still_renders():
     assert "&mdash;<span>" in html, "no headline placeholder"
 
 
+def test_a_limited_run_says_so_before_any_number():
+    """The arena saves by default, so a 5-question file must not read as a score."""
+    limited = dict(ARENA_ONLY, arena=dict(ARENA, questions=5, limited_to=5,
+                                          available=137))
+    first = plain_summary(limited)[0]
+    assert first.startswith("NOT THE SCORE"), first
+    assert "5 of 137" in first, first
+
+    html = render(limited, ".html", scratch())
+    assert "NOT THE SCORE" in html, "the warning never reached the page"
+    assert "a SUBSET of 137, not the score" in html, "table heading does not say it"
+
+
+def test_an_unlimited_run_carries_no_warning():
+    for payload in (ARENA_ONLY, FULL):
+        assert "NOT THE SCORE" not in " ".join(plain_summary(payload))
+        assert "SUBSET" not in render(payload, ".html", scratch())
+
+
 def test_nothing_is_double_escaped():
     html = render(ARENA_ONLY, ".html", scratch())
     assert "&amp;mdash;" not in html and "&amp;rarr;" not in html
