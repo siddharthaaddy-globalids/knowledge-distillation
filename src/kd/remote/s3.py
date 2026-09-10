@@ -16,6 +16,7 @@ than a hardcoded AWS host.
 """
 
 import os
+import time
 
 from ..paths import mark_complete, split_uri
 
@@ -70,6 +71,11 @@ def bucket_or_die(config):
     if not bucket:
         raise RuntimeError("s3.enabled is true but s3.bucket is not set")
     return bucket
+
+
+def uri_of(bucket, prefix):
+    """The s3:// URI a bucket and prefix name. One spelling, used everywhere."""
+    return f"s3://{bucket}/{prefix}"
 
 
 def run_prefix(config, run_id):
@@ -127,13 +133,117 @@ def reachable(config, uri):
     return True, f"reachable ({response['Contents'][0]['Key']} ...)"
 
 
-def download(config, uri, destination):
-    """Fetch everything under `uri` into `destination`.
+def _human(num_bytes):
+    """Bytes as something a person reads at a glance."""
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{value:.0f} B"
+        value /= 1024
+
+
+def _duration(seconds):
+    seconds = int(max(0, seconds))
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
+class _Progress:
+    """Live progress for a multi-object transfer, in either direction.
+
+    A teacher checkpoint is tens of gigabytes and, on a rented GPU, the download
+    is billed at the GPU's hourly rate. Before this, `download` printed nothing
+    between "fetching" and "done", so the one part of a run where you most want
+    to know whether to wait or to kill it was the part that said least. Uploads
+    are usually far smaller, with one exception that matters: a rescue upload
+    after a limit stopped a run ships hundreds of megabytes of checkpoint off a
+    pod that is about to be destroyed.
+
+    Two output shapes, because the two places this runs want different things.
+    A terminal gets one line rewritten in place. A log file - which is where a
+    pod run actually ends up, through kd.runlog - gets an occasional new line
+    instead, since several thousand carriage returns make a log unreadable.
+
+    boto3 transfers each object in parallel parts and calls back from several
+    threads, so the running total is taken under a lock.
+    """
+
+    # Redraw at most this often. A callback per 8 MB part on a fast link is
+    # dozens a second, and rendering every one costs more than it tells you.
+    TTY_INTERVAL = 0.25
+    LOG_INTERVAL = 30.0
+
+    def __init__(self, total_bytes, total_objects, log=None, stream=None):
+        import sys
+        import threading
+
+        self.total = max(1, total_bytes)
+        self.objects = total_objects
+        self.log = log
+        self.stream = stream or sys.stdout
+        self.tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.done = 0
+        self.finished_objects = 0
+        self.started = time.time()
+        self.last_render = 0.0
+        self.lock = threading.Lock()
+
+    def callback(self, chunk):
+        with self.lock:
+            self.done += chunk
+            self._maybe_render()
+
+    def object_done(self):
+        with self.lock:
+            self.finished_objects += 1
+
+    def _maybe_render(self):
+        now = time.time()
+        interval = self.TTY_INTERVAL if self.tty else self.LOG_INTERVAL
+        if now - self.last_render < interval:
+            return
+        self.last_render = now
+        self._render(now)
+
+    def _render(self, now, final=False):
+        elapsed = max(1e-6, now - self.started)
+        rate = self.done / elapsed
+        share = min(1.0, self.done / self.total)
+        # Remaining time from the rate so far. Honest about being an estimate:
+        # a stalled connection makes it grow, which is itself the useful signal.
+        eta = (self.total - self.done) / rate if rate > 0 else 0
+        line = (f"{share * 100:5.1f}%  {_human(self.done)} / {_human(self.total)}"
+                f"  {_human(rate)}/s"
+                f"  {self.finished_objects}/{self.objects} files"
+                + ("" if final else f"  eta {_duration(eta)}"))
+        if self.tty and not final:
+            self.stream.write(f"\r      {line}")
+            self.stream.flush()
+        elif self.tty:
+            self.stream.write(f"\r      {line}\n")
+            self.stream.flush()
+        elif self.log:
+            self.log.info(f"      {line}")
+
+    def finish(self):
+        with self.lock:
+            self._render(time.time(), final=True)
+
+
+def download(config, uri, destination, log=None):
+    """Fetch everything under `uri` into `destination`, reporting progress.
 
     An S3 prefix is not a directory - it is a shared string across flat keys - so
     a "directory" download is a listing plus one GET per object. Both the
     single-object and prefix cases are handled, because s3://bucket/model.tar and
     s3://bucket/model/ are both reasonable things to write in a config.
+
+    The listing is walked fully before anything is fetched. That costs one extra
+    round trip and buys the total size, without which "47% done" is not a thing
+    that can be said.
     """
     s3 = client(config)
     bucket, key = split_uri(uri)
@@ -141,18 +251,30 @@ def download(config, uri, destination):
 
     prefix = f"{key}/" if key else ""
     paginator = s3.get_paginator("list_objects_v2")
-    downloaded, total_bytes = 0, 0
 
+    wanted = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for item in page.get("Contents", []):
             relative = item["Key"][len(prefix):]
             if not relative or relative.endswith("/"):
                 continue  # a zero-byte key standing in for a folder
+            wanted.append((item["Key"], relative, item.get("Size", 0)))
+
+    downloaded, total_bytes = 0, 0
+    if wanted:
+        expected = sum(size for _k, _r, size in wanted)
+        if log:
+            log.info(f"      {len(wanted)} files, {_human(expected)} to fetch")
+        progress = _Progress(expected, len(wanted), log=log)
+        for object_key, relative, size in wanted:
             target = os.path.join(destination, *relative.split("/"))
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            s3.download_file(bucket, item["Key"], target)
+            s3.download_file(bucket, object_key, target,
+                             Callback=progress.callback)
+            progress.object_done()
             downloaded += 1
-            total_bytes += item.get("Size", 0)
+            total_bytes += size
+        progress.finish()
 
     if downloaded == 0:
         # Not a prefix, so try it as a single object before giving up. Reporting
@@ -217,13 +339,28 @@ def upload_bundle(config, run_dir, run_id, groups=None, log=None):
             f"nothing to upload: s3.upload={groups} matched no files in {run_dir}")
 
     s3 = client(config)
+    # Sizes are known from the filesystem, so unlike a download this needs no
+    # extra round trip to say how much there is.
+    expected = sum(os.path.getsize(path) for path in files)
+    if log:
+        log.info(f"      {len(files)} files, {_human(expected)} -> {uri_of(bucket, prefix)}")
+
+    # Usually tens of megabytes against a download's tens of gigabytes, so this
+    # matters less - except in the one case it matters most. `checkpoints` is a
+    # rescue upload after a limit stopped a run, which is hundreds of megabytes
+    # of optimizer state on a pod that is about to be destroyed, and watching it
+    # move is the difference between waiting and guessing.
+    progress = _Progress(expected, len(files), log=log)
     sent_bytes = 0
     for path in files:
         relative = os.path.relpath(path, run_dir).replace(os.sep, "/")
-        s3.upload_file(path, bucket, f"{prefix}/{relative}")
+        s3.upload_file(path, bucket, f"{prefix}/{relative}",
+                       Callback=progress.callback)
+        progress.object_done()
         sent_bytes += os.path.getsize(path)
+    progress.finish()
 
-    uri = f"s3://{bucket}/{prefix}"
+    uri = uri_of(bucket, prefix)
     if log:
-        log.info(f"      {len(files)} files, {sent_bytes / 1e6:.1f} MB -> {uri}")
+        log.info(f"      uploaded to {uri}")
     return {"uri": uri, "files": len(files), "bytes": sent_bytes, "groups": groups}

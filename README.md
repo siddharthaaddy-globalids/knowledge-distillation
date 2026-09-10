@@ -159,8 +159,8 @@ Full key-by-key reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 | `smoke` | Two steps, tiny pools. CI and first-run validation. |
 | `finance` | A finance-tuned Qwen3.5-2B → Qwen3.5-0.8B. |
 | `qwen-poc` | Stock Qwen3.5-2B → 0.8B. A known-good pairing for proving the pipeline. |
-| `enlibraQ3-4B` | The SFT teacher (~4B) → Qwen3-1.7B. ~11 GB of weights, so a 24 GB GPU is enough. Start here. |
-| `enlibraQ3-4B-smoke` | The same pair on a laptop, training on a small slice of the corpus. |
+| `enlibraQ25-3B` | The SFT teacher (Qwen2.5-3B) → Qwen2.5-1.5B. ~8.6 GB of weights, so a 16 GB GPU is enough. Start here. |
+| `enlibraQ25-3B-smoke` | The same **real** pair on a laptop, training on a small slice of the corpus. |
 | `enlibraQ3-8B` | An RL-tuned Qwen3-8B → Qwen3-1.7B on the enLibra space curriculum. Needs a 48 GB GPU. |
 | `enlibraQ3-8B-smoke` | The same run with stand-in models, small enough for a 16 GB laptop. Two steps — proves the plumbing. |
 | `enlibraQ3-8B-mac` | Stand-in models again, but the **full** schedule and the whole evaluation. Hours, free, and it answers whether distillation works on this data. |

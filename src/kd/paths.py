@@ -326,7 +326,7 @@ def resolve_inputs(config, log=None):
         else:
             if log:
                 log.info(f"      {path}: fetching {uri}")
-            s3.download(config, uri, local)
+            s3.download(config, uri, local, log=log)
         section, _, key = path.partition(".")
         config[section][key] = local
         resolved[path] = {"uri": uri, "local": local}

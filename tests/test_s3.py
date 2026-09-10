@@ -45,16 +45,29 @@ class FakeS3:
         return Paginator()
 
     # --- transfers -------------------------------------------------------- #
-    def download_file(self, Bucket, Key, Filename):  # noqa: N803
+    def download_file(self, Bucket, Key, Filename, Callback=None):  # noqa: N803
+        # Callback is boto3's progress hook: called with the byte count of each
+        # transferred part, from whichever thread transferred it. Accepted here
+        # because kd.remote.s3 passes it, and a double that rejects an argument
+        # the real client takes tests a client nobody uses.
         if Key not in self.objects:
             raise KeyError(f"no such key: {Key}")
         os.makedirs(os.path.dirname(Filename), exist_ok=True)
+        payload = self.objects[Key]
         with open(Filename, "wb") as handle:
-            handle.write(self.objects[Key])
+            handle.write(payload)
+        if Callback:
+            Callback(len(payload))
 
-    def upload_file(self, Filename, Bucket, Key):  # noqa: N803
+    def upload_file(self, Filename, Bucket, Key, Callback=None):  # noqa: N803
+        # Same progress hook the download side takes, and for the same reason:
+        # a double that rejects an argument the real client accepts is testing a
+        # client nobody uses.
         with open(Filename, "rb") as handle:
-            self.uploaded[Key] = handle.read()
+            payload = handle.read()
+        self.uploaded[Key] = payload
+        if Callback:
+            Callback(len(payload))
 
 
 def check(name, fn):
@@ -308,6 +321,78 @@ def test_uploaded_manifest_is_current(workspace):
     key = next(k for k in fake.uploaded if k.endswith("manifest.json"))
     manifest = json.loads(fake.uploaded[key])
     assert manifest["run_id"] == run_id, manifest["run_id"]
+
+
+def test_download_reports_progress(workspace):
+    """A multi-object fetch reports size, file count and a rate as it goes.
+
+    The teacher is the largest thing a run downloads and, on a rented GPU, the
+    slowest thing it pays for. A silent download is the one place a person most
+    needs to know whether to keep waiting or to kill it.
+    """
+    lines = []
+
+    class Log:
+        def info(self, message):
+            lines.append(str(message))
+
+    install_fake({
+        "models/teacher/config.json": b"x" * 900,
+        "models/teacher/model.safetensors": b"y" * 4096,
+    })
+    s3.download(make_config(workspace), "s3://test-bucket/models/teacher",
+                os.path.join(workspace, "out"), log=Log())
+
+    joined = " | ".join(lines)
+    assert "2 files" in joined, joined
+    assert "to fetch" in joined, joined
+    assert any("100.0%" in line for line in lines), joined
+    # The completion line drops the estimate: there is nothing left to estimate.
+    final = [line for line in lines if "100.0%" in line][-1]
+    assert "eta" not in final, final
+
+
+def test_progress_survives_an_empty_download(workspace):
+    """Zero bytes must not divide by zero, whatever else it does."""
+    progress = s3._Progress(0, 0)
+    progress.callback(0)
+    progress.finish()
+
+
+def test_human_readable_sizes(workspace):
+    assert s3._human(512) == "512 B"
+    assert s3._human(8 * 1024 ** 2) == "8.0 MB"
+    assert s3._human(15 * 1024 ** 3).endswith("GB")
+    assert s3._duration(9) == "9s"
+    assert s3._duration(75) == "1m15s"
+    assert s3._duration(4021) == "1h07m"
+
+
+def test_upload_reports_progress(workspace):
+    """The bundle upload reports size, file count and a rate as it goes.
+
+    Small next to a download, with one exception: the rescue upload after a
+    limit stops a run ships the checkpoint off a pod about to be destroyed, and
+    that is precisely when you want to see it moving.
+    """
+    lines = []
+
+    class Log:
+        def info(self, message):
+            lines.append(str(message))
+
+    install_fake()
+    config = make_config(workspace)
+    run = runlog.Run(config, argv=["kd"])
+    with run:
+        with open(run.path("metrics.json"), "w", encoding="utf-8") as handle:
+            handle.write("{}")
+    s3.upload_bundle(config, run.dir, run.run_id, groups=["metrics"], log=Log())
+
+    joined = " | ".join(lines)
+    assert "files" in joined, joined
+    assert any("100.0%" in line for line in lines), joined
+    assert any("uploaded to s3://" in line for line in lines), joined
 
 
 for _name, _fn in sorted(list(globals().items())):
