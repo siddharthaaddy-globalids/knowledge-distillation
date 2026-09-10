@@ -15,7 +15,7 @@
 # WHAT IT CAN AND CANNOT TELL YOU
 # -------------------------------
 # The only thing changed from the pod profile is the pair of models: a 1.7B
-# teacher into a 0.6B student instead of 8B into 1.7B, because 20.5 GB of
+# teacher into a 0.6B student instead of 8B into 1.7B, because 19.0 GB of
 # weights does not fit 16 GB of unified memory. Everything else - the corpus,
 # the LoRA shape, the schedule, the token budgets, the held-out set - is
 # inherited unchanged.

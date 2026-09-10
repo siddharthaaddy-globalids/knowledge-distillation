@@ -62,8 +62,9 @@ models:
 hardware:
   device: auto
   # 8.19B + 2.03B parameters, both resident - the teacher frozen, the student
-  # training - is 20.5 GB of weights at bfloat16 before a single activation.
-  # float32 would be 41 GB and fits nothing sensible.
+  # training - is 19.0 GB of weights at bfloat16 before a single activation:
+  # 15.3 for the teacher, 3.8 for the student. float32 would be 38 GB and fits
+  # nothing sensible.
   #
   # Budget at least a 48 GB card (L40S, RTX A6000) and preferably 80 GB. On
   # 24 GB this does not run at all; the allocator will not politely refuse, it
@@ -276,7 +277,7 @@ runpod:
   # path - scripts/runpod.sh on a pod you started yourself - ignores this block
   # entirely and takes its cost ceiling from KD_PRICE_PER_HOUR instead.
   enabled: true
-  # 20.5 GB of weights plus activations does not fit the base profile's A4000.
+  # 19.0 GB of weights plus activations does not fit the base profile's A4000.
   # `kd runpod gpus --config configs/enlibraQ3-8B.yaml` prints the exact names
   # this account can see; the launcher rents the one named here and no other.
   gpu_type: L40S

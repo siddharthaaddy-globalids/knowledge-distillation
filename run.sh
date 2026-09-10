@@ -200,6 +200,13 @@ kd() {
     # passes everything else through to the pipeline.
     "$ROOT/scripts/runpod.sh" "$@"
   else
+    # The same dispatch rule scripts/runpod.sh applies: nothing, or a leading
+    # option, means the full gated pipeline. Without this the two paths disagree
+    # - `./run.sh train` worked on a pod and died locally on `invalid choice:
+    # configs/...yaml`, because `python -m kd --config X` names no subcommand.
+    if [ $# -eq 0 ] || [ "${1#-}" != "$1" ]; then
+      set -- pipeline "$@"
+    fi
     uv run --quiet python -m kd "$@"
   fi
 }

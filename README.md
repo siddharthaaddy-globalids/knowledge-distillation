@@ -162,6 +162,11 @@ Full key-by-key reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 | `enlibraQ3-8B-smoke` | The same run with stand-in models, small enough for a 16 GB laptop. Two steps — proves the plumbing. |
 | `enlibraQ3-8B-mac` | Stand-in models again, but the **full** schedule and the whole evaluation. Hours, free, and it answers whether distillation works on this data. |
 
+Both models are resident at once, so their **sum** is what has to fit: Qwen3-8B
+plus Qwen3-1.7B is 19.0 GB of bf16 weights before activations, which is why the
+pod profile asks for a 48 GB card and why the laptop profiles shrink both halves.
+[docs/START-HERE.md](docs/START-HERE.md) has the table.
+
 Those three read `data/enlibra-curriculum/`, which **is committed** — 3.4 MB, so
 a fresh clone on a rented pod has the corpus already and needs no credentials for
 it. Regenerate it when the curriculum exports change:

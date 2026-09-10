@@ -135,7 +135,7 @@ If you want that answer before renting a GPU — and it is a good answer to have
 This trains on **all 1087 rows for the full 300 steps**, then scores **all 137
 held-out questions** with all three players. Everything is inherited from the
 real profile — corpus, LoRA shape, schedule, token budgets — except the models,
-which are one size down (Qwen3-1.7B → Qwen3-0.6B) because 20.5 GB does not fit
+which are one size down (Qwen3-1.7B → Qwen3-0.6B) because 19.0 GB does not fit
 16 GB of memory.
 
 Budget **several hours**. It is free, and safe to interrupt: checkpoints are
@@ -156,6 +156,55 @@ At the end you get the same table the pod will produce. Read it like this:
 distillation works on this data. If it does not, it will not work on the pod
 either — and you found that out for nothing.
 
+### Can I force the real 8B teacher on the Mac?
+
+No — and the arithmetic is worth seeing, because it is the same arithmetic that
+decides which GPU you rent.
+
+Both models are resident at once: the teacher frozen, the student training. So
+the sum is what has to fit, *before* activations, optimizer state and the OS.
+
+| Pairing | bf16 weights | On a 16 GB Mac |
+|---|---|---|
+| Qwen3-8B → Qwen3-1.7B | **19.0 GB** | does not fit — the teacher alone is 15.3 GB |
+| Qwen3-4B → Qwen3-1.7B | 11.3 GB | runs, but swaps hard |
+| Qwen3-1.7B → Qwen3-0.6B | 5.2 GB | comfortable — this is `./run.sh full` |
+
+`kd.paths` treats 60% of RAM (9.6 GB here) as the working budget, because
+activations and the KV cache sit on top of the weights. Past that macOS does not
+refuse — it swaps, and the run gets mysteriously slow rather than failing
+honestly.
+
+**The useful middle ground** is a 4B teacher into the *real* 1.7B student. It
+exercises the actual student, the actual LoRA target modules and the actual
+per-step memory on the student side — none of which `./run.sh full` covers,
+since that one shrinks both halves:
+
+```bash
+./run.sh train \
+    --set models.teacher=Qwen/Qwen3-4B \
+    --set s3.enabled=false \
+    --set hardware.device=mps \
+    --set training.max_steps=20 \
+    --set limits.max_runtime_minutes=600
+```
+
+Expect it to be slow. It is a memory-shape test, not a training run.
+
+**If you want to watch the 8B try anyway** — swap `Qwen3-4B` for `Qwen3-8B`
+above. It downloads 15.3 GB and then thrashes; `preflight` warns first:
+
+```
+!! the teacher and student together are 19.0 GB of bfloat16 weights, against a
+   9.6 GB budget (60% of this machine's 16 GB).
+```
+
+That warning is not a formality. Nothing you learn from pushing past it applies
+to the pod, which has different memory and a different backend.
+
+`--set s3.enabled=false` in both commands substitutes a stock Hub teacher for
+the S3 one, so these work without any AWS access.
+
 ---
 
 ## Part 2 — On RunPod (paid)
@@ -165,7 +214,7 @@ either — and you found that out for nothing.
 In the RunPod console:
 
 1. **Deploy** → a GPU with **at least 48 GB** — an **L40S** or **RTX A6000**.
-   A 24 GB card will not do; the two models are 20.5 GB of weights before
+   A 24 GB card will not do; the two models are 19.0 GB of weights before
    anything else.
 2. Template: any **PyTorch** template. This matters — the script keeps that
    template's CUDA build of torch instead of downloading its own, saving about
@@ -372,6 +421,8 @@ Anything else is passed straight through, so `./run.sh arena --limit 20` and
 | It says | What to do |
 |---|---|
 | `models.teacher FAIL ... access denied` | A permissions problem, not a key problem. New keys will not help — ask your AWS administrator. |
+| `PutObject ... is not authorized` at the `upload` stage | A **different** permission from reading the teacher: the run needs `s3:PutObject` on `dss/dev/kd/*`. Nothing is lost — the bundle is still on disk. |
+| The run swaps / a step takes minutes on a Mac | The models do not fit. See [the memory table](#can-i-force-the-real-8b-teacher-on-the-mac). |
 | `No AWS credentials in this shell` | Run the three `export` lines above, then run the script again. |
 | `You are not inside tmux` | Run `tmux new -s kd`, then the script again. |
 | `REFUSED at smoke` | Working as designed: the run cannot finish inside its limits. The message says which number to change. **Nothing was spent.** |
