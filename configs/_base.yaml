@@ -148,6 +148,11 @@ evaluation:
   # a real run wants. A small number is for proving the stage runs at all
   # without waiting for three models to answer everything.
   arena_limit: null
+  # How much of the teacher's answer the teacher-check stage prints. Not a
+  # quality setting - the check reads the first token's distribution, not the
+  # text - but the text is what a person actually looks at, and an answer cut
+  # off mid-sentence tells them nothing.
+  teacher_check_max_new_tokens: 1024
 
 benchmark_prompts:
   - List three states of matter. Use a numbered list.

@@ -191,7 +191,13 @@ def stage_teacher_check(ctx):
         tokenizer=None,
         dtype="auto",
         device=ctx.hardware["device"],
-        max_new_tokens=48,
+        # Enough to read a whole short answer. 48 was too few the moment the
+        # teacher became a model that opens with a reasoning block: the sample
+        # ended mid-preamble every time, so the one stage whose job is to show
+        # you the teacher's output showed you none of it. kd.teacher now renders
+        # the prompt past that block, and this is sized to reach a conclusion.
+        max_new_tokens=int((ctx.config.get("evaluation") or {})
+                           .get("teacher_check_max_new_tokens") or 192),
     )
     code = teacher.main(args)
     if code != 0:

@@ -179,10 +179,38 @@ def significant_missing(loading_info):
     return [key for key in missing if not key.endswith(IGNORABLE_MISSING)]
 
 
+def render_prompt(tokenizer, prompt):
+    """The prompt, positioned so the next token is an ANSWER rather than a preamble.
+
+    Qwen3 and its relatives render `...assistant\\n` and then open a reasoning
+    chain, so the next token is `<think>` with probability ~1.0. Both things this
+    module does are ruined by that:
+
+      * the confidence check measures how sure the model is that it is about to
+        think, which is near-certain for a healthy model AND for a broken one
+        whose reasoning is nonsense - so it reports 0.9999 either way;
+      * the generation sample shows the first few dozen tokens of deliberation
+        and never reaches the answer, which is the part worth reading.
+
+    `enable_thinking=False` moves the empty `<think></think>` block into the
+    prompt, so generation starts at the answer. Templates that do not know the
+    argument ignore it - verified against SmolLM2, whose output is byte-identical
+    either way - so this is safe to pass unconditionally.
+    """
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False)
+    except TypeError:
+        # A template implementation that rejects unknown kwargs outright.
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+
+
 def token_confidence(model, tokenizer, prompt, device):
     """(top-1 probability, entropy, uniform entropy) for the next token after `prompt`."""
-    text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
+    text = render_prompt(tokenizer, prompt)
     ids = tokenizer(text, return_tensors="pt").to(device)
     with torch.no_grad():
         logits = model(**ids).logits[0, -1].float()
@@ -359,10 +387,9 @@ def main(args=None):
                            if (config.get('benchmark_prompts') or []) else 'built-in fallbacks'}")
     for probe in probes:
         top_p, entropy, uniform = token_confidence(model, tokenizer, probe, device)
-        text = tokenizer.apply_chat_template(
-            [{"role": "user", "content": probe}], tokenize=False, add_generation_prompt=True
-        )
-        ids = tokenizer(text, return_tensors="pt").to(device)
+        # The same rendering the confidence was measured at, so the number and
+        # the text below it describe the same position in the same sequence.
+        ids = tokenizer(render_prompt(tokenizer, probe), return_tensors="pt").to(device)
 
         with torch.no_grad():
             out = model.generate(

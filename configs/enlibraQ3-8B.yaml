@@ -86,22 +86,24 @@ dataset:
   # built from, which is what lets a checkout say which exports it holds.
   source: ./data/enlibra-curriculum
 
-  # NO INPUT LIMIT, deliberately. These are the budgets kd.data filters every
-  # sample against, and a sample over either is dropped SILENTLY - so set high
-  # enough that nothing is ever dropped, and the corpus that trains is the whole
-  # corpus.
+  # NO CAP. These are the budgets kd.data filters every sample against, and a
+  # sample over either is dropped SILENTLY - so they are set to Qwen3's full
+  # native context, where the filter can never fire and the corpus that trains
+  # is the whole corpus, whatever the exports grow into.
   #
-  # Measured over the prepared corpus with the Qwen3 tokenizer, for context:
+  # A literal "no limit" is not available: both values are integers the code
+  # requires, and max_total_tokens also becomes the collator's max_length. What
+  # is available is a ceiling nothing can reach, which is this.
+  #
+  # For context, measured with the Qwen3 tokenizer:
   #   prompt        median 271, p99 383, max 424   (eval rows reach 458)
   #   prompt+answer median 601, p99 756, max 786   (eval rows reach 869)
   #
-  # 4096 is roughly five times the longest thing in the corpus, so the filter is
-  # effectively off. This costs almost nothing at training time: max_total_tokens
-  # also becomes the collator's max_length, which is a TRUNCATION ceiling, not an
-  # allocation - real batches pad to the longest sample in the batch, which is
-  # still ~800. Raising the ceiling does not raise the memory bill.
-  max_prompt_tokens: 4096
-  max_total_tokens: 4096
+  # It costs nothing. max_length is a TRUNCATION ceiling, not an allocation:
+  # real batches pad to the longest sample in the batch, which is still ~800.
+  # Raising the ceiling does not raise the memory bill.
+  max_prompt_tokens: 32768
+  max_total_tokens: 32768
 
   validation_size: 48
 
@@ -198,15 +200,15 @@ gkd:
   lmbda: 0.0
   beta: 0.5
   temperature: 0.7
-  # Output ceiling: 2048 tokens.
+  # No practical cap: 8192, against explanations that run to ~306 tokens. The
+  # model reaches end-of-turn long before this, so the number never binds - it
+  # is a runaway guard, not a length.
   #
-  # Unused while lmbda is 0.0 - no generation happens at all - so this costs
-  # nothing today. It matters the moment lmbda is raised, and it is generation
-  # length that dominates GKD's cost: each on-policy sample is this many
-  # SEQUENTIAL forward passes against one for a supervised batch. Explanations
-  # run to ~306 tokens, so 2048 is a generous ceiling the model should reach EOS
-  # well inside, not a target.
-  max_new_tokens: 2048
+  # Unused while lmbda is 0.0 (no generation happens at all), so it costs
+  # nothing today. It matters the moment lmbda is raised, and generation length
+  # is what dominates GKD's cost: each on-policy sample is this many SEQUENTIAL
+  # forward passes against one for a supervised batch.
+  max_new_tokens: 8192
   seq_kd: false
 
 evaluation:
@@ -229,12 +231,13 @@ evaluation:
   # a reasoning chain a step longer than the student has ever been shown. That
   # is a generalisation test, not a broken run.
   arena_file: ./data/enlibra-curriculum/eval-1to5hop.jsonl
-  # 2048. The answer sits AFTER a ~300-token explanation, so a tight ceiling
-  # scores a truncated response as "never answered" rather than as wrong - which
-  # understates the model for a reason that has nothing to do with the model.
-  # Generation stops at EOS, so a model that answers properly never pays for the
-  # headroom; only one that rambles does, and that is worth seeing.
-  arena_max_new_tokens: 2048
+  # No practical cap. The answer sits AFTER a ~300-token explanation, so a tight
+  # ceiling scores a truncated response as "never answered" rather than as wrong,
+  # which understates the model for a reason that has nothing to do with it.
+  # Generation stops at end-of-turn, so a model that answers properly never pays
+  # for the headroom. One that rambles does - and the `unanswered` column is
+  # where you will see that, which is worth knowing rather than hiding.
+  arena_max_new_tokens: 8192
   arena_elo_rounds: 25
 
 # Generated at benchmark_every steps to make quality drift visible during the
