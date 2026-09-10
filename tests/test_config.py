@@ -314,6 +314,71 @@ def test_strip_meta():
     assert "_meta" not in kdc.strip_meta(cfg)
 
 
+def test_every_data_files_entry_exists():
+    """Every domain's `data_files` names a file that is really on disk.
+
+    `kd check` resolves a profile without ever opening the dataset, so a domain
+    pointing at a renamed corpus file resolves cleanly and fails much later, in
+    the smoke stage, after the models have loaded. That has happened: a profile
+    was updated to a new corpus filename and the smoke profile that overrides
+    its `domains` block was not, so the two disagreed about which files exist.
+
+    Only local sources are checked. A Hub id is not this test's business.
+    """
+    import glob
+
+    offences = []
+    for path in sorted(glob.glob(os.path.join(CONFIGS, "*.yaml"))):
+        name = os.path.splitext(os.path.basename(path))[0]
+        if name.startswith("_"):
+            continue
+        resolved = kdc.load_config(path, use_env=False)
+        dataset = resolved.get("dataset") or {}
+        source = str(dataset.get("source") or "")
+        root = source if os.path.isabs(source) else os.path.join(
+            os.path.dirname(CONFIGS), source)
+        if not os.path.isdir(root):
+            continue  # a Hub id, or an s3:// URI resolved at run time
+        for domain in dataset.get("domains") or []:
+            entries = domain.get("data_files")
+            if not entries:
+                continue
+            for entry in ([entries] if isinstance(entries, str) else entries):
+                if any(ch in entry for ch in "*?["):
+                    continue
+                if not os.path.exists(os.path.join(root, entry)):
+                    offences.append(
+                        f"{name}.yaml: domain '{domain.get('name')}' names "
+                        f"data_files '{entry}', missing from {source}")
+    assert not offences, "configs point at corpus files that do not exist: " \
+        + "; ".join(offences)
+
+
+def test_arena_file_exists_where_named():
+    """evaluation.arena_file, when set, is a real file.
+
+    Same failure shape as above and a worse place to discover it: the arena
+    stage runs after training, so a bad path there wastes the whole run.
+    """
+    import glob
+
+    offences = []
+    for path in sorted(glob.glob(os.path.join(CONFIGS, "*.yaml"))):
+        name = os.path.splitext(os.path.basename(path))[0]
+        if name.startswith("_"):
+            continue
+        arena_file = (kdc.load_config(path, use_env=False).get("evaluation")
+                      or {}).get("arena_file")
+        if not arena_file or str(arena_file).startswith("s3://"):
+            continue
+        target = arena_file if os.path.isabs(arena_file) else os.path.join(
+            os.path.dirname(CONFIGS), arena_file)
+        if not os.path.isfile(target):
+            offences.append(f"{name}.yaml: evaluation.arena_file '{arena_file}'")
+    assert not offences, "configs name held-out sets that do not exist: " \
+        + "; ".join(offences)
+
+
 for _name, _fn in sorted(list(globals().items())):
     if _name.startswith("test_") and callable(_fn):
         check(_name, _fn)

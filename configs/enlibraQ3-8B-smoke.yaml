@@ -53,21 +53,32 @@ dataset:
   # dataset.source is inherited: the corpus is committed, so it is the same
   # directory here as on the pod and there is nothing to switch.
   #
-  # Enough rows from each domain to prove both files are found and parsed, and
-  # that the budgets admit them. The pass rate printed per domain is the number
-  # worth reading: anything below 100% here means max_prompt_tokens or
-  # max_total_tokens is too tight and the real run would train on a fraction of
-  # the corpus.
+  # The SAME domains as the real run, at a fraction of the size. Same names,
+  # same files, same order - only the quotas differ.
+  #
+  # That matters more than it looks. This block overrides the parent's rather
+  # than adding to it, so a domain renamed upstream and not renamed here is a
+  # smoke test that exercises a corpus the real run does not have. Which is
+  # exactly what happened once: the parent moved to sft-1to3hop.jsonl and this
+  # list kept naming files the converter had stopped producing.
+  #
+  # The pass rate printed per domain is the number worth reading: anything below
+  # 100% means max_prompt_tokens or max_total_tokens is too tight, and the real
+  # run would silently train on a fraction of the corpus.
   validation_size: 8
   domains:
-    - name: curriculum-1hop
-      data_files: sft-1hop.jsonl
+    - name: curriculum-sft
+      data_files: sft-1to3hop.jsonl
       quota: 24
       pool: 32
-    - name: curriculum-multihop
-      data_files: sft-2to3hop.jsonl
-      quota: 16
-      pool: 24
+    - name: curriculum-rl
+      data_files: rl-1to2hop.jsonl
+      quota: 8
+      pool: 12
+    - name: identity
+      data_files: identity.jsonl
+      quota: 4
+      pool: 6
 
 lora:
   # A cheap adapter. The point is that the target names resolve against a real
