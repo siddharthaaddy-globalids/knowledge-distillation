@@ -439,6 +439,23 @@ def ensure_peft_adapter(config, log=None):
     return {"source": source, "local": destination, "converted": True}
 
 
+def adapter_dir_of(where):
+    """The adapter DIRECTORY, given either it or a file inside it.
+
+    Copying a path out of a bucket listing or an object URL naturally lands on
+    adapter_config.json, because that is the file you were looking at. Treating
+    that as the directory it names costs one string check and saves a confusing
+    failure two steps later, when the download has already happened and
+    something reports that a directory has no adapter_config.json.
+    """
+    text = str(where or "")
+    for marker in ("adapter_config.json", "adapter_model.safetensors",
+                   ADAPTER_META):
+        if text.rstrip("/").endswith(marker):
+            return text.rstrip("/")[: -len(marker)].rstrip("/")
+    return text
+
+
 def localise(where, config=None, log=None, label="input"):
     """An s3:// URI fetched into the cache; anything else returned unchanged.
 

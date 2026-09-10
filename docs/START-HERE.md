@@ -388,10 +388,48 @@ subcommand to run one piece of it:
 ```
 
 Anything else is passed straight through, so `./run.sh --config X arena --limit
-20` works without the script needing to know that command exists.
+20` and `./run.sh --config X evaluate` work without the script needing to know
+those commands exist.
 
-Anything else is passed straight through, so `./run.sh arena --limit 20` and
-`./run.sh evaluate` work without the script needing to know they exist.
+---
+
+## Scoring an adapter you trained somewhere else
+
+Two ways, depending on how much you want measured.
+
+**The answer key on its own** — who was right, and how alike their explanations
+are. Three models, no training:
+
+```bash
+./run.sh --config configs/enlibraQ25-3B.yaml arena \
+    --adapter s3://enlibra/dss/dev/runs/<run>/outputs/gkd/runs/<run-id>/final_adapter
+```
+
+`--adapter` takes a directory or an `s3://` prefix, which is fetched into
+`s3.cache_dir` first. A path that names `adapter_config.json` works too — that is
+what copying out of a bucket listing gives you.
+
+It writes three files beside each other, whether or not you ask:
+
+| | |
+|---|---|
+| `arena.json` | the numbers — accuracy, Elo, agreement, hop-wise similarity |
+| `arena-transcript.jsonl` | **every question and every word each model said about it**, one line per question |
+| `arena-report.html` | the readable version of `arena.json` |
+
+`--json some/where/score.json` moves all three; `--report=` skips the HTML;
+`--no-save` writes nothing, which is what you want with `--limit 5`.
+
+**Everything the report can show** — the above *plus* fidelity to the teacher,
+perplexity and tokens/sec, which need the `evaluate` stage:
+
+```bash
+./run.sh --config configs/enlibraQ25-3B.yaml --from evaluate \
+    --adapter s3://enlibra/dss/dev/runs/<run>/outputs/gkd/runs/<run-id>/final_adapter
+```
+
+That runs **evaluate → arena → report** into a *new* run directory under `runs/`,
+printed at the end. Add `--skip upload` to keep it off S3.
 
 ---
 

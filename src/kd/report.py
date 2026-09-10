@@ -18,6 +18,58 @@ from datetime import datetime
 # --------------------------------------------------------------------------- #
 # Readable report
 # --------------------------------------------------------------------------- #
+def _arena_summary(arena):
+    """The plain-English reading when the answer key is all there is.
+
+    `kd arena` scores who was RIGHT without loading the machinery kd.evaluate
+    needs to say how closely the student tracks the teacher token by token. That
+    is a smaller report, not a broken one, so it gets its own summary rather
+    than a page of em-dashes where the fidelity numbers would have been.
+    """
+    players = arena.get("players") or {}
+    base, dist = players.get("base"), players.get("distilled")
+    teacher, total = players.get("teacher"), arena.get("questions", 0)
+    lines = []
+    if not (base and dist):
+        return ["Scored on a held-out answer key."]
+
+    pct = lambda e: (e.get("accuracy") or 0) * 100
+    moved = pct(dist) - pct(base)
+    verb = ("is ahead of" if moved > 0 else
+            "is level with" if moved == 0 else "is behind")
+    lines.append(
+        f"On {total} held-out questions the distilled student answered "
+        f"{pct(dist):.1f}% correctly, against {pct(base):.1f}% for the same model "
+        f"before training - it {verb} where it started, by "
+        f"{abs(moved):.1f} points.")
+
+    if teacher:
+        gap = pct(teacher) - pct(base)
+        if gap > 0:
+            closed = moved / gap * 100
+            lines.append(
+                f"The teacher scores {pct(teacher):.1f}%, so the gap training had "
+                f"to close was {gap:.1f} points and it closed {closed:.0f}% of it.")
+        else:
+            lines.append(
+                f"The teacher scores {pct(teacher):.1f}%, at or below the untrained "
+                f"student - so on this set there was no gap to close, and the "
+                f"comparison says more about the questions than about the models.")
+
+    # Answered-vs-correct kept separate, because a model that never produces a
+    # parseable letter scores 0% for a reason that has nothing to do with what
+    # it knows - and that is a fixable problem, unlike being wrong.
+    silent = [n for n, e in players.items() if e.get("answered", 0) < total * 0.9]
+    if silent:
+        lines.append(
+            "Read the answered row before the accuracy row: "
+            + ", ".join(f"{n} produced a parseable answer on "
+                        f"{players[n].get('answered', 0)} of {total}"
+                        for n in sorted(silent))
+            + ". Accuracy counts the rest as wrong.")
+    return lines
+
+
 def plain_summary(payload):
     """Plain-English reading of the numbers, for someone who did not run the job.
 
@@ -25,6 +77,11 @@ def plain_summary(payload):
     that a reader should not have to know what perplexity is to learn whether the
     training worked.
     """
+    # An arena-only payload: `kd arena --report` writes one, and it carries the
+    # answer key without any of the token-level measurements below.
+    if "fidelity" not in payload:
+        return _arena_summary(payload.get("arena") or {})
+
     fid, cap = payload["fidelity"], payload["capability"]
     lift = fid["agreement_lift_pts"]
     recovered = cap.get("gap_recovered_pct")
@@ -78,9 +135,27 @@ def plain_summary(payload):
     return lines
 
 
+# What the four columns mean unless a section says otherwise. Most sections
+# compare the three models; the similarity table compares three PAIRS of them,
+# and labelling its columns with model names would misdescribe every cell.
+DEFAULT_HEADERS = ("Metric", "Base student", "Distilled", "Teacher")
+
+
+def _sections(payload):
+    """(title, rows, headers) for every section, headers defaulted."""
+    return [(s[0], s[1], s[2] if len(s) > 2 else DEFAULT_HEADERS)
+            for s in _report_rows(payload)]
+
+
 def _report_rows(payload):
-    """(section, [(label, base, distilled, teacher)]) for both report formats."""
-    fid, cap, eff = payload["fidelity"], payload["capability"], payload["efficiency"]
+    """(section, [(label, base, distilled, teacher)]) for both report formats.
+
+    A section may carry a third element, its own column headers, for a table
+    whose columns are not the three models.
+    """
+    fid = payload.get("fidelity")
+    cap = payload.get("capability")
+    eff = payload.get("efficiency")
     close = payload.get("closeness_to_teacher") or {}
     fmt = lambda v, spec=".4f": (format(v, spec)
                                  if isinstance(v, (int, float)) and math.isfinite(v)
@@ -135,6 +210,43 @@ def _report_rows(payload):
             (f"The answer key — {total} held-out questions "
              f"(random baseline {arena.get('random_baseline', 0.25) * 100:.0f}%)",
              rows))
+
+    # Hop-wise cosine between the players' EXPLANATIONS. Computed by the arena,
+    # and until now visible only in the terminal - which meant the one table
+    # that says whether the student reasons like its teacher never reached the
+    # file people actually read.
+    #
+    # Shaped to the four-column table like everything else: one row per hop,
+    # the three columns being the three pairs rather than the three players.
+    # The header is overridden below, because "Base student / Distilled /
+    # Teacher" would be a lie about what these numbers compare.
+    asim = arena.get("similarity") or {}
+    if asim.get("pairs"):
+        pairs = asim["pairs"]
+        want = ("base vs teacher", "distilled vs teacher", "base vs distilled")
+
+        def cell(pair, hop=None):
+            entry = pairs.get(pair) or pairs.get(" vs ".join(reversed(pair.split(" vs "))))
+            if not entry:
+                return "-"
+            value = (entry.get("overall") if hop is None
+                     else (entry.get("by_hop", {}).get(hop) or {}).get("cosine"))
+            return fmt(value, ".3f")
+
+        rows = []
+        for hop in asim.get("hops") or []:
+            counted = ((pairs.get(want[0]) or {}).get("by_hop", {}).get(hop) or {})
+            rows.append((f"{hop} hop  ({counted.get('n', 0)} questions)",
+                         *(cell(p, hop) for p in want)))
+        rows.append(("All questions", *(cell(p) for p in want)))
+        sections.append((
+            "How alike are the explanations? (cosine 0-1, by reasoning depth)",
+            rows,
+            ("Reasoning depth", "Base vs teacher", "Distilled vs teacher",
+             "Base vs distilled")))
+
+    if not (fid and cap and eff):
+        return sections
 
     sections += [
         ("How close is the student to the teacher?", [
@@ -322,17 +434,39 @@ def _render_html(payload, facts, sections, summary):
         f"<style>{_REPORT_CSS}</style>",
     ]
 
+    student = str(payload.get("student") or "the student").split("/")[-1]
+    teacher = str(payload.get("teacher") or "").split("/")[-1]
     body = ['<div class="wrap"><header>',
             '<p class="eyebrow">Knowledge distillation &middot; evaluation</p>',
-            f'<h1>{esc(payload["student"].split("/")[-1])}</h1>',
-            f'<p class="lede">Distilled from <strong>'
-            f'{esc(payload["teacher"].split("/")[-1])}</strong>, then measured against '
-            f'it and against its own untrained self.</p></header>']
+            f'<h1>{esc(student)}</h1>',
+            (f'<p class="lede">Distilled from <strong>{esc(teacher)}</strong>, '
+             f'then measured against it and against its own untrained self.</p>'
+             if teacher else
+             '<p class="lede">Measured against its own untrained self on a '
+             'held-out answer key.</p>'),
+            '</header>']
+
+    # The headline number is the share of the teacher gap that training closed.
+    # kd.evaluate measures it token by token; with only an arena payload the
+    # same quantity is available from the accuracy columns, and the caption says
+    # which one is on the page rather than leaving them to look identical.
+    arena_players = (payload.get("arena") or {}).get("players") or {}
+    caption = "of the distance to the teacher, closed by training"
+    if not isinstance(recovered, (int, float)) or not math.isfinite(recovered):
+        recovered = None
+        base, dist, tea = (arena_players.get("base"), arena_players.get("distilled"),
+                           arena_players.get("teacher"))
+        if base and dist and tea:
+            gap = (tea.get("accuracy") or 0) - (base.get("accuracy") or 0)
+            if gap > 0:
+                recovered = ((dist.get("accuracy") or 0)
+                             - (base.get("accuracy") or 0)) / gap * 100
+                caption = "of the teacher's lead on the answer key, closed by training"
 
     big = (f"{recovered:.0f}%" if isinstance(recovered, (int, float))
            and math.isfinite(recovered) else "&mdash;")
     body.append(f'<section class="verdict"><div><div class="big">{big}'
-                '<span>of the distance to the teacher, closed by training</span>'
+                f'<span>{caption}</span>'
                 '</div></div><div>'
                 + "".join(f"<p>{esc(line)}</p>" for line in summary)
                 + '</div></section>')
@@ -340,14 +474,15 @@ def _render_html(payload, facts, sections, summary):
     if bars:
         body.append(f'<section><h2>How far it moved</h2>{bars}</section>')
 
-    for title, rows in sections:
+    for title, rows, headers in sections:
         cells = "".join(
             f'<tr><td>{esc(label)}</td><td class="c-b">{esc(b)}</td>'
             f'<td class="c-d">{esc(d)}</td><td class="c-t">{esc(t)}</td></tr>'
             for label, b, d, t in rows)
+        head_cells = "".join(f"<th>{esc(h)}</th>" for h in headers)
         body.append(
             f'<section><h2>{esc(title)}</h2><div class="tbl"><table><thead><tr>'
-            '<th>Metric</th><th>Base student</th><th>Distilled</th><th>Teacher</th>'
+            f'{head_cells}'
             f'</tr></thead><tbody>{cells}</tbody></table></div></section>')
 
     body.append('<section><h2>This run</h2><dl>'
@@ -368,33 +503,50 @@ def write_report(payload, path):
     """Write a human-readable report. Format chosen by the file extension."""
     target = pathlib.Path(path)
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    sections = _report_rows(payload)
+    sections = _sections(payload)
     summary = plain_summary(payload)
-    facts = [
-        ("Teacher", payload["teacher"] + (f"  + {payload['teacher_adapter']}"
-                                          if payload.get("teacher_adapter") else "")),
-        ("Student", payload["student"]),
-        ("Adapter evaluated", payload["adapter"]),
-        ("Hardware", f"{payload['device']} ({payload['dtype']})"),
-        ("Held-out samples", f"{payload['samples']} "
-                             f"({payload['completion_tokens']} scored tokens)"),
-        ("Generated", stamp),
-    ]
+
+    # Built by appending what is present rather than by indexing what should be:
+    # an arena-only payload carries the answer key and the models, and none of
+    # the token-level fields kd.evaluate adds.
+    arena = payload.get("arena") or {}
+    facts = []
+    if payload.get("teacher"):
+        facts.append(("Teacher", payload["teacher"]
+                      + (f"  + {payload['teacher_adapter']}"
+                         if payload.get("teacher_adapter") else "")))
+    if payload.get("student"):
+        facts.append(("Student", payload["student"]))
+    if payload.get("adapter") or arena.get("adapter"):
+        facts.append(("Adapter evaluated",
+                      payload.get("adapter") or arena.get("adapter")))
+    if payload.get("device"):
+        facts.append(("Hardware", f"{payload['device']} ({payload.get('dtype')})"))
+    if payload.get("samples") is not None:
+        facts.append(("Held-out samples",
+                      f"{payload['samples']} "
+                      f"({payload.get('completion_tokens')} scored tokens)"))
+    if arena.get("questions"):
+        facts.append(("Answer key", f"{arena['questions']} questions"
+                      + (f" from {arena['arena_file']}"
+                         if arena.get("arena_file") else "")))
+    facts.append(("Generated", stamp))
 
     if target.suffix.lower() in (".html", ".htm"):
         target.write_text(_render_html(payload, facts, sections, summary),
                           encoding="utf-8")
     else:
-        out = ["# Distillation evaluation", "",
-               f"`{payload['student']}` distilled from `{payload['teacher']}`", "",
-               "## Summary", ""]
+        lede = (f"`{payload['student']}` distilled from `{payload['teacher']}`"
+                if payload.get("student") and payload.get("teacher")
+                else "Scored on a held-out answer key")
+        out = ["# Distillation evaluation", "", lede, "", "## Summary", ""]
         out += [f"{line}\n" for line in summary]
         out += ["", "## Run", "", "| | |", "|---|---|"]
         out += [f"| {k} | {v} |" for k, v in facts]
-        for title, rows in sections:
+        for title, rows, headers in sections:
             out += ["", f"## {title}", "",
-                    "| Metric | Base student | Distilled | Teacher |",
-                    "|---|---|---|---|"]
+                    "| " + " | ".join(headers) + " |",
+                    "|" + "---|" * len(headers)]
             out += [f"| {label} | {b} | **{d}** | {t} |" for label, b, d, t in rows]
         out += ["", "---", "",
                 "Every metric is reported for the untrained base student as well, "

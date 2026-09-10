@@ -159,6 +159,13 @@ student (no adapter, the control), the **distilled** student, and the
 **teacher** (the ceiling). Distilled below base means training hurt; distilled
 level with base means the format transferred but the capability did not.
 
+Whichever way it runs — as a pipeline stage or as `kd arena` — it writes
+`arena.json` (the numbers, including the hop-wise cosine between the players'
+explanations), `arena-transcript.jsonl` (every question and every word each
+player said about it) and an HTML report. The standalone command writes them
+beside its `--json` path, defaulting to the working directory; `--no-save`
+suppresses all three, for a `--limit` smoke check.
+
 ## `lora`
 
 | Key | Default | Meaning |

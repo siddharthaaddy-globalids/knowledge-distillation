@@ -80,7 +80,32 @@ class Context:
     # work in a pipeline that had already run the earlier stages in the same
     # invocation - which is exactly the case they exist for.
     def resolve_adapter(self):
-        """This run's adapter, else the newest one any run produced."""
+        """The named adapter, else this run's, else the newest one any run made.
+
+        `--adapter` wins over discovery because it is an instruction, not a
+        hint: someone who names an adapter is scoring THAT one, and silently
+        falling back to whatever a previous run left under runs_dir would
+        produce a report about the wrong weights - the worst kind of wrong,
+        since every number in it would look perfectly reasonable.
+        """
+        from . import paths
+
+        named = self.options.get("adapter")
+        if named:
+            # adapter_dir_of first: a path copied out of a bucket listing names
+            # adapter_config.json, and the directory is what loads.
+            named = paths.adapter_dir_of(named)
+            # Written back so the next stage to ask sees a local path: localise
+            # is a no-op on one, so evaluate and arena share the one download
+            # without either needing to know the other ran.
+            named = paths.localise(named, self.config, log=self.log,
+                                   label="adapter")
+            self.options["adapter"] = named
+            if not runlog.is_adapter(named):
+                raise StageFailed(
+                    f"--adapter {named} is not a LoRA adapter directory: no "
+                    f"adapter_config.json in it.")
+            return named
         if runlog.is_adapter(self.results.get("adapter")):
             return self.results["adapter"]
         if runlog.is_adapter(self.run.adapter_dir):
@@ -429,11 +454,21 @@ def stage_report(ctx):
     from .report import write_report
 
     payload_path = ctx.resolve_evaluation()
-    if not payload_path:
-        raise StageFailed("no evaluation to report on - run the evaluate stage first")
-
-    with open(payload_path, encoding="utf-8") as handle:
-        payload = json.load(handle)
+    if payload_path:
+        with open(payload_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    else:
+        # An arena score with no evaluation beside it is a smaller report, not a
+        # missing one - and refusing to write it would mean a run that scored
+        # three models on a held-out set ends with nothing a person can read.
+        payload = {
+            "student": ctx.config["models"].get("student"),
+            "teacher": ctx.config["models"].get("teacher"),
+            "teacher_adapter": ctx.config["models"].get("teacher_adapter"),
+            "device": ctx.hardware["device"],
+            "dtype": ctx.hardware.get("dtype_name"),
+        }
+        ctx.log.info("      no evaluation found - reporting on the answer key alone")
 
     # The arena writes its own file, and the report is a separate stage that may
     # run in a later invocation - so it is read from disk rather than passed
@@ -442,6 +477,11 @@ def stage_report(ctx):
     if arena_path and os.path.isfile(arena_path):
         with open(arena_path, encoding="utf-8") as handle:
             payload["arena"] = json.load(handle)
+
+    if not payload_path and not payload.get("arena"):
+        raise StageFailed(
+            "nothing to report on: no evaluation.json and no arena.json, in this "
+            "run or any earlier one. Run the evaluate or arena stage first.")
 
     suffix = str((ctx.config.get("evaluation") or {}).get("report_format", "html"))
     written = write_report(payload, ctx.run.path(f"report.{suffix.lstrip('.')}"))

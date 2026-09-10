@@ -356,7 +356,8 @@ def main(argv=None):
             raise SystemExit(f"xx  no such merged model directory: {merged}")
         model, tokenizer, device = load_merged(merged, args.device, args.dtype)
     else:
-        adapter = localise(args.adapter, "adapter")
+        from kd import paths
+        adapter = localise(paths.adapter_dir_of(args.adapter), "adapter")
         if not os.path.isdir(adapter):
             raise SystemExit(f"xx  no such adapter directory: {adapter}")
         model, tokenizer, device = merge(

@@ -830,7 +830,16 @@ def main(args=None):
         parser.add_argument("--device", default=None,
                             help="auto | cpu | mps | cuda")
         parser.add_argument("--json", default=None, metavar="PATH",
-                            help="Write the payload here")
+                            help="Where the payload goes (default: ./arena.json). "
+                                 "The transcript and the report are written "
+                                 "beside it.")
+        parser.add_argument("--report", default=None, metavar="PATH",
+                            help="Write an HTML report too (default: "
+                                 "<json>-report.html). --report= (empty) skips it.")
+        parser.add_argument("--no-save", action="store_true",
+                            help="Print the tables and write nothing. For a "
+                                 "--limit smoke check, where the output is not "
+                                 "worth keeping.")
         args = parser.parse_args()
 
     from .config import load_config, resolve_device
@@ -861,7 +870,10 @@ def main(args=None):
     from . import paths
 
     try:
-        adapter = (paths.localise(args.adapter, config, log=log, label="adapter")
+        # Tolerant of a path that names a file inside the adapter, which is
+        # what copying out of a bucket listing gives you.
+        adapter = (paths.localise(paths.adapter_dir_of(args.adapter), config,
+                                  log=log, label="adapter")
                    if args.adapter else None)
         path = paths.localise(path, config, log=log, label="held-out set")
     except RuntimeError as exc:
@@ -915,8 +927,47 @@ def main(args=None):
     log.info("")
     log.info(render(payload))
 
-    if getattr(args, "json", None):
-        with open(args.json, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-        log.info(f"\n  wrote {args.json}")
+    # Saved unless refused, rather than saved only when asked. Scoring three
+    # players over a held-out set costs hours and cannot be reconstructed from a
+    # terminal buffer - so the default that throws that away is the wrong one.
+    # The transcript in particular exists nowhere else: it is the only record of
+    # what each model actually SAID, question by question.
+    if getattr(args, "no_save", False):
+        log.info("")
+        log.info("  --no-save: nothing written")
+        return 0
+
+    target = getattr(args, "json", None) or "arena.json"
+    stem = target[:-5] if target.endswith(".json") else target
+    directory = os.path.dirname(os.path.abspath(target))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    with open(target, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    transcript = write_transcript(f"{stem}-transcript.jsonl", questions,
+                                  predictions, formats, completions)
+    log.info("")
+    log.info(f"  wrote {target}         the numbers")
+    log.info(f"  wrote {transcript}   every question, every answer, in full")
+
+    # An arena-only report: the answer key and the similarity table, without the
+    # token-level sections kd.evaluate produces. Smaller than the pipeline's
+    # report, and honest about it rather than padded with blanks.
+    report = getattr(args, "report", None)
+    if report is None:
+        report = f"{stem}-report.html"
+    if report:
+        from .report import write_report
+
+        written = write_report({
+            "arena": payload,
+            "student": config["models"].get("student"),
+            "teacher": config["models"].get("teacher"),
+            "teacher_adapter": config["models"].get("teacher_adapter"),
+            "adapter": str(adapter) if adapter else None,
+            "device": hardware["device"],
+            "dtype": hardware.get("dtype_name"),
+        }, report)
+        log.info(f"  wrote {written}       the readable summary")
     return 0

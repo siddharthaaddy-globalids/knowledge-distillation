@@ -193,7 +193,8 @@ def cmd_pipeline(args):
             only=args.only,
             start_from=getattr(args, "from"),
             skip=args.skip,
-            options={"allow_bad_teacher": args.allow_bad_teacher},
+            options={"allow_bad_teacher": args.allow_bad_teacher,
+                     "adapter": getattr(args, "adapter", None)},
             price_per_hour=price,
         )
 
@@ -365,6 +366,11 @@ def build_parser():
                           help="Start at this stage and run everything after it")
     pipeline.add_argument("--skip", action="append", default=[], metavar="STAGE",
                           help="Skip this stage, repeatable")
+    pipeline.add_argument("--adapter", metavar="PATH_OR_URI",
+                          help="Score this adapter instead of one produced by "
+                               "this run. A directory, or an s3:// URI, which is "
+                               "fetched. Use with --from evaluate to score an "
+                               "adapter trained on another machine.")
     pipeline.add_argument("--allow-bad-teacher", action="store_true",
                           help="Train even if the teacher fails its pre-flight check "
                                "(not recommended)")

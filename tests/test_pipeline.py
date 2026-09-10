@@ -443,6 +443,56 @@ def test_evaluation_falls_back_to_the_newest_run(workspace):
         run.close()
 
 
+def test_named_adapter_beats_the_newest_run(workspace):
+    """--adapter is an instruction, not a hint: discovery must not override it."""
+    config, seeded = _seed_previous_run(workspace)
+    named = os.path.join(workspace, "elsewhere", "final_adapter")
+    os.makedirs(named, exist_ok=True)
+    with open(os.path.join(named, "adapter_config.json"), "w") as fh:
+        fh.write("{}")
+    ctx, run = _fresh_context(workspace, config)
+    ctx.options["adapter"] = named
+    try:
+        found = ctx.resolve_adapter()
+        assert os.path.normpath(found) == os.path.normpath(named), found
+        assert os.path.normpath(seeded) not in os.path.normpath(found)
+    finally:
+        run.close()
+
+
+def test_named_adapter_accepts_a_file_inside_it(workspace):
+    """A path copied out of a bucket listing names adapter_config.json."""
+    config = make_config(workspace)
+    named = os.path.join(workspace, "elsewhere2", "final_adapter")
+    os.makedirs(named, exist_ok=True)
+    with open(os.path.join(named, "adapter_config.json"), "w") as fh:
+        fh.write("{}")
+    ctx, run = _fresh_context(workspace, config)
+    ctx.options["adapter"] = os.path.join(named, "adapter_config.json")
+    try:
+        assert os.path.normpath(ctx.resolve_adapter()) == os.path.normpath(named)
+    finally:
+        run.close()
+
+
+def test_named_adapter_that_is_not_one_fails_loudly(workspace):
+    """Better a stage failure than a report about weights that were never read."""
+    config = make_config(workspace)
+    empty = os.path.join(workspace, "not-an-adapter")
+    os.makedirs(empty, exist_ok=True)
+    ctx, run = _fresh_context(workspace, config)
+    ctx.options["adapter"] = empty
+    try:
+        try:
+            ctx.resolve_adapter()
+        except pipeline.StageFailed as exc:
+            assert "adapter_config.json" in str(exc), exc
+        else:
+            raise AssertionError("a directory with no adapter in it was accepted")
+    finally:
+        run.close()
+
+
 def test_no_previous_run_resolves_to_nothing(workspace):
     config = make_config(workspace)
     ctx, run = _fresh_context(workspace, config)
