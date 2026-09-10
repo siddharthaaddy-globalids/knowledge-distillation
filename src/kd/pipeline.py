@@ -120,6 +120,32 @@ class Context:
             return newest
         return None
 
+    def ensure_inputs(self):
+        """Fetch any s3:// input that preflight has not already fetched.
+
+        preflight is where remote inputs are normally resolved, and every stage
+        after it inherits a config whose paths are local. But `--from arena` and
+        `--only evaluate` do not run preflight, so those stages would hand a raw
+        `s3://...` string to from_pretrained and get "Repo id must be in the form
+        namespace/repo_name" - a message about the Hub, for a problem that has
+        nothing to do with the Hub.
+
+        Called by the stages that load a model, not by the pipeline, and that
+        distinction is the point: `--only report` must not trigger a multi-
+        gigabyte download to render an HTML file from JSON it already has.
+
+        A no-op once the config holds local paths, so calling it twice costs a
+        dictionary scan.
+        """
+        from . import paths
+
+        if not paths.remote_values(self.config):
+            return
+        try:
+            paths.resolve_inputs(self.config, self.log)
+        except Exception as exc:
+            raise StageFailed(str(exc)) from exc
+
     def resolve_evaluation(self):
         """This run's evaluation payload, else the newest run that has one."""
         return self._newest("evaluation", "evaluation.json", "evaluation")
@@ -202,6 +228,8 @@ def stage_teacher_check(ctx):
 
     from . import teacher
 
+    ctx.ensure_inputs()
+
     args = argparse.Namespace(
         config=ctx.config["_meta"].get("source"),
         teacher=ctx.config["models"]["teacher"],
@@ -234,6 +262,7 @@ def stage_smoke(ctx):
 
     from .train import train
 
+    ctx.ensure_inputs()
     scratch = ctx.run.path("smoke-checkpoints")
     try:
         summary = train(ctx.config, ctx.hardware, ctx.run, dry_run=True,
@@ -263,6 +292,7 @@ def stage_train(ctx):
     """The run itself, under the budget."""
     from .train import train
 
+    ctx.ensure_inputs()
     summary = train(ctx.config, ctx.hardware, ctx.run,
                     allow_bad_teacher=ctx.options.get("allow_bad_teacher", False),
                     callbacks=[LimitCallback(ctx.budget, ctx.run)])
@@ -276,6 +306,8 @@ def stage_evaluate(ctx):
     import argparse
 
     from . import evaluate
+
+    ctx.ensure_inputs()
 
     adapter = ctx.resolve_adapter()
     if not adapter:
@@ -334,6 +366,7 @@ def stage_arena(ctx):
 
     from . import arena
 
+    ctx.ensure_inputs()
     settings = ctx.config.get("evaluation") or {}
     path = settings.get("arena_file")
     questions, skipped = arena.load_questions(path)
