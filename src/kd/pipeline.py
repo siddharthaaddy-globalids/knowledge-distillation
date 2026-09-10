@@ -92,11 +92,17 @@ class Context:
             return found[0]
         return None
 
-    def resolve_evaluation(self):
-        """This run's evaluation payload, else the newest run that has one."""
+    def _newest(self, key, filename, what):
+        """This run's `filename`, else the newest any run produced, else None.
+
+        The rule that makes `--only report` and `--from report` mean anything:
+        those open a NEW run directory, so the file a later stage wants was
+        written by an earlier invocation and has to be found rather than
+        assumed.
+        """
         import glob
 
-        candidate = self.results.get("evaluation") or self.run.path("evaluation.json")
+        candidate = self.results.get(key) or self.run.path(filename)
         if os.path.isfile(candidate):
             return candidate
         runs_dir = self.config["project"].get("runs_dir") or "./runs"
@@ -105,14 +111,26 @@ class Context:
         # naming an alias instead of a run id makes the log say something that
         # will not be true tomorrow.
         found = sorted(
-            (p for p in glob.glob(os.path.join(runs_dir, "*", "evaluation.json"))
+            (p for p in glob.glob(os.path.join(runs_dir, "*", filename))
              if not runlog.is_latest_alias(p, runs_dir)),
             key=os.path.getmtime, reverse=True)
         if found:
             newest = os.path.normpath(found[0]).replace("\\", "/")
-            self.log.info(f"      using the newest evaluation found: {newest}")
+            self.log.info(f"      using the newest {what} found: {newest}")
             return newest
         return None
+
+    def resolve_evaluation(self):
+        """This run's evaluation payload, else the newest run that has one."""
+        return self._newest("evaluation", "evaluation.json", "evaluation")
+
+    def resolve_arena(self):
+        """This run's arena payload, else the newest run that has one.
+
+        Optional, unlike the evaluation: a profile with no arena_file never
+        produces one, and the report is complete without it.
+        """
+        return self._newest("arena", "arena.json", "arena score")
 
 
 # --------------------------------------------------------------------------- #
@@ -334,13 +352,14 @@ def stage_arena(ctx):
             f"{ctx.config['project'].get('runs_dir')}")
 
     ctx.log.info(f"      {len(questions)} held-out questions from {path}")
-    predictions = arena.play(
+    predictions, formats, unanswered, completions = arena.play(
         ctx.config, ctx.hardware, adapter, questions,
         max_new_tokens=int(settings.get("arena_max_new_tokens") or 512),
         log=ctx.log)
 
     payload = arena.summarise(
         predictions, [q["gold"] for q in questions],
+        formats=formats, unanswered=unanswered,
         rounds=int(settings.get("arena_elo_rounds") or 25),
         seed=int(ctx.config["project"]["seed"]))
     payload["arena_file"] = str(path)
@@ -350,12 +369,20 @@ def stage_arena(ctx):
     with open(target, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
 
+    # The full transcript beside it: every question, and every word each player
+    # said about it. Separate from arena.json because it is large and read for a
+    # different reason - the numbers to see WHAT happened, this to see WHY.
+    transcript = arena.write_transcript(
+        ctx.run.path("arena-transcript.jsonl"), questions, predictions, formats,
+        completions)
+    ctx.log.info(f"      transcript: {transcript}")
+
     ctx.log.info("")
     for line in arena.render(payload).splitlines():
         ctx.log.info(line)
     ctx.run.write_metrics({"arena": payload["players"]})
     ctx.run.event("arena", "ratings", **payload["players"])
-    return {"arena": target}
+    return {"arena": target, "arena_transcript": transcript}
 
 
 def stage_report(ctx):
@@ -374,8 +401,8 @@ def stage_report(ctx):
     # The arena writes its own file, and the report is a separate stage that may
     # run in a later invocation - so it is read from disk rather than passed
     # through ctx.results, which `--only report` would not have populated.
-    arena_path = ctx.results.get("arena") or ctx.run.path("arena.json")
-    if os.path.isfile(arena_path):
+    arena_path = ctx.resolve_arena()
+    if arena_path and os.path.isfile(arena_path):
         with open(arena_path, encoding="utf-8") as handle:
             payload["arena"] = json.load(handle)
 

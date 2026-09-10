@@ -362,6 +362,14 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
         report_to=[],
         dataloader_num_workers=0,
     )
+    if training_cfg.get("gradient_checkpointing"):
+        config_kwargs["gradient_checkpointing"] = True
+        # use_reentrant=False is required with PEFT: the reentrant implementation
+        # does not see the LoRA branches as needing grad, so the checkpointed
+        # segments come back with nothing to differentiate and the step silently
+        # does no learning.
+        config_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+        print(" -> gradient checkpointing on (about 30% slower, far less memory)")
     if use_eval:
         config_kwargs.update(
             eval_strategy="steps",

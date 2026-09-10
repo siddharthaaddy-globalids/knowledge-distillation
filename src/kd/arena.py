@@ -47,22 +47,73 @@ import os
 import random
 import re
 
-# `<Answer>:` - the colon sits inside the tag in the curriculum exports, and the
-# letter is on its own line after it. Matched loosely enough to survive a model
-# dropping the colon or the newline, which they do.
-ANSWER_PATTERN = re.compile(r"<Answer>\s*:?\s*\n?\s*([A-Z])\b", re.IGNORECASE)
+# The letters an option can be. Deliberately narrow: `[A-Z]` would let a stray
+# capital in prose - and English is full of "A" and "I" - be read as an answer.
+OPTIONS = "A-F"
 
-# Standard chess constants. K is the step size per match; 400 is the rating
-# difference that corresponds to a 10:1 expected score.
+# How an answer might be written, most specific first.
+#
+# ONE of these is the format the curriculum teaches and the student is trained
+# to produce. The rest are how a model that was never taught that format still
+# manages to answer, and leaving them out is how every player in an arena scores
+# zero while answering most questions correctly in plain English.
+#
+# That is not hypothetical: the first real run scored base, distilled AND
+# teacher at 0% with everything unanswered. When every player fails identically,
+# the parser is wrong, not the players.
+ANSWER_PATTERNS = [
+    # The curriculum's own shape: an <Answer> tag with the letter after it.
+    # Tried first, so a tagged answer always beats whatever the explanation
+    # above it happened to mention.
+    ("tagged", re.compile(rf"<Answer>\s*:?\s*\n?\s*([{OPTIONS}])\b", re.I)),
+    # "the answer is C", "Answer: D", "answer is **B**"
+    ("labelled", re.compile(
+        rf"\banswers?\s*(?:is|:|=)\s*\**\(?([{OPTIONS}])\)?\b", re.I)),
+    # "option C", "choice B"
+    ("named", re.compile(
+        rf"\b(?:option|choice)\s+\**\(?([{OPTIONS}])\)?\b", re.I)),
+    # A line that is nothing but the letter: "C", "**C**", "(C)", "D."
+    # Anchored to the whole line, so "A star forms..." cannot match.
+    ("bare", re.compile(
+        rf"(?:^|\n)[ \t]*\**\(?([{OPTIONS}])\)?\**[ \t]*[.):]?[ \t]*$", re.M)),
+]
+
+# How many unanswered completions to keep per player, and how much of each.
+# Enough to see the pattern - they are nearly always the same failure repeated -
+# without turning arena.json into a transcript.
+UNANSWERED_KEPT = 5
+UNANSWERED_CHARS = 800
+
 K_FACTOR = 24
 START_RATING = 1000.0
 RATING_SCALE = 400.0
 
 
+def extract_answer_detail(text):
+    """(letter, how it was written), or (None, None) if it never committed.
+
+    Patterns are tried in order, and within a pattern the LAST match wins. Both
+    rules matter: a model discusses the options before concluding, so the first
+    "option B" in a paragraph is usually something being ruled out, and the last
+    is the conclusion.
+
+    `how` is worth carrying because "answered" and "answered in the format it
+    was trained to produce" are different achievements. A student answering
+    `tagged` learned the curriculum's shape; one answering `labelled` is
+    answering in spite of it.
+    """
+    if not text:
+        return None, None
+    for how, pattern in ANSWER_PATTERNS:
+        found = pattern.findall(text)
+        if found:
+            return found[-1].upper(), how
+    return None, None
+
+
 def extract_answer(text):
     """The letter a completion settled on, or None when it never committed."""
-    match = ANSWER_PATTERN.search(text or "")
-    return match.group(1).upper() if match else None
+    return extract_answer_detail(text)[0]
 
 
 def load_questions(path):
@@ -207,7 +258,8 @@ def letter_agreement(predictions):
     return table
 
 
-def summarise(predictions, golds, rounds=25, seed=42):
+def summarise(predictions, golds, formats=None, unanswered=None,
+              rounds=25, seed=42):
     """The whole payload: what each player answered, how often it was right, Elo.
 
     Two accuracies, deliberately, because they answer different questions and a
@@ -225,11 +277,21 @@ def summarise(predictions, golds, rounds=25, seed=42):
     total = len(golds)
     results = correctness(predictions, golds)
     ratings = elo(results, rounds=rounds, seed=seed)
+    formats = formats or {}
+    unanswered = unanswered or {}
 
     players = {}
     for name, picks in predictions.items():
         answered = sum(1 for p in picks if p is not None)
         hits = sum(1 for p, g in zip(picks, golds) if p == g)
+        # How each answer was written, counted. "tagged" is the curriculum's own
+        # shape, so it is the one that says the FORMAT transferred - a student
+        # answering correctly in prose has learned the content and not the form,
+        # which is a different result and worth being able to see.
+        how = {}
+        for value in formats.get(name) or []:
+            if value:
+                how[value] = how.get(value, 0) + 1
         players[name] = {
             "answered": answered,
             "questions": total,
@@ -237,6 +299,11 @@ def summarise(predictions, golds, rounds=25, seed=42):
             "accuracy": (hits / total) if total else None,
             "accuracy_when_answered": (hits / answered) if answered else None,
             "unanswered": total - answered,
+            "answer_formats": how,
+            "in_trained_format": how.get("tagged", 0),
+            # The completions that produced no letter at all. The only failure
+            # the numbers cannot explain, so the text is kept.
+            "unanswered_examples": unanswered.get(name) or [],
             "elo": round(ratings[name]["rating"], 1),
             "elo_spread": round(ratings[name]["spread"], 1),
         }
@@ -278,6 +345,8 @@ def render(payload):
             lambda n: pct(players[n]["accuracy"])),
         row("correct, when it answered",
             lambda n: pct(players[n]["accuracy_when_answered"])),
+        row("in the trained <Answer> format",
+            lambda n: f"{players[n].get('in_trained_format', 0)}/{total}"),
         row("elo", lambda n: f"{players[n]['elo']:.0f}"),
         row("elo +/-", lambda n: f"{players[n]['elo_spread']:.0f}"),
     ]
@@ -310,6 +379,48 @@ def render(payload):
         "  A gap smaller than it is noise.",
     ]
     return "\n".join(lines)
+
+
+def write_transcript(path, questions, predictions, formats, completions):
+    """Every question and every word each player said about it, as JSONL.
+
+    One line per QUESTION rather than per player, so the three answers to the
+    same question sit side by side and "why did they differ" is a matter of
+    reading one record instead of joining three files.
+
+    Nothing is truncated. The whole prompt, the whole completion - which for a
+    model that reasons out loud includes its <think> block, since that is simply
+    part of what it generated. arena.json keeps the numbers and a bounded sample;
+    this keeps the evidence, and the evidence is what settles an argument about
+    whether an answer was wrong or merely unparsed.
+
+    JSONL rather than one JSON object because it can be read a line at a time,
+    grepped, and appended to - and because 137 questions times three players
+    times a few thousand characters is a file you want to stream, not load.
+    """
+    names = sorted(predictions)
+    with open(path, "w", encoding="utf-8") as handle:
+        for index, question in enumerate(questions):
+            record = {
+                "question": index + 1,
+                "gold": question["gold"],
+                "prompt": question["prompt"],
+                "players": {
+                    name: {
+                        "answer": predictions[name][index],
+                        # How it was written - "tagged" is the curriculum's own
+                        # shape, anything else is the model answering in spite of
+                        # the format rather than in it.
+                        "how": (formats.get(name) or [None] * len(questions))[index],
+                        "correct": predictions[name][index] == question["gold"],
+                        "completion": (completions.get(name)
+                                       or [""] * len(questions))[index],
+                    }
+                    for name in names
+                },
+            }
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -358,30 +469,66 @@ def _generate(model, tokenizer, prompt, device, max_new_tokens):
 
 def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log,
                 show=0):
-    """Every question, greedily. Returns (correct flags, unanswered count).
+    """Every question, greedily.
 
-    `show` prints the first N completions verbatim. Worth reaching for the
-    moment a player scores 0% with everything unanswered: that is not a model
-    getting the questions wrong, it is a model whose output the <Answer> pattern
-    never matched, and the only way to tell those apart is to read what it said.
+    Returns (predictions, unanswered examples) - a letter or None per question,
+    and the first few completions that produced no letter at all.
+
+    KEEPING THE UNANSWERED ONES MATTERS
+    -----------------------------------
+    An unanswered question is the only failure the numbers cannot explain. A
+    wrong letter is a wrong letter; a missing one could be a model that ran out
+    of tokens mid-explanation, one that answered in prose the pattern does not
+    match, or one that refused - and those have completely different fixes.
+
+    So the completion is kept for a bounded sample of them, and it goes into
+    arena.json. Without it, `unanswered: 4` sends you back to re-run the whole
+    stage with --show just to see what was said. Bounded because the alternative
+    - every completion from every player - is megabytes of text nobody reads
+    when the run went fine.
     """
-    predictions = []
+    predictions, formats, unanswered, completions = [], [], [], []
     for index, question in enumerate(questions, start=1):
         text = _generate(model, tokenizer, question["prompt"], device,
                          max_new_tokens)
-        predicted = extract_answer(text)
+        predicted, how = extract_answer_detail(text)
+        if predicted is None and len(unanswered) < UNANSWERED_KEPT:
+            unanswered.append({
+                "question": index,
+                "gold": question["gold"],
+                "prompt": question["prompt"][:400],
+                # Both ends: the opening says what shape it started in, and the
+                # last line says whether it was still going when the ceiling cut
+                # it off - which is the difference between "wrong format" and
+                # "needed more tokens".
+                "completion_head": text[:UNANSWERED_CHARS],
+                "completion_tail": text[-200:] if len(text) > UNANSWERED_CHARS else "",
+                "completion_chars": len(text),
+            })
         if show and index <= show and log:
             log.info(f"      --- {label} #{index} (gold {question['gold']}, "
                      f"parsed {predicted}) " + "-" * 20)
             for line in text.strip().splitlines()[:24]:
                 log.info(f"        {line}")
         predictions.append(predicted)
+        formats.append(how)
+        completions.append(text)
         if log and (index % 10 == 0 or index == len(questions)):
             hits = sum(1 for p, q in zip(predictions, questions) if p == q["gold"])
             said = sum(1 for p in predictions if p)
             log.info(f"      {label:<10} {index}/{len(questions)}  "
                      f"{hits / index * 100:5.1f}% correct, {said} answered")
-    return predictions
+
+    # A player that never answered anything is the case worth interrupting for -
+    # it is almost always one thing wrong for every question, not many things.
+    if unanswered and log and not any(predictions):
+        example = unanswered[0]
+        log.info(f"      !! {label} answered NONE of {len(questions)}. "
+                 f"What it said to #{example['question']} "
+                 f"({example['completion_chars']} chars):")
+        for line in example["completion_head"].strip().splitlines()[:8]:
+            log.info(f"         {line}")
+    return predictions, formats, unanswered, completions
 
 
 def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
@@ -411,7 +558,7 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
     if log:
         log.info(f"      tokenizer: {source}")
 
-    predictions = {}
+    predictions, formats, unanswered, completions = {}, {}, {}, {}
 
     def run(label, build):
         if log:
@@ -419,7 +566,8 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
         model = build()
         model.eval()
         try:
-            predictions[label] = _answer_all(
+            (predictions[label], formats[label], unanswered[label],
+             completions[label]) = _answer_all(
                 model, tokenizer, questions, device, max_new_tokens, label, log,
                 show=show)
         finally:
@@ -454,7 +602,7 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
             return model
         run("teacher", build_teacher)
 
-    return predictions
+    return predictions, formats, unanswered, completions
 
 
 # --------------------------------------------------------------------------- #
@@ -539,13 +687,14 @@ def main(args=None):
 
     players = tuple(p for p in ("base", "distilled", "teacher")
                     if p not in (args.skip or []))
-    predictions = play(
+    predictions, formats, unanswered, completions = play(
         config, hardware, adapter, questions,
         max_new_tokens=int(args.max_new_tokens
                            or settings.get("arena_max_new_tokens") or 512),
         log=log, players=players, show=int(getattr(args, "show", 0) or 0))
 
     payload = summarise(predictions, [q["gold"] for q in questions],
+                        formats=formats, unanswered=unanswered,
                         rounds=int(settings.get("arena_elo_rounds") or 25),
                         seed=int(config["project"]["seed"]))
     payload["arena_file"] = str(path)

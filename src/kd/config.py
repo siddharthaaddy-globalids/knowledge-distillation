@@ -578,6 +578,26 @@ def resolve_device(config):
             os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", str(ratio))
             notes.append(f"PYTORCH_MPS_HIGH_WATERMARK_RATIO={ratio} (unified memory pool)")
 
+    # --- CUDA allocator ------------------------------------------------------ #
+    if device == "cuda":
+        # Distillation allocates enormous, VARYING tensors: the JSD loss holds
+        # the teacher's logits and the student's at once, each [batch, tokens,
+        # vocab], and with a 150k vocabulary at ~870 tokens that is over half a
+        # gigabyte per tensor. Sequence length changes every step, because each
+        # batch pads to its own longest sample.
+        #
+        # The default caching allocator carves fixed segments, so a run like this
+        # strands gigabytes in blocks that fit nothing being asked for next - it
+        # dies with several GB "reserved but unallocated" and a few hundred MB
+        # free. Observed: 3.5 GB stranded out of 19.5 on an RTX 4000 Ada, at step
+        # 9 of 300.
+        #
+        # expandable_segments lets a segment grow instead, which is what makes
+        # varying shapes reusable. setdefault, so an explicit setting wins.
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        notes.append("PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
+                     "(varying tensor sizes fragment the default allocator)")
+
     # --- dtype --------------------------------------------------------------- #
     bf16_ok = False
     if device == "cuda":

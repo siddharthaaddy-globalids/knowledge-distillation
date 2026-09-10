@@ -35,7 +35,11 @@ UPLOAD_GROUPS = {
     # number anyone asks about first. metrics.json carries a summary of it, but
     # only the summary, so a bundle without this cannot say which questions were
     # scored or how the players actually differed.
-    "metrics": ["metrics.json", "evaluation.json", "arena.json"],
+    "metrics": ["metrics.json", "evaluation.json", "arena.json",
+                # Every question and every word each player said about it. Large
+                # - a few MB - and the thing you want when a number is
+                # surprising, which is exactly when the pod is already gone.
+                "arena-transcript.jsonl"],
     "checkpoints": ["checkpoints/**"],
 }
 

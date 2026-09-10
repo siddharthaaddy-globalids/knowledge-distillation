@@ -114,6 +114,16 @@ training:
   save_total_limit: 2
   eval_enabled: true
   benchmark_every: 100
+  # Recompute activations in the backward pass instead of keeping them.
+  #
+  # The lever to reach for when a run dies with CUDA out of memory and the
+  # allocator is not merely fragmented. It trades roughly 30% of throughput for
+  # a large cut in activation memory, and changes nothing about the result - the
+  # gradients are identical, they are just derived twice.
+  #
+  # Off by default: most runs fit without it, and paying 30% for headroom you do
+  # not need is a bad trade on a rented GPU.
+  gradient_checkpointing: false
   # How many tokens the periodic sample generations are allowed.
   #
   # A ceiling, not a length. A trained student emits end-of-turn around 350

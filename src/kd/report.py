@@ -109,6 +109,8 @@ def _report_rows(payload):
              *three(lambda e: pct(e.get("accuracy")))),
             ("Correct, when it answered",
              *three(lambda e: pct(e.get("accuracy_when_answered")))),
+            ("Answered in the trained <Answer> format",
+             *three(lambda e: f"{e.get('in_trained_format', 0)} / {total}")),
             ("Elo", *three(lambda e: f"{e['elo']:.0f}  ±{e['elo_spread']:.0f}")),
         ]
         # Agreement is pairwise, and this table has one column per player - so
