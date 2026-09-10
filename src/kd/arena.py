@@ -176,63 +176,139 @@ def head_to_head(results):
     return table
 
 
-def summarise(results, unparsed=None, rounds=25, seed=42):
-    """The whole payload: accuracy, Elo, and the pairwise record."""
-    total = len(next(iter(results.values()))) if results else 0
+def correctness(predictions, golds):
+    """{player: [was it right?]} - what Elo and the head-to-head record run on."""
+    return {name: [p == g for p, g in zip(picks, golds)]
+            for name, picks in predictions.items()}
+
+
+def letter_agreement(predictions):
+    """{"a vs b": {same, of, pct}} - how often two players CHOSE THE SAME LETTER.
+
+    Not the same question as the head-to-head record, which asks who was right.
+    Two players can agree on every answer and both be wrong, or split every
+    question and score identically. Agreement says whether one is tracking the
+    other - which for a distilled student and its teacher is the thing being
+    bought - and the answer-key columns cannot say it.
+
+    Counted over every question, with an unanswered one never agreeing: two
+    models that both failed to produce a letter have not agreed on anything.
+    """
+    names = sorted(predictions)
+    total = len(next(iter(predictions.values()))) if predictions else 0
+    table = {}
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            same = sum(1 for x, y in zip(predictions[a], predictions[b])
+                       if x is not None and x == y)
+            table[f"{a} vs {b}"] = {
+                "same": same, "of": total,
+                "pct": (same / total) if total else None}
+    return table
+
+
+def summarise(predictions, golds, rounds=25, seed=42):
+    """The whole payload: what each player answered, how often it was right, Elo.
+
+    Two accuracies, deliberately, because they answer different questions and a
+    single number hides which one is failing:
+
+      over ALL questions      unanswered counts as wrong. What the model is
+                              worth in practice, since a response nobody can
+                              parse is no use however sound the reasoning was.
+      over ANSWERED questions the model's accuracy when it did commit. A model
+                              that is right 95% of the time it answers but only
+                              answers two thirds of the time has a FORMAT
+                              problem, not a knowledge problem - and those have
+                              completely different fixes.
+    """
+    total = len(golds)
+    results = correctness(predictions, golds)
     ratings = elo(results, rounds=rounds, seed=seed)
-    unparsed = unparsed or {}
 
     players = {}
-    for name, correct in results.items():
-        hits = sum(1 for value in correct if value)
+    for name, picks in predictions.items():
+        answered = sum(1 for p in picks if p is not None)
+        hits = sum(1 for p, g in zip(picks, golds) if p == g)
         players[name] = {
-            "accuracy": (hits / total) if total else None,
+            "answered": answered,
+            "questions": total,
             "correct": hits,
+            "accuracy": (hits / total) if total else None,
+            "accuracy_when_answered": (hits / answered) if answered else None,
+            "unanswered": total - answered,
             "elo": round(ratings[name]["rating"], 1),
             "elo_spread": round(ratings[name]["spread"], 1),
-            # Never answering is not the same failure as answering wrongly, and
-            # collapsing them hides the one that is actually fixable: running out
-            # of max_new_tokens before the <Answer> tag.
-            "unanswered": unparsed.get(name, 0),
         }
     return {
         "questions": total,
         "random_baseline": 0.25,
         "elo_rounds": rounds,
         "players": players,
+        "agreement": letter_agreement(predictions),
         "head_to_head": head_to_head(results),
+        "predictions": {name: list(picks) for name, picks in predictions.items()},
+        "gold": list(golds),
     }
 
 
 def render(payload):
     """The summary table, for a log or a terminal."""
-    lines = [
-        f"  {payload['questions']} held-out questions, "
-        f"random baseline {payload['random_baseline'] * 100:.0f}%",
-        "",
-        f"  {'player':<12} {'accuracy':>9}  {'elo':>7}  {'+/-':>5}  {'unanswered':>10}",
-        f"  {'-' * 12} {'-' * 9}  {'-' * 7}  {'-' * 5}  {'-' * 10}",
-    ]
-    ranked = sorted(payload["players"].items(),
-                    key=lambda kv: -kv[1]["elo"])
-    for name, entry in ranked:
-        accuracy = f"{entry['accuracy'] * 100:.1f}%" if entry["accuracy"] is not None else "-"
-        lines.append(f"  {name:<12} {accuracy:>9}  {entry['elo']:>7.0f}  "
-                     f"{entry['elo_spread']:>5.0f}  {entry['unanswered']:>10}")
+    players = payload["players"]
+    order = sorted(players, key=lambda n: -(players[n]["accuracy"] or 0))
+    total = payload["questions"]
+    width = max(12, *(len(n) for n in order)) if order else 12
 
-    lines.append("")
-    for pair, record in sorted(payload["head_to_head"].items()):
-        lines.append(f"  {pair:<28} {record['win']}W {record['loss']}L "
+    def pct(value):
+        return f"{value * 100:.1f}%" if isinstance(value, float) else "-"
+
+    def row(label, cell):
+        return ("  " + label.ljust(34)
+                + "".join(cell(name).rjust(width + 2) for name in order))
+
+    lines = [
+        f"  {total} held-out questions, random baseline "
+        f"{payload['random_baseline'] * 100:.0f}%",
+        "",
+        "  " + "measure".ljust(34) + "".join(n.rjust(width + 2) for n in order),
+        "  " + "-" * 34 + "".join("-" * (width + 2) for _ in order),
+        row("produced a parseable answer",
+            lambda n: f"{players[n]['answered']}/{total}"),
+        row(f"correct, counting all {total}",
+            lambda n: pct(players[n]["accuracy"])),
+        row("correct, when it answered",
+            lambda n: pct(players[n]["accuracy_when_answered"])),
+        row("elo", lambda n: f"{players[n]['elo']:.0f}"),
+        row("elo +/-", lambda n: f"{players[n]['elo_spread']:.0f}"),
+    ]
+
+    agreement = payload.get("agreement") or {}
+    if agreement:
+        lines += ["", "  chose the same letter"]
+        for pair, entry in sorted(agreement.items()):
+            lines.append(f"    {pair:<30} {entry['same']}/{entry['of']}"
+                         f"  ({pct(entry['pct'])})")
+
+    lines += ["", "  won on the answer key"]
+    for pair, record in sorted((payload.get("head_to_head") or {}).items()):
+        lines.append(f"    {pair:<30} {record['win']}W {record['loss']}L "
                      f"{record['draw']}D")
 
-    # The spread is the noise floor. Saying so once, next to the numbers, is
-    # cheaper than watching someone act on a 12-point difference.
-    spreads = [e["elo_spread"] for e in payload["players"].values()]
-    if spreads:
-        lines += ["",
-                  f"  +/- is the standard deviation across "
-                  f"{payload['elo_rounds']} shuffled orderings. A gap smaller "
-                  f"than it is noise."]
+    # Three notes, each answering a question the table above provokes.
+    lines += [
+        "",
+        "  Two accuracy rows because they fail differently. A model far better "
+        "on the",
+        "  second than the first is not getting questions wrong - it is failing "
+        "to say",
+        "  an answer in a form anything can read, which is a format problem "
+        "with a",
+        "  different fix.",
+        "",
+        f"  +/- is the standard deviation across {payload['elo_rounds']} "
+        f"shuffled orderings.",
+        "  A gap smaller than it is noise.",
+    ]
     return "\n".join(lines)
 
 
@@ -289,7 +365,7 @@ def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log,
     getting the questions wrong, it is a model whose output the <Answer> pattern
     never matched, and the only way to tell those apart is to read what it said.
     """
-    correct, unanswered = [], 0
+    predictions = []
     for index, question in enumerate(questions, start=1):
         text = _generate(model, tokenizer, question["prompt"], device,
                          max_new_tokens)
@@ -299,21 +375,23 @@ def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log,
                      f"parsed {predicted}) " + "-" * 20)
             for line in text.strip().splitlines()[:24]:
                 log.info(f"        {line}")
-        if predicted is None:
-            unanswered += 1
-        correct.append(predicted == question["gold"])
+        predictions.append(predicted)
         if log and (index % 10 == 0 or index == len(questions)):
-            hits = sum(1 for value in correct if value)
+            hits = sum(1 for p, q in zip(predictions, questions) if p == q["gold"])
+            said = sum(1 for p in predictions if p)
             log.info(f"      {label:<10} {index}/{len(questions)}  "
-                     f"{hits / index * 100:5.1f}%")
-    return correct, unanswered
+                     f"{hits / index * 100:5.1f}% correct, {said} answered")
+    return predictions
 
 
 def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
          players=("base", "distilled", "teacher"), show=0):
-    """Load each player in turn, answer every question, return the raw results.
+    """Load each player in turn, answer every question, return what each said.
 
-    Returns ({player: [correct?, ...]}, {player: unanswered count}).
+    Returns {player: [letter or None, ...]}, one entry per question in order.
+    The LETTERS rather than right/wrong, because two of the things worth
+    reporting - whether a player answered at all, and whether two players chose
+    the same option - cannot be recovered from a list of booleans.
     """
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -333,7 +411,7 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
     if log:
         log.info(f"      tokenizer: {source}")
 
-    results, unparsed = {}, {}
+    predictions = {}
 
     def run(label, build):
         if log:
@@ -341,12 +419,11 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
         model = build()
         model.eval()
         try:
-            correct, missing = _answer_all(model, tokenizer, questions, device,
-                                           max_new_tokens, label, log, show=show)
+            predictions[label] = _answer_all(
+                model, tokenizer, questions, device, max_new_tokens, label, log,
+                show=show)
         finally:
             _free(model)
-        results[label] = correct
-        unparsed[label] = missing
 
     if "base" in players:
         run("base", lambda: AutoModelForCausalLM.from_pretrained(
@@ -377,7 +454,7 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
             return model
         run("teacher", build_teacher)
 
-    return results, unparsed
+    return predictions
 
 
 # --------------------------------------------------------------------------- #
@@ -462,13 +539,13 @@ def main(args=None):
 
     players = tuple(p for p in ("base", "distilled", "teacher")
                     if p not in (args.skip or []))
-    results, unparsed = play(
+    predictions = play(
         config, hardware, adapter, questions,
         max_new_tokens=int(args.max_new_tokens
                            or settings.get("arena_max_new_tokens") or 512),
         log=log, players=players, show=int(getattr(args, "show", 0) or 0))
 
-    payload = summarise(results, unparsed,
+    payload = summarise(predictions, [q["gold"] for q in questions],
                         rounds=int(settings.get("arena_elo_rounds") or 25),
                         seed=int(config["project"]["seed"]))
     payload["arena_file"] = str(path)

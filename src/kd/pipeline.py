@@ -334,13 +334,13 @@ def stage_arena(ctx):
             f"{ctx.config['project'].get('runs_dir')}")
 
     ctx.log.info(f"      {len(questions)} held-out questions from {path}")
-    results, unparsed = arena.play(
+    predictions = arena.play(
         ctx.config, ctx.hardware, adapter, questions,
         max_new_tokens=int(settings.get("arena_max_new_tokens") or 512),
         log=ctx.log)
 
     payload = arena.summarise(
-        results, unparsed,
+        predictions, [q["gold"] for q in questions],
         rounds=int(settings.get("arena_elo_rounds") or 25),
         seed=int(ctx.config["project"]["seed"]))
     payload["arena_file"] = str(path)
@@ -370,6 +370,14 @@ def stage_report(ctx):
 
     with open(payload_path, encoding="utf-8") as handle:
         payload = json.load(handle)
+
+    # The arena writes its own file, and the report is a separate stage that may
+    # run in a later invocation - so it is read from disk rather than passed
+    # through ctx.results, which `--only report` would not have populated.
+    arena_path = ctx.results.get("arena") or ctx.run.path("arena.json")
+    if os.path.isfile(arena_path):
+        with open(arena_path, encoding="utf-8") as handle:
+            payload["arena"] = json.load(handle)
 
     suffix = str((ctx.config.get("evaluation") or {}).get("report_format", "html"))
     written = write_report(payload, ctx.run.path(f"report.{suffix.lstrip('.')}"))

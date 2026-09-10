@@ -85,7 +85,56 @@ def _report_rows(payload):
     fmt = lambda v, spec=".4f": (format(v, spec)
                                  if isinstance(v, (int, float)) and math.isfinite(v)
                                  else "-")
-    sections = [
+    sections = []
+
+    # The answer key first when there is one. Fidelity below says how closely the
+    # student tracks the teacher; this says who was RIGHT, which is the question
+    # anyone outside the project asks first.
+    arena = payload.get("arena") or {}
+    players = arena.get("players") or {}
+    if players:
+        total = arena.get("questions", 0)
+        order = [n for n in ("base", "distilled", "teacher") if n in players]
+        pct = lambda v: (f"{v * 100:.1f}%" if isinstance(v, float) else "-")
+
+        def three(cell):
+            values = {n: cell(players[n]) for n in order}
+            return (values.get("base", "-"), values.get("distilled", "-"),
+                    values.get("teacher", "-"))
+
+        rows = [
+            ("Produced a parseable answer",
+             *three(lambda e: f"{e['answered']} / {total}")),
+            (f"Correct, counting all {total}",
+             *three(lambda e: pct(e.get("accuracy")))),
+            ("Correct, when it answered",
+             *three(lambda e: pct(e.get("accuracy_when_answered")))),
+            ("Elo", *three(lambda e: f"{e['elo']:.0f}  ±{e['elo_spread']:.0f}")),
+        ]
+        # Agreement is pairwise, and this table has one column per player - so
+        # report the pair that matters and let the columns do the work: how
+        # often each student picked the TEACHER's letter. That is what
+        # distillation is supposed to move, and a row per unordered pair would
+        # have left two thirds of every row empty to say it.
+        agreement = arena.get("agreement") or {}
+
+        def against_teacher(name):
+            entry = (agreement.get(f"{name} vs teacher")
+                     or agreement.get(f"teacher vs {name}"))
+            if not entry:
+                return "-"
+            return f"{entry['same']} / {entry['of']}  ({pct(entry['pct'])})"
+
+        if agreement and "teacher" in players:
+            rows.append(("Chose the teacher's letter",
+                         against_teacher("base"), against_teacher("distilled"),
+                         f"{total} / {total}  (100.0%)"))
+        sections.append(
+            (f"The answer key — {total} held-out questions "
+             f"(random baseline {arena.get('random_baseline', 0.25) * 100:.0f}%)",
+             rows))
+
+    sections += [
         ("How close is the student to the teacher?", [
             ("Prediction agreement",
              fmt(close.get("prediction_agreement_base_pct"), ".2f") + "%",
