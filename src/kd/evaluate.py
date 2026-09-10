@@ -612,6 +612,13 @@ def main(args=None):
     from peft import PeftModel
     student = AutoModelForCausalLM.from_pretrained(
         student_id, dtype=dtype, low_cpu_mem_usage=True)
+    # The same trim training applied, reproduced from the two configs. Without
+    # it PEFT meets an lm_head 271 rows wider than the adapter was built against
+    # and refuses the state dict on a shape mismatch.
+    from . import paths
+    paths.fit_vocab(student,
+                    paths.vocab_target(student_id, teacher_id, len(tokenizer)),
+                    label="student")
     student = PeftModel.from_pretrained(student, adapter_dir).to(device).eval()
 
     teacher_params = sum(p.numel() for p in teacher.parameters())

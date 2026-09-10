@@ -89,6 +89,71 @@ BYTES_PER_PARAM = {"float32": 4, "bfloat16": 2, "float16": 2}
 GB = 1024 ** 3
 
 
+def vocab_target(student_id, teacher_id, tokenizer_length):
+    """The output width both models must share for GKD, or None if they agree.
+
+    GKD's JSD compares the teacher's whole next-token distribution against the
+    student's, so the two logit tensors have to be the same width.
+
+    The mismatch this exists for is not a real disagreement about vocabulary.
+    Stock Qwen checkpoints pad `vocab_size` up to a multiple of 128 for tensor
+    alignment - 151936 against a tokenizer of 151665 - and everything above the
+    tokenizer length is filler that no token id indexes and no correct model
+    puts mass on. A checkpoint fine-tuned through
+    `resize_token_embeddings(len(tokenizer))` has had that padding trimmed, so a
+    trimmed teacher and a stock student differ by exactly the padding.
+
+    Trimming the wider down to the narrower is therefore lossless, and is the
+    only case this reports. A model narrower than the tokenizer would be missing
+    real tokens - a genuine mismatch - and raises instead.
+
+    Reads config.json for each, which is a few hundred bytes and cached, so this
+    is cheap enough to call from anywhere that loads one of the pair. It has to
+    be callable that way: the resize happens at training time, and every later
+    consumer of the adapter - kd.evaluate, kd.arena - must reproduce it exactly
+    or PEFT refuses the state dict on a shape mismatch.
+    """
+    from transformers import AutoConfig
+
+    try:
+        student_width = int(AutoConfig.from_pretrained(student_id).vocab_size)
+        teacher_width = int(AutoConfig.from_pretrained(teacher_id).vocab_size)
+    except Exception:
+        # Not knowing is not a reason to block: the loader reports a genuine
+        # problem better than a guess here would.
+        return None
+
+    if student_width == teacher_width:
+        return None
+
+    target = min(student_width, teacher_width)
+    if target < int(tokenizer_length):
+        raise ValueError(
+            f"the student has vocab_size {student_width} and the teacher "
+            f"{teacher_width}, and the narrower of the two is below the "
+            f"tokenizer's {tokenizer_length} real tokens.\n"
+            f"  That is a genuine vocabulary difference, not alignment padding, "
+            f"and standard GKD cannot bridge it.\n"
+            f"  Use a teacher and student from the same model family.")
+    return target
+
+
+def fit_vocab(model, target, label="model"):
+    """Trim `model`'s output layer to `target`, if it is not already there.
+
+    Deterministic, so a base model resized here matches one resized at training
+    time byte for byte - which is what lets the adapter load without carrying a
+    copy of the embeddings around with it.
+    """
+    if not target or int(model.config.vocab_size) == int(target):
+        return False
+    print(f" -> vocab: trimming {label} from {model.config.vocab_size} to {target}")
+    model.resize_token_embeddings(int(target))
+    # resize_token_embeddings updates the modules; TRL and PEFT read the config.
+    model.config.vocab_size = int(target)
+    return True
+
+
 def parameter_count(model_id):
     """Total parameters, from the Hub's metadata. No weights are downloaded.
 

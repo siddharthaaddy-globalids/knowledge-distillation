@@ -344,6 +344,13 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
         def build_distilled():
             model = AutoModelForCausalLM.from_pretrained(
                 base_id, dtype=dtype, low_cpu_mem_usage=True)
+            # The same trim training applied. Reproduced from the two configs
+            # rather than carried in the adapter, which would mean shipping a
+            # gigabyte of untrained embedding with every run.
+            from . import paths
+            paths.fit_vocab(model, paths.vocab_target(
+                base_id, config["models"]["teacher"], len(tokenizer)),
+                label="student")
             return PeftModel.from_pretrained(
                 model, str(adapter)).merge_and_unload().to(device)
         run("distilled", build_distilled)
