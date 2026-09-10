@@ -251,10 +251,11 @@ benchmark_prompts:
   - Explain in two sentences what a star is formed from.
 
 limits:
-  # Covers the whole run, not just training: the teacher download from S3, the
-  # teacher-check load and the smoke steps are all elapsed time counted against
-  # this ceiling. ~16 GB of teacher weights is a meaningful part of it.
-  max_runtime_minutes: 240
+  # No wall-clock ceiling - inherited as null. A clock that fires mid-training
+  # kills the run and leaves a checkpoint rather than an adapter, and the thing
+  # it would have been sized against here is a ~16 GB teacher download whose
+  # duration nobody can predict.
+  max_runtime_minutes: null
   max_cost_usd: 6.00
   confirm_above_usd: 2.00
 

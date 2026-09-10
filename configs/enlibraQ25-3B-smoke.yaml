@@ -97,11 +97,11 @@ evaluation:
   arena_max_new_tokens: 2048
 
 limits:
-  # Generous, because most of it is one-time: fetching the teacher from S3, then
-  # downloading the student from the Hub. The smoke stage projects the run
-  # against this and REFUSES anything that cannot finish inside it, so a tight
-  # ceiling here would decline the run before it started.
-  max_runtime_minutes: 120
+  # None, like every other profile here. Most of this profile's wall clock is
+  # one-time anyway - fetching the teacher from S3, then the student from the
+  # Hub - and a ceiling sized for that would refuse the run on the first attempt
+  # and be pointless on every later one.
+  max_runtime_minutes: null
   max_cost_usd: null
 
 runpod:

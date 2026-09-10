@@ -74,11 +74,9 @@ evaluation:
   samples: 48
 
 limits:
-  # Generous, because the smoke stage projects the run against this and REFUSES
-  # anything that cannot finish inside it. On MPS a step is several seconds and
-  # the arena afterwards is three models generating 137 answers each, so a tight
-  # ceiling here would decline the run before it started.
-  max_runtime_minutes: 720
+  # None. This profile takes hours by design, and a ceiling sized by guesswork
+  # would either refuse it up front or kill it partway.
+  max_runtime_minutes: null
   max_cost_usd: null
 
 s3:

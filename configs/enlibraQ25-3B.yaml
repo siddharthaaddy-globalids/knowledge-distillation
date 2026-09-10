@@ -198,10 +198,10 @@ benchmark_prompts:
   - Explain in two sentences what a star is formed from.
 
 limits:
-  # Covers the whole run, not just training: the teacher download, the
-  # teacher-check load, the smoke steps and the arena afterwards are all elapsed
-  # time counted against this.
-  max_runtime_minutes: 240
+  # No wall-clock ceiling: inherited as null from _base.yaml. Training is the
+  # thing this run exists to do, and a clock that kills it partway leaves a
+  # checkpoint rather than an adapter. Add one for a single run if you want it.
+  max_runtime_minutes: null
   max_cost_usd: 6.00
   confirm_above_usd: 2.00
 

@@ -202,7 +202,19 @@ pipeline:
 #  by training.save_steps, so tighten save_steps when caps are tight.
 # ---------------------------------------------------------------------------
 limits:
-  max_runtime_minutes: 180
+  # NO TIME LIMIT by default. A wall-clock ceiling does not pause a run, it
+  # KILLS it - mid-epoch, keeping only whatever the last training.save_steps
+  # checkpoint holds - and a training run that is merely slower than guessed is
+  # not a training run that has gone wrong. Guessing that ceiling in a config
+  # file, before anyone has measured a step, is how a good run gets destroyed at
+  # 80%.
+  #
+  # Set one deliberately, per run, when you actually want the guard:
+  #     --set limits.max_runtime_minutes=180
+  # With one set, the smoke stage also refuses up front any run its measured
+  # s/step says cannot finish inside it - which is the useful half, since
+  # nothing is spent.
+  max_runtime_minutes: null
   max_steps: null           # hard ceiling above training.max_steps; null = no extra ceiling
   max_cost_usd: null        # only meaningful for a rented pod; null = no cost cap
   confirm_above_usd: 1.00   # print the estimate and ask before renting above this

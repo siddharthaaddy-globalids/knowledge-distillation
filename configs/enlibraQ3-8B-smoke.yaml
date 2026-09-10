@@ -110,11 +110,9 @@ evaluation:
   arena_max_new_tokens: 2048
 
 limits:
-  # Raised from 30 when the arena ceiling went to 2048. A two-step student runs
-  # to that ceiling on every question, so four questions across three models is
-  # now the slowest part of this profile by some margin - longer than the
-  # training it is nominally smoke-testing.
-  max_runtime_minutes: 60
+  # None, like every other profile here. Most of the wall clock is the one-time
+  # model download, which is exactly the shape a fixed ceiling gets wrong.
+  max_runtime_minutes: null
   max_cost_usd: null
 
 s3:

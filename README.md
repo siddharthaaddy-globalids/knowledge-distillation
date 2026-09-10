@@ -161,6 +161,7 @@ Full key-by-key reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 | `qwen-poc` | Stock Qwen3.5-2B → 0.8B. A known-good pairing for proving the pipeline. |
 | `enlibraQ25-3B` | The SFT teacher (Qwen2.5-3B) → Qwen2.5-1.5B. ~8.6 GB of weights, so a 16 GB GPU is enough. Start here. |
 | `enlibraQ25-3B-smoke` | The same **real** pair on a laptop, training on a small slice of the corpus. |
+| `enlibraQ25-flow` | Qwen2.5-1.5B → 0.5B, both from the Hub. 3.8 GB, minutes, no S3 download — proves the pipeline runs end to end. |
 | `enlibraQ3-8B` | An RL-tuned Qwen3-8B → Qwen3-1.7B on the enLibra space curriculum. Needs a 48 GB GPU. |
 | `enlibraQ3-8B-smoke` | The same run with stand-in models, small enough for a 16 GB laptop. Two steps — proves the plumbing. |
 | `enlibraQ3-8B-mac` | Stand-in models again, but the **full** schedule and the whole evaluation. Hours, free, and it answers whether distillation works on this data. |
@@ -220,10 +221,15 @@ S3 — so a run is either entirely recoverable or entirely absent.
 
 ```yaml
 limits:
-  max_runtime_minutes: 180
-  max_cost_usd: 2.00        # only meaningful on a rented GPU
+  max_runtime_minutes: null   # no clock by default — see below
+  max_cost_usd: 2.00          # only meaningful on a rented GPU
   confirm_above_usd: 1.00
 ```
+
+**There is no wall-clock ceiling by default.** One does not pause a run, it
+*kills* it — mid-epoch, keeping only the last `training.save_steps` checkpoint —
+and a run that is merely slower than someone guessed is not a run that has gone
+wrong. Set one deliberately, per run, when you want that guard.
 
 Checked twice. The `smoke` stage measures s/step, so a run that cannot finish
 inside its limits is **refused before it starts**:

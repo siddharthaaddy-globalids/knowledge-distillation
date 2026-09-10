@@ -1,0 +1,111 @@
+# ===========================================================================
+#  Flow test - Qwen2.5-1.5B -> Qwen2.5-0.5B, entirely from the Hub
+#
+#    ./run.sh --config configs/enlibraQ25-flow.yaml
+#
+#  Does the pipeline work, on this machine, from end to end? That is the only
+#  question this profile answers, and it answers it in minutes for free.
+#
+#  Every stage runs for real: the corpus is built, the teacher is checked, two
+#  models are loaded together, the trainer takes real steps, the adapter is
+#  saved, the arena scores it, the report is written, and the bundle is uploaded
+#  to S3. If all nine stages say OK, nothing about the plumbing is broken and
+#  what remains is a question about models and hardware.
+#
+#  WHAT MAKES IT CHEAP
+#  -------------------
+#  Both models come from the Hub, so nothing is downloaded from S3. 1.54B plus
+#  0.49B is 3.8 GB of bfloat16 weights against the ~9.6 GB kd.paths treats as
+#  the budget on a 16 GB machine - a third of it, with room to spare, where
+#  configs/enlibraQ25-3B-smoke.yaml sits at 8.6 GB and leaves almost none.
+#
+#  The upload still runs against the real bucket. That is deliberate: it is the
+#  permission most likely to be missing (s3:PutObject is a separate grant from
+#  reading the teacher) and the one whose absence is discovered last, at stage
+#  nine of nine, on a pod you are paying for.
+#
+#  WHAT IT DOES NOT TELL YOU
+#  -------------------------
+#  Nothing about the real run's quality, speed or memory. Different models on
+#  different hardware. A student this small copying a teacher this small is not
+#  the problem the real profiles solve, and its accuracy means nothing. Read the
+#  fact that the stages finished, not the numbers they printed.
+#
+#  Once this passes, go to configs/enlibraQ25-3B.yaml on a GPU.
+# ===========================================================================
+extends: enlibraQ25-3B.yaml
+
+project:
+  name: enlibra-q25-flow
+
+models:
+  # Stock, small, and both INSTRUCT - unlike the real profile, whose student is
+  # the Qwen2.5-1.5B base model.
+  #
+  # That difference is on purpose and worth knowing. A base model has not been
+  # taught to stop: it never emits an end-of-turn token, so every benchmark
+  # probe and every arena question runs to its full ceiling instead of finishing
+  # in a few hundred tokens. On a laptop that turns a ten-minute flow test into
+  # an afternoon. An instruct pair stops when it is done, which is the whole
+  # point here.
+  teacher: Qwen/Qwen2.5-1.5B-Instruct
+  student: Qwen/Qwen2.5-0.5B-Instruct
+  teacher_adapter: null
+  # Both are Qwen2.5, so the vocabulary is identical either way and this only
+  # decides which chat template renders the corpus. The teacher's is the one the
+  # real run uses.
+  tokenizer: teacher
+
+hardware:
+  device: auto
+  dtype: bfloat16
+
+dataset:
+  # The WHOLE corpus is built - all 1095 rows, read and filtered exactly as the
+  # real run reads them - because that costs about three seconds and is the
+  # cheapest proof that every row is parseable and inside the token budgets. The
+  # domains are inherited rather than restated, so a rename upstream follows
+  # here automatically.
+  #
+  # Rows built and rows trained on are different numbers. Training consumes 16
+  # samples; the 1095 is what vouches for the data.
+  validation_size: 16
+
+training:
+  # Enough to see the loss move and a checkpoint written, not enough to learn.
+  max_steps: 8
+  batch_size: 1
+  gradient_accumulation_steps: 2
+  save_steps: 4
+  save_total_limit: 1
+  benchmark_every: 4
+  # Short probes. These models stop on their own well inside this; the ceiling
+  # is only here so a model that will not stop cannot stall the test.
+  benchmark_max_new_tokens: 256
+
+evaluation:
+  samples: 16
+  # Six questions across three players is eighteen generations - enough to prove
+  # the arena loads each model in turn, finds the <Answer> tag and produces
+  # ratings. The Elo from six questions is noise. Read that it finished.
+  arena_limit: 6
+  arena_max_new_tokens: 512
+
+limits:
+  # None. The first run downloads ~4 GB of models from the Hub and is much
+  # slower than every run after it, which is exactly the shape a fixed ceiling
+  # gets wrong.
+  max_runtime_minutes: null
+  max_cost_usd: null
+
+s3:
+  # Left ON, inheriting the bucket and prefix from the parent. The teacher is a
+  # Hub id so nothing is fetched from S3 - this exercises the upload alone,
+  # which is the half that fails last and costs most to discover late.
+  #
+  # `upload` is a non-gate stage, so on a machine with no credentials it reports
+  # the failure and the run still finishes.
+  enabled: true
+
+runpod:
+  enabled: false
