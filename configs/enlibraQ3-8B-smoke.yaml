@@ -53,32 +53,30 @@ dataset:
   # dataset.source is inherited: the corpus is committed, so it is the same
   # directory here as on the pod and there is nothing to switch.
   #
-  # The SAME domains as the real run, at a fraction of the size. Same names,
-  # same files, same order - only the quotas differ.
+  # THE WHOLE CORPUS. Not a sample of it - the same 1095 rows the real run
+  # builds, read and filtered identically.
   #
-  # That matters more than it looks. This block overrides the parent's rather
-  # than adding to it, so a domain renamed upstream and not renamed here is a
-  # smoke test that exercises a corpus the real run does not have. Which is
-  # exactly what happened once: the parent moved to sft-1to3hop.jsonl and this
-  # list kept naming files the converter had stopped producing.
+  # This block used to hold token quotas, and that was the wrong economy. The
+  # full build costs 2.6 seconds against 1.5 for a 36-row slice, and what the
+  # extra 1.1 seconds buys is every row being proved readable, parseable and
+  # inside the budget - on this machine, before a GPU is rented. A slice can
+  # only ever vouch for the rows it happened to touch.
   #
-  # The pass rate printed per domain is the number worth reading: anything below
-  # 100% means max_prompt_tokens or max_total_tokens is too tight, and the real
-  # run would silently train on a fraction of the corpus.
+  # Training still consumes just 4 samples (2 steps x batch 1 x accum 2). Rows
+  # kept and rows trained on are different numbers, and it is the first one that
+  # says whether the corpus is sound.
+  #
+  # The domains are inherited from the parent for the same reason: this block
+  # REPLACES the parent's rather than merging with it, so a domain renamed
+  # upstream and not renamed here is a rehearsal of a corpus the real run does
+  # not have. That has happened - the parent moved to sft-1to3hop.jsonl and this
+  # list kept naming files the converter had stopped producing. Not restating it
+  # is what makes that impossible.
+  #
+  # The pass rate printed per domain is the number to read: below 100% means the
+  # budgets are dropping rows, and the real run would silently train on part of
+  # the corpus.
   validation_size: 8
-  domains:
-    - name: curriculum-sft
-      data_files: sft-1to3hop.jsonl
-      quota: 24
-      pool: 32
-    - name: curriculum-rl
-      data_files: rl-1to2hop.jsonl
-      quota: 8
-      pool: 12
-    - name: identity
-      data_files: identity.jsonl
-      quota: 4
-      pool: 6
 
 lora:
   # A cheap adapter. The point is that the target names resolve against a real

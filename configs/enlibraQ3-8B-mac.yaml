@@ -1,0 +1,90 @@
+# ===========================================================================
+# The real run, at a size a Mac can hold. Full training, full evaluation.
+#
+#     ./run.sh full
+#
+# This is NOT the smoke test. enlibraQ3-8B-smoke.yaml proves the plumbing in a
+# few minutes and trains on four samples; this trains on all 1087 rows for the
+# same 300 steps the pod will, then scores all 137 held-out questions with all
+# three players. It answers "does distillation actually work on this data",
+# which is the question worth answering before renting anything.
+#
+# Budget several hours. It is free, it can be interrupted, and every stage
+# writes into the run bundle as it goes.
+#
+# WHAT IT CAN AND CANNOT TELL YOU
+# -------------------------------
+# The only thing changed from the pod profile is the pair of models: a 1.7B
+# teacher into a 0.6B student instead of 8B into 1.7B, because 20.5 GB of
+# weights does not fit 16 GB of unified memory. Everything else - the corpus,
+# the LoRA shape, the schedule, the token budgets, the held-out set - is
+# inherited unchanged.
+#
+#   It CAN tell you: whether the format transfers, whether the loss falls,
+#   whether the student learns to answer in <Explanation>/<Answer> shape, and
+#   whether distilled beats base on the answer key. If it does not work here it
+#   will not work on the pod, and you will have found that out for free.
+#
+#   It CANNOT tell you: the accuracy the real pair will reach. A 0.6B student
+#   copying a 1.7B teacher is a different problem from a 1.7B student copying
+#   an 8B one. Read the DIRECTION - distilled above base - not the number.
+# ===========================================================================
+extends: enlibraQ3-8B.yaml
+
+project:
+  name: enlibra-q3-mac-full
+
+models:
+  # One size down each, sharing the identical Qwen3 tokenizer, so the chat
+  # rendering and the prompt/completion split are the ones the pod will see.
+  teacher: Qwen/Qwen3-1.7B
+  student: Qwen/Qwen3-0.6B
+  teacher_adapter: null
+
+hardware:
+  device: mps
+  # 2.03B + 0.75B at bfloat16 is ~5.6 GB, comfortably inside the 60% of 16 GB
+  # that kd.paths treats as the working budget.
+  #
+  # transformers permits bfloat16 on MPS only from macOS 14.0; below that
+  # kd.config falls back to float32 and says so - slower, not broken. On an
+  # Intel Mac add --set hardware.device=cpu and expect it to take all day.
+  dtype: bfloat16
+
+training:
+  # Identical to the pod profile: 300 steps at an effective batch of 8 is 2400
+  # samples, about 2.2 passes over 1087 rows. Matching it is the point - a
+  # rehearsal on a different schedule rehearses a different run.
+  max_steps: 300
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  # More often than the pod's 50. Checkpoints are cheap here and a laptop run
+  # is more likely to be interrupted.
+  save_steps: 25
+  save_total_limit: 2
+  # Generate sample answers every 50 steps so you can watch the format appear.
+  # This is the most informative thing in the log: the student should go from
+  # noise to <Explanation>...<Answer> within the first hundred steps or so.
+  benchmark_every: 50
+
+evaluation:
+  # The full held-out set, all three players, nothing capped. This is the
+  # number you came for.
+  arena_limit: null
+  samples: 48
+
+limits:
+  # Generous, because the smoke stage projects the run against this and REFUSES
+  # anything that cannot finish inside it. On MPS a step is several seconds and
+  # the arena afterwards is three models generating 137 answers each, so a tight
+  # ceiling here would decline the run before it started.
+  max_runtime_minutes: 720
+  max_cost_usd: null
+
+s3:
+  # Nothing is rented and nothing needs shipping anywhere. This also means the
+  # whole run works with no AWS credentials at all.
+  enabled: false
+
+runpod:
+  enabled: false

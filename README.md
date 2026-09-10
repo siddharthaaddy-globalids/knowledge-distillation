@@ -159,24 +159,37 @@ Full key-by-key reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 | `finance` | A finance-tuned Qwen3.5-2B → Qwen3.5-0.8B. |
 | `qwen-poc` | Stock Qwen3.5-2B → 0.8B. A known-good pairing for proving the pipeline. |
 | `enlibraQ3-8B` | An RL-tuned Qwen3-8B → Qwen3-1.7B on the enLibra space curriculum. Needs a 48 GB GPU. |
-| `enlibraQ3-8B-smoke` | The same run with stand-in models, small enough for a 16 GB laptop. |
+| `enlibraQ3-8B-smoke` | The same run with stand-in models, small enough for a 16 GB laptop. Two steps — proves the plumbing. |
+| `enlibraQ3-8B-mac` | Stand-in models again, but the **full** schedule and the whole evaluation. Hours, free, and it answers whether distillation works on this data. |
 
-The last two read `data/enlibra-curriculum/`, which **is committed** — 3.4 MB, so
+Those three read `data/enlibra-curriculum/`, which **is committed** — 3.4 MB, so
 a fresh clone on a rented pod has the corpus already and needs no credentials for
 it. Regenerate it when the curriculum exports change:
 
 ```bash
 python scripts/prepare_curriculum.py --out data/enlibra-curriculum \
     --stats-tokenizer Qwen/Qwen3-8B \
-    curriculum_sft.json curriculum_sft_stage_2.json curriculum_rl.json
+    curriculum_verified.json curriculum_sft.json
 ```
 
 That converts the bespoke multiple-choice export into chat JSONL, one file per
-curriculum stage, and prints the token budgets the result needs. It is
-deterministic, so an unchanged export leaves `git status` clean, and
-`manifest.json` records the sha1 of every export the corpus was built from.
-`rl-*.jsonl` is written but deliberately left out of `dataset.domains`: it is the
-held-out set.
+`split`, and prints the token budgets the result needs.
+`curriculum_verified.json` is the superset and supplies sft, rl and eval;
+`curriculum_sft.json` is passed only for the persona rows the superset does not
+carry — everything else in it deduplicates away against what the first file
+already wrote.
+
+| | | |
+|---|---|---|
+| `sft-1to3hop.jsonl` | 937 | trains |
+| `rl-1to2hop.jsonl` | 143 | trains |
+| `identity.jsonl` | 15 | trains |
+| `eval-1to5hop.jsonl` | 137 | **held out** — what the `arena` stage scores |
+
+The converter is deterministic, so an unchanged export leaves `git status`
+clean, and `manifest.json` records the sha1 of every export the corpus was built
+from. The held-out file is reported as such and left out of `dataset.domains`;
+pointing a domain at it takes a deliberate edit.
 
 ## What a run leaves behind
 

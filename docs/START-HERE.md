@@ -12,8 +12,12 @@ cd knowledge-distillation
 
 | Where you run it | What it does |
 |---|---|
-| **Your Mac** (no GPU) | Installs everything, checks it, runs the **smoke test** — small stand-in models, the whole pipeline, free |
+| **Your Mac** (no GPU) | Installs everything, checks it, runs the **smoke test** — small stand-in models, the whole pipeline, minutes, free |
 | **A RunPod pod** (GPU) | Installs everything, checks it, runs the **real training** |
+
+There is a third thing it can do on request — `./run.sh full`, which trains on
+all the data and runs the whole evaluation locally. See
+[Part 1b](#part-1b--does-it-actually-learn-still-free-but-hours).
 
 Same command in both places. The expensive one only happens on the machine that
 is expensive anyway.
@@ -75,12 +79,19 @@ Every stage saying `OK`, and at the end:
 Along the way it prints the dataset it built, which should look like this:
 
 ```
-  curriculum-sft             937  (85.6%)
-  curriculum-rl              143  (13.1%)
-  identity                    15  ( 1.4%)
-  Train split     : 1047
-  Validation split: 48
+  - curriculum-sft   937/937  (100.0% pass)
+  - curriculum-rl    143/143  (100.0% pass)
+  - identity          15/15   (100.0% pass)
+  Total collected : 1095
 ```
+
+**All three at 100%** is what matters. The smoke test builds the *whole* corpus,
+not a sample of it, so this proves every row is readable and inside the token
+budgets — on your machine, before a GPU is rented. Below 100% means rows are
+being silently dropped and the real run would train on part of the data.
+
+It still only *trains* on four samples. Rows built and rows trained on are
+different numbers, and it is the first one that says whether the data is sound.
 
 ### The one thing to check carefully
 
@@ -107,6 +118,43 @@ that the plumbing works.
 ```bash
 ./run.sh ask "What are stars formed from?"
 ```
+
+---
+
+## Part 1b — Does it actually learn? (still free, but hours)
+
+The smoke test proves nothing is broken. It does **not** tell you whether
+distillation works on this data, because it trains on four samples.
+
+If you want that answer before renting a GPU — and it is a good answer to have:
+
+```bash
+./run.sh full
+```
+
+This trains on **all 1087 rows for the full 300 steps**, then scores **all 137
+held-out questions** with all three players. Everything is inherited from the
+real profile — corpus, LoRA shape, schedule, token budgets — except the models,
+which are one size down (Qwen3-1.7B → Qwen3-0.6B) because 20.5 GB does not fit
+16 GB of memory.
+
+Budget **several hours**. It is free, and safe to interrupt: checkpoints are
+written every 25 steps, and each stage writes into the run bundle as it finishes.
+
+**Watch the sample generations**, printed every 50 steps. They are the most
+informative thing in the log — the student should go from noise to the
+`<Explanation>…<Answer>` shape within the first hundred steps or so.
+
+At the end you get the same table the pod will produce. Read it like this:
+
+| | |
+|---|---|
+| **It answers** | Does the format transfer? Does the loss fall? Does distilled beat base on the answer key? |
+| **It does not answer** | What accuracy the real 8B → 1.7B pair will reach. A 0.6B student copying a 1.7B teacher is a different problem. |
+
+**Read the direction, not the number.** If distilled beats base here,
+distillation works on this data. If it does not, it will not work on the pod
+either — and you found that out for nothing.
 
 ---
 
@@ -246,12 +294,13 @@ aws s3 cp --recursive s3://enlibra/dss/dev/kd/runs/<run-id>/final_adapter ./my-a
 
 ## Running a different YAML
 
-The script uses two configs, because it does two different things:
+The script uses three configs, because it does three different things:
 
-| | |
-|---|---|
-| `configs/enlibraQ3-8B.yaml` | the **real** run, on a GPU |
-| `configs/enlibraQ3-8B-smoke.yaml` | the **rehearsal**, small enough for a laptop |
+| | | |
+|---|---|---|
+| `configs/enlibraQ3-8B.yaml` | `--config` | the **real** run, on a GPU |
+| `configs/enlibraQ3-8B-smoke.yaml` | `--smoke-config` | the **rehearsal**, minutes |
+| `configs/enlibraQ3-8B-mac.yaml` | `--full-config` | **all the data**, locally, hours |
 
 Three ways to point somewhere else, in increasing order of permanence:
 
@@ -262,13 +311,14 @@ Three ways to point somewhere else, in increasing order of permanence:
 # 2. just this shell
 export KD_CONFIG=configs/mine.yaml
 export KD_SMOKE_CONFIG=configs/mine-smoke.yaml
+export KD_FULL_CONFIG=configs/mine-mac.yaml
 ./run.sh
 
-# 3. from now on — edit the two lines under
+# 3. from now on — edit the three lines under
 #    "WHICH YAML DOES THIS RUN?" at the top of run.sh
 ```
 
-`--config` and `--smoke-config` go **before** the subcommand:
+`--config`, `--smoke-config` and `--full-config` go **before** the subcommand:
 
 ```bash
 ./run.sh --config configs/mine.yaml train
@@ -297,8 +347,9 @@ a second rather than turning up after the install.
 ```bash
 ./run.sh doctor      # what can this machine do, and what can it reach
 ./run.sh check       # resolve the config and print the plan, run nothing
-./run.sh smoke       # the smoke test
-./run.sh train       # the real run
+./run.sh smoke       # the smoke test — minutes, proves the plumbing
+./run.sh full        # all the data + the whole evaluation, locally — hours
+./run.sh train       # the real run, on a GPU
 ./run.sh setup       # install only
 ./run.sh ask "..."   # ask the model something
 ./run.sh help

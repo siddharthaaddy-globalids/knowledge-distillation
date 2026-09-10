@@ -31,7 +31,8 @@
 #      ./run.sh --config configs/mine.yaml     run a different profile
 #      ./run.sh doctor              what can this machine do, and what can it reach
 #      ./run.sh check               resolve the config, run nothing
-#      ./run.sh smoke               force the smoke test
+#      ./run.sh smoke               force the smoke test (minutes)
+#      ./run.sh full                all the data + the whole evaluation, locally
 #      ./run.sh train               force the real run
 #      ./run.sh ask "why is the sky blue?"
 #      ./run.sh setup               install only, then stop
@@ -45,8 +46,12 @@ cd "$ROOT"
 # ===========================================================================
 #  WHICH YAML DOES THIS RUN?  <-- change it here
 # ===========================================================================
-#  Two configs, because this script does two different things. The real one is
-#  what trains on a GPU; the smoke one is the rehearsal that fits a laptop.
+#  Three configs, because this script does three different things:
+#
+#      CONFIG        the real run, on a rented GPU
+#      SMOKE_CONFIG  the few-minute rehearsal that proves the plumbing
+#      FULL_CONFIG   all the data and the whole evaluation, on your own machine,
+#                    with models one size down so they fit  (./run.sh full)
 #
 #  Three ways to point somewhere else, in increasing order of permanence:
 #
@@ -60,12 +65,17 @@ cd "$ROOT"
 #      ./run.sh --config configs/mine.yaml train      yes
 #      ./run.sh train --config configs/mine.yaml      also works, handed to kd
 #
-#  If you write your own profile, write both halves. A smoke test that runs the
-#  real config on a laptop is not a smoke test - it is the expensive run on the
-#  wrong machine.
+#  --smoke-config and --full-config name the other two.
+#
+#  If you write your own profile, write the smaller halves too. A smoke test
+#  that runs the real config on a laptop is not a smoke test - it is the
+#  expensive run on the wrong machine.
 # ===========================================================================
 CONFIG="${KD_CONFIG:-configs/enlibraQ3-8B.yaml}"
 SMOKE_CONFIG="${KD_SMOKE_CONFIG:-configs/enlibraQ3-8B-smoke.yaml}"
+# `./run.sh full`: the real schedule and the whole evaluation, with models small
+# enough for a laptop. Hours rather than minutes, and free.
+FULL_CONFIG="${KD_FULL_CONFIG:-configs/enlibraQ3-8B-mac.yaml}"
 
 BOLD=""; DIM=""; OFF=""
 if [ -t 1 ]; then BOLD=$'\033[1m'; DIM=$'\033[2m'; OFF=$'\033[0m'; fi
@@ -114,13 +124,16 @@ while [ $# -gt 0 ]; do
     --smoke-config)   [ $# -ge 2 ] || die "--smoke-config needs a path after it"
                       SMOKE_CONFIG="$2"; shift 2 ;;
     --smoke-config=*) SMOKE_CONFIG="${1#*=}"; shift ;;
+    --full-config)    [ $# -ge 2 ] || die "--full-config needs a path after it"
+                      FULL_CONFIG="$2"; shift 2 ;;
+    --full-config=*)  FULL_CONFIG="${1#*=}"; shift ;;
     *) break ;;
   esac
 done
 
 # Checked now rather than by the first command that reads it, so a typo costs a
 # second here instead of appearing after an install.
-for candidate in "$CONFIG" "$SMOKE_CONFIG"; do
+for candidate in "$CONFIG" "$SMOKE_CONFIG" "$FULL_CONFIG"; do
   [ -f "$ROOT/$candidate" ] || [ -f "$candidate" ] || {
     warn "No such config: $candidate"
     warn "Profiles that ship with this repository:"
@@ -371,6 +384,26 @@ case "${1:-}" in
 
   smoke)     setup; shift
              kd pipeline --config "$SMOKE_CONFIG" "$@"; finish_local ;;
+
+  full)      setup; shift
+             say ""
+             say "${BOLD}Full local run: all the data, the whole evaluation.${OFF}"
+             note "config: $FULL_CONFIG"
+             note "Trains on all 1087 rows for 300 steps, then scores all 137"
+             note "held-out questions with base, distilled and teacher."
+             note ""
+             note "Several hours, and free. Safe to interrupt - checkpoints are"
+             note "written every 25 steps and each stage writes as it finishes."
+             if [ "$MODE" = "local" ]; then
+               note "Models are one size down (1.7B -> 0.6B) so this fits. Read the"
+               note "DIRECTION of the result, not the number."
+             fi
+             kd pipeline --config "$FULL_CONFIG" "$@"
+             say ""
+             say "${BOLD}Done.${OFF} The table above is the answer: if distilled"
+             say "beats base on accuracy and Elo, distillation works on this data."
+             say "If it does not, it will not work on the pod either - and you"
+             say "found that out for nothing." ;;
 
   train)     setup
              [ "$MODE" = "pod" ] || warn "No GPU here - this will be very slow."
