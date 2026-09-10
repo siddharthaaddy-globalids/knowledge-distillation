@@ -1,33 +1,37 @@
 # Start here
 
-Clone the repository. Run one script. That is the whole thing.
+Clone the repository, name a config, run it.
 
 ```bash
 git clone <GIT REPO URL> knowledge-distillation
 cd knowledge-distillation
-./run.sh
+./run.sh --config configs/enlibraQ3-8B-smoke.yaml
 ```
 
-`run.sh` works out where it is running and does the right thing there:
+**`--config` is required and nothing is ever substituted for it.** There is no
+default profile and no fallback. The YAML you name is the YAML that runs — on a
+laptop, on a pod, always. If a config cannot run on this machine you get an
+error, never a quietly different run.
 
-| Where you run it | What it does |
-|---|---|
-| **Your Mac** (no GPU) | Installs everything, checks it, runs the **smoke test** — small stand-in models, the whole pipeline, minutes, free |
-| **A RunPod pod** (GPU) | Installs everything, checks it, runs the **real training** |
+Pick the profile that matches the machine:
 
-There is a third thing it can do on request — `./run.sh full`, which trains on
-all the data and runs the whole evaluation locally. See
-[Part 1b](#part-1b--does-it-actually-learn-still-free-but-hours).
+| Config | Where | What |
+|---|---|---|
+| `configs/enlibraQ3-8B-smoke.yaml` | laptop | Two steps. Proves the plumbing. Minutes. |
+| `configs/enlibraQ3-8B-mac.yaml` | laptop | All the data, full schedule, whole evaluation. Small models. Hours. |
+| `configs/enlibraQ3-8B.yaml` | 48 GB GPU | The real run. |
 
-Same command in both places. The expensive one only happens on the machine that
-is expensive anyway.
+The script decides exactly one thing on its own: **how to install**, never what
+to run. On your machine it builds a uv environment with the right torch build;
+on a pod it keeps the template's CUDA torch and installs around it, which saves
+about five minutes of paid time.
 
-The one case it refuses to guess: if the machine **looks rented** (`RUNPOD_POD_ID`
-or `KD_PRICE_PER_HOUR` is set) but no GPU is visible, it stops and asks. Running
-a smoke test on a pod that is billing you would look like success while being the
-worst outcome available — that is almost always the wrong pod template.
+It does stop and ask in one case: if the machine **looks rented**
+(`RUNPOD_POD_ID` or `KD_PRICE_PER_HOUR` is set) but no GPU is visible. That is a
+machine billing you for hardware that is not there — almost always the wrong pod
+template.
 
-**Do the Mac first.** A RunPod GPU bills by the second from the moment it
+**Do the laptop first.** A RunPod GPU bills by the second from the moment it
 starts, so everything that can be proven for free should be proven for free.
 
 ---
@@ -57,12 +61,12 @@ export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_DEFAULT_REGION=us-east-1
 
-./run.sh
+./run.sh --config configs/enlibraQ3-8B-smoke.yaml
 ```
 
-That is it. The script installs uv, installs the project, reports what your
-machine can do, checks whether it can actually reach the teacher in S3, prints
-the plan for the real run, and then runs the full pipeline on small models.
+The script installs uv, installs the project, reports what your machine can do,
+checks whether it can actually reach the teacher in S3, prints the plan, and
+runs that config's pipeline.
 
 Expect **20–40 minutes** the first time — most of it downloading about 5 GB of
 stand-in models. Later runs are much faster.
@@ -116,7 +120,7 @@ The smoke adapter is trained for two steps, so expect nonsense. The point is
 that the plumbing works.
 
 ```bash
-./run.sh ask "What are stars formed from?"
+./run.sh --config configs/enlibraQ3-8B-smoke.yaml ask "What are stars formed from?"
 ```
 
 ---
@@ -129,7 +133,7 @@ distillation works on this data, because it trains on four samples.
 If you want that answer before renting a GPU — and it is a good answer to have:
 
 ```bash
-./run.sh full
+./run.sh --config configs/enlibraQ3-8B-mac.yaml
 ```
 
 This trains on **all 1087 rows for the full 300 steps**, then scores **all 137
@@ -168,7 +172,7 @@ the sum is what has to fit, *before* activations, optimizer state and the OS.
 |---|---|---|
 | Qwen3-8B → Qwen3-1.7B | **19.0 GB** | does not fit — the teacher alone is 15.3 GB |
 | Qwen3-4B → Qwen3-1.7B | 11.3 GB | runs, but swaps hard |
-| Qwen3-1.7B → Qwen3-0.6B | 5.2 GB | comfortable — this is `./run.sh full` |
+| Qwen3-1.7B → Qwen3-0.6B | 5.2 GB | comfortable — `configs/enlibraQ3-8B-mac.yaml` |
 
 `kd.paths` treats 60% of RAM (9.6 GB here) as the working budget, because
 activations and the KV cache sit on top of the weights. Past that macOS does not
@@ -177,7 +181,7 @@ honestly.
 
 **The useful middle ground** is a 4B teacher into the *real* 1.7B student. It
 exercises the actual student, the actual LoRA target modules and the actual
-per-step memory on the student side — none of which `./run.sh full` covers,
+per-step memory on the student side — none of which the `-mac` profile covers,
 since that one shrinks both halves:
 
 ```bash
@@ -236,10 +240,11 @@ export AWS_DEFAULT_REGION=us-east-1
 export KD_PRICE_PER_HOUR=0.89        # the rate from step 4 above
 
 tmux new -s kd
-./run.sh
+./run.sh --config configs/enlibraQ3-8B.yaml
 ```
 
-Same script. It sees the GPU and runs the real training.
+Same script, and the config says what runs — it is not inferred from the
+machine.
 
 **`tmux` is not optional.** If your connection drops, anything in the foreground
 dies *and the pod keeps billing*. Inside tmux the run survives; reconnect by SSH
@@ -307,13 +312,13 @@ the run is still on the pod's disk.
 **Send it somewhere else:**
 
 ```bash
-./run.sh train --set s3.prefix=dss/dev/my-experiment
+./run.sh --config configs/enlibraQ3-8B.yaml --set s3.prefix=dss/dev/my-experiment
 ```
 
 **Turn it off:**
 
 ```bash
-./run.sh train --set s3.enabled=false
+./run.sh --config configs/enlibraQ3-8B.yaml --set s3.enabled=false
 ```
 
 **Upload by hand afterwards**, if the stage failed — on the pod, before you
@@ -336,80 +341,47 @@ scp -P <port> -i ~/.ssh/id_ed25519 -r \
 
 ```bash
 aws s3 cp --recursive s3://enlibra/dss/dev/kd/runs/<run-id>/final_adapter ./my-adapter
-./run.sh ask "What are stars formed from?" --adapter ./my-adapter
+./run.sh --config configs/enlibraQ3-8B.yaml ask "What are stars formed from?" \n    --adapter ./my-adapter
 ```
 
 ---
 
 ## Running a different YAML
 
-The script uses three configs, because it does three different things:
-
-| | | |
-|---|---|---|
-| `configs/enlibraQ3-8B.yaml` | `--config` | the **real** run, on a GPU |
-| `configs/enlibraQ3-8B-smoke.yaml` | `--smoke-config` | the **rehearsal**, minutes |
-| `configs/enlibraQ3-8B-mac.yaml` | `--full-config` | **all the data**, locally, hours |
-
-Three ways to point somewhere else, in increasing order of permanence:
+`--config` is the only way, and it is required:
 
 ```bash
-# 1. just this once
 ./run.sh --config configs/mine.yaml
-
-# 2. just this shell
-export KD_CONFIG=configs/mine.yaml
-export KD_SMOKE_CONFIG=configs/mine-smoke.yaml
-export KD_FULL_CONFIG=configs/mine-mac.yaml
-./run.sh
-
-# 3. from now on — edit the three lines under
-#    "WHICH YAML DOES THIS RUN?" at the top of run.sh
 ```
 
-`--config`, `--smoke-config` and `--full-config` go **before** the subcommand:
+`KD_CONFIG=configs/mine.yaml` in the environment does the same thing for a whole
+shell. There is no default and no fallback, so a command always says which
+config it used, and a config that will not run here fails rather than being
+quietly swapped for a smaller one.
 
-```bash
-./run.sh --config configs/mine.yaml train
-./run.sh --smoke-config configs/mine-smoke.yaml smoke
-```
+A path with no `--config` in front of it is refused with the spelling to use
+instead — one form, so there is never a question about which YAML a run read.
 
-Putting `--config` after the subcommand also works — it is handed to `kd`, which
-takes the last one it sees:
-
-```bash
-./run.sh train --config configs/mine.yaml       # same result
-```
-
-A path that does not exist stops immediately and lists what does, so a typo costs
-a second rather than turning up after the install.
-
-> **If you write your own profile, write both halves.** A "smoke test" that runs
-> the real config on a laptop is not a smoke test — it is the expensive run on
-> the wrong machine. Copy `configs/enlibraQ3-8B-smoke.yaml`; it is short, and it
-> only overrides the models, the sizes and the limits.
+A path that does not exist stops immediately and lists the ones that do.
 
 ## Doing one thing at a time
 
 `./run.sh` on its own is the whole sequence. These run a single piece of it:
 
-```bash
-./run.sh doctor      # what can this machine do, and what can it reach
-./run.sh check       # resolve the config and print the plan, run nothing
-./run.sh smoke       # the smoke test — minutes, proves the plumbing
-./run.sh full        # all the data + the whole evaluation, locally — hours
-./run.sh train       # the real run, on a GPU
-./run.sh setup       # install only
-./run.sh ask "..."   # ask the model something
-./run.sh help
-```
-
-They all accept `--config`:
+`./run.sh --config X` with nothing after it runs the whole pipeline. Add a
+subcommand to run one piece of it:
 
 ```bash
-./run.sh --config configs/mine.yaml doctor
-./run.sh --config configs/mine.yaml check
+./run.sh --config X doctor     # what this machine can do, and what it can reach
+./run.sh --config X check      # resolve the config, print the plan, run nothing
+./run.sh --config X train      # the training stage only
+./run.sh --config X ask "..."  # ask the trained model something
+./run.sh setup                 # install only  (no config needed)
+./run.sh help                  # (no config needed)
 ```
+
+Anything else is passed straight through, so `./run.sh --config X arena --limit
+20` works without the script needing to know that command exists.
 
 Anything else is passed straight through, so `./run.sh arena --limit 20` and
 `./run.sh evaluate` work without the script needing to know they exist.

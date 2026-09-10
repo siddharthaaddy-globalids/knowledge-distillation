@@ -1,41 +1,50 @@
 #!/usr/bin/env bash
 # ===========================================================================
-#  One script. Clone the repository, run this, answer nothing.
+#  One script. Clone the repository, name a config, run it.
 #
 #      git clone <repo> && cd knowledge-distillation
-#      ./run.sh
+#      ./run.sh --config configs/enlibraQ3-8B.yaml
 #
-#  It works out where it is running and does the right thing there:
+#  THE CONFIG IS THE ONLY SOURCE OF TRUTH
+#  --------------------------------------
+#  --config is REQUIRED and this script never substitutes another one. There is
+#  no default profile, no fallback, and no case in which the YAML you name is
+#  not the YAML that runs.
 #
-#      no GPU  (your Mac)   install, check, then the SMOKE TEST - small
-#                           stand-in models, the whole pipeline, free
-#      a GPU   (a pod)      install, check, then the REAL RUN
+#  An earlier version guessed: on a machine with no GPU it quietly ran a small
+#  "smoke" profile instead of the one you asked for. That is the wrong trade at
+#  any price. A run that silently trains a different pair of models than the
+#  file you pointed at is worse than a run that fails, because it reports
+#  success. If a config cannot run here, the right outcome is an error.
 #
-#  So the same command is correct in both places, and the expensive one only
-#  happens on the machine that is expensive anyway.
+#  Pick the profile that matches the machine:
 #
-#  WHY TWO INSTALL PATHS
-#  ---------------------
-#  On your own machine this creates a project virtual environment with uv, which
-#  pulls the build of torch that matches your hardware - on a Mac, the one with
-#  Apple GPU support.
+#      configs/enlibraQ3-8B.yaml         a 48 GB GPU. The real run.
+#      configs/enlibraQ3-8B-mac.yaml     a laptop. All the data, small models.
+#      configs/enlibraQ3-8B-smoke.yaml   a laptop. Two steps, proves plumbing.
 #
-#  On a rented pod it does the opposite, and deliberately: RunPod's PyTorch
-#  templates already ship a CUDA build of torch, which is 2.5 GB of the install
-#  and effectively all of the wait. scripts/runpod.sh installs everything AROUND
+#  WHAT THIS SCRIPT STILL DECIDES
+#  ------------------------------
+#  Exactly one thing: HOW to install, never WHAT to run.
+#
+#  On your own machine it builds a uv virtual environment, which pulls the torch
+#  build matching your hardware - on a Mac, the one with Apple GPU support.
+#
+#  On a rented pod it does the opposite, deliberately: RunPod's PyTorch
+#  templates already ship a CUDA build of torch, 2.5 GB of the install and
+#  effectively all of the wait. scripts/runpod.sh installs everything AROUND
 #  that build and keeps it. Ninety seconds instead of six minutes, at the GPU's
 #  hourly rate.
 #
-#  Anything you pass is handed through, so the automatic choice is never a cage:
+#  Anything after the config is passed straight through:
 #
-#      ./run.sh --config configs/mine.yaml     run a different profile
-#      ./run.sh doctor              what can this machine do, and what can it reach
-#      ./run.sh check               resolve the config, run nothing
-#      ./run.sh smoke               force the smoke test (minutes)
-#      ./run.sh full                all the data + the whole evaluation, locally
-#      ./run.sh train               force the real run
-#      ./run.sh ask "why is the sky blue?"
-#      ./run.sh setup               install only, then stop
+#      ./run.sh --config configs/X.yaml                 the full pipeline
+#      ./run.sh --config configs/X.yaml doctor          machine + credentials
+#      ./run.sh --config configs/X.yaml check           resolve, run nothing
+#      ./run.sh --config configs/X.yaml train           training stage only
+#      ./run.sh --config configs/X.yaml ask "why ...?"
+#      ./run.sh --config configs/X.yaml --set training.max_steps=50
+#      ./run.sh setup                                   install only
 #      ./run.sh help
 # ===========================================================================
 set -euo pipefail
@@ -43,39 +52,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-# ===========================================================================
-#  WHICH YAML DOES THIS RUN?  <-- change it here
-# ===========================================================================
-#  Three configs, because this script does three different things:
-#
-#      CONFIG        the real run, on a rented GPU
-#      SMOKE_CONFIG  the few-minute rehearsal that proves the plumbing
-#      FULL_CONFIG   all the data and the whole evaluation, on your own machine,
-#                    with models one size down so they fit  (./run.sh full)
-#
-#  Three ways to point somewhere else, in increasing order of permanence:
-#
-#      ./run.sh --config configs/mine.yaml            just this once
-#      KD_CONFIG=configs/mine.yaml ./run.sh           just this shell
-#      edit the two lines below                       from now on
-#
-#  --config and --smoke-config go BEFORE the subcommand, because they are
-#  choices about the whole run rather than arguments to one step:
-#
-#      ./run.sh --config configs/mine.yaml train      yes
-#      ./run.sh train --config configs/mine.yaml      also works, handed to kd
-#
-#  --smoke-config and --full-config name the other two.
-#
-#  If you write your own profile, write the smaller halves too. A smoke test
-#  that runs the real config on a laptop is not a smoke test - it is the
-#  expensive run on the wrong machine.
-# ===========================================================================
-CONFIG="${KD_CONFIG:-configs/enlibraQ3-8B.yaml}"
-SMOKE_CONFIG="${KD_SMOKE_CONFIG:-configs/enlibraQ3-8B-smoke.yaml}"
-# `./run.sh full`: the real schedule and the whole evaluation, with models small
-# enough for a laptop. Hours rather than minutes, and free.
-FULL_CONFIG="${KD_FULL_CONFIG:-configs/enlibraQ3-8B-mac.yaml}"
+# No default. Empty means "the caller has not said yet", and every path that
+# needs it refuses rather than inventing one. KD_CONFIG is honoured because an
+# exported variable is still the caller saying it, once, explicitly.
+CONFIG="${KD_CONFIG:-}"
 
 BOLD=""; DIM=""; OFF=""
 if [ -t 1 ]; then BOLD=$'\033[1m'; DIM=$'\033[2m'; OFF=$'\033[0m'; fi
@@ -86,13 +66,18 @@ note()  { printf '%s   %s%s\n' "$DIM" "$*" "$OFF"; }
 warn()  { printf '!! %s\n' "$*" >&2; }
 die()   { printf '\nxx %s\n' "$*" >&2; exit 1; }
 
+profiles() {
+  for found in "$ROOT"/configs/*.yaml; do
+    case "$found" in *_base.yaml) continue ;; esac
+    printf '    configs/%s\n' "$(basename "$found")"
+  done
+}
+
 # Ask a yes/no question, and default to NO on every path that is not an explicit
 # yes. Every use of this guards something that costs money, so silence, a closed
 # pipe and a stray newline all have to mean "stop".
 #
 # KD_YES=1 answers everything in advance, for anyone driving this from a script.
-# Without it a non-interactive shell refuses rather than hanging on a read that
-# nobody is there to answer.
 confirm() {
   if [ -n "${KD_YES:-}" ]; then
     warn "KD_YES is set - continuing without asking."
@@ -110,96 +95,42 @@ confirm() {
 
 
 # ---------------------------------------------------------------------------
-#  Leading options: which config, before we decide what to do with it
+#  Which config
 # ---------------------------------------------------------------------------
-# Only in leading position. Stopping at the first thing that is not one of these
-# is what leaves `./run.sh pipeline --config X` intact for kd's own parser -
-# swallowing that --config here would hand kd a bare `pipeline` and quietly run
-# the wrong profile.
+# Leading position only. Stopping at the first thing that is not one of these
+# leaves `--set a=b` and every kd flag intact for kd's own parser.
 while [ $# -gt 0 ]; do
   case "$1" in
-    --config)         [ $# -ge 2 ] || die "--config needs a path after it"
-                      CONFIG="$2"; shift 2 ;;
-    --config=*)       CONFIG="${1#*=}"; shift ;;
-    --smoke-config)   [ $# -ge 2 ] || die "--smoke-config needs a path after it"
-                      SMOKE_CONFIG="$2"; shift 2 ;;
-    --smoke-config=*) SMOKE_CONFIG="${1#*=}"; shift ;;
-    --full-config)    [ $# -ge 2 ] || die "--full-config needs a path after it"
-                      FULL_CONFIG="$2"; shift 2 ;;
-    --full-config=*)  FULL_CONFIG="${1#*=}"; shift ;;
-    # A bare path to a YAML file, with no --config in front of it. This is what
-    # people actually type - `./run.sh configs/mine.yaml` - and refusing it in
-    # favour of `kd: error: invalid choice` teaches nothing. It means exactly
-    # what --config means; the banner below says what will run.
-    *.yaml|*.yml)     CONFIG="$1"; shift ;;
+    --config)   [ $# -ge 2 ] || die "--config needs a path after it"
+                CONFIG="$2"; shift 2 ;;
+    --config=*) CONFIG="${1#*=}"; shift ;;
+    # A bare path is a near miss, not a guess to make on someone's behalf. Say
+    # what to type instead: one spelling, so there is never a question about
+    # which config a command used.
+    *.yaml|*.yml)
+      die "Configs are named with --config, so the command says which one:
+    ./run.sh --config $1 ${*:2}" ;;
     *) break ;;
   esac
 done
 
-# The same courtesy one position later: `./run.sh train configs/mine.yaml`.
-# kd's own parser takes --config but not a loose positional, so without this the
-# subcommand form fails where the leading form now works - and the two reading
-# identically is the whole point.
-#
-# Safe to do blindly because nothing here takes a positional argument that could
-# end in .yaml: the subcommands take none, and `ask` takes a question.
-REST=()
-prev=""
-for arg in "$@"; do
-  keep=1
-  case "$arg" in
-    *.yaml|*.yml)
-      # Only when it is standing on its own. A path that FOLLOWS an option is
-      # that option's value - `--config X`, `--set dataset.source=X` - and
-      # taking it would leave the option dangling, breaking the very form this
-      # is meant to complement. Anything after a `-...` word is left alone.
-      #
-      # And only when the file exists, so a question that happens to end in
-      # ".yaml" stays a question.
-      if [ "${prev#-}" = "$prev" ] && [ -f "$arg" ]; then
-        CONFIG="$arg"; keep=0
-      fi
-      ;;
-  esac
-  [ "$keep" = "1" ] && REST+=("$arg")
-  prev="$arg"
-done
-set -- ${REST[@]+"${REST[@]}"}
-
-# Checked now rather than by the first command that reads it, so a typo costs a
-# second here instead of appearing after an install.
-for candidate in "$CONFIG" "$SMOKE_CONFIG" "$FULL_CONFIG"; do
-  [ -f "$ROOT/$candidate" ] || [ -f "$candidate" ] || {
-    warn "No such config: $candidate"
-    warn "Profiles that ship with this repository:"
-    for found in "$ROOT"/configs/*.yaml; do
-      case "$found" in *_base.yaml) continue ;; esac
-      warn "    configs/$(basename "$found")"
-    done
-    die "Name one of those, or check the path you passed to --config."
-  }
-done
-
 
 # ---------------------------------------------------------------------------
-#  Where are we?
+#  Where are we? (this decides how to install, and nothing else)
 # ---------------------------------------------------------------------------
-# An NVIDIA driver that answers is the only thing that distinguishes a rented
-# pod from a laptop for our purposes. Asked by running it, not by looking for
-# the file: a container can carry the binary without the driver underneath.
+# An NVIDIA driver that answers is what distinguishes a rented pod from a
+# laptop. Asked by running it, not by looking for the file: a container can
+# carry the binary without the driver underneath.
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
   MODE="pod"
 else
   MODE="local"
 fi
 
-# "No GPU" and "no GPU *and nothing is being rented*" are different situations,
-# and only the second one is safe to answer with a smoke test.
-#
-# On a laptop, falling back to the rehearsal is exactly right. On a pod whose
-# driver is missing - the wrong template, most often - it is the worst possible
-# outcome: you pay for a GPU and get two steps of a 0.6B model, and the output
-# looks like a success. So if anything says money is involved, stop and ask.
+# "No GPU" and "no GPU *and nothing is being rented*" are different situations.
+# On a laptop the first is ordinary. On a pod whose driver is missing - the
+# wrong template, most often - you are paying for hardware that is not there,
+# and the run that follows will be slow rather than absent. Worth stopping for.
 rented_looking() {
   [ -n "${RUNPOD_POD_ID:-}" ] && return 0
   [ -n "${KD_PRICE_PER_HOUR:-}" ] && return 0
@@ -212,17 +143,11 @@ if [ "$MODE" = "local" ] && rented_looking; then
   [ -n "${KD_PRICE_PER_HOUR:-}" ] && \
     warn "  KD_PRICE_PER_HOUR is set: ${KD_PRICE_PER_HOUR}/hour"
   warn ""
-  warn "  Continuing would run the SMOKE TEST - two steps of a small stand-in"
-  warn "  model - on a machine that is billing you. It would look like it"
-  warn "  worked."
-  warn ""
-  warn "  Almost always the pod template. Use a PyTorch template, and check:"
-  warn "      nvidia-smi"
-  if confirm "Run the smoke test anyway?"; then
-    warn "Continuing without a GPU, on your say-so."
-  else
-    die "Stopped. Fix the GPU, or terminate this pod before it bills further."
-  fi
+  warn "  Whatever you run next will fall back to CPU on a machine that is"
+  warn "  billing you for a GPU. Almost always the pod template - use a"
+  warn "  PyTorch template, and check:   nvidia-smi"
+  confirm "Continue on CPU anyway?" \
+    || die "Stopped. Fix the GPU, or terminate this pod before it bills further."
 fi
 
 
@@ -231,14 +156,12 @@ fi
 # ---------------------------------------------------------------------------
 kd() {
   if [ "$MODE" = "pod" ]; then
-    # runpod.sh owns the install on a pod, skips it when it is already done, and
-    # passes everything else through to the pipeline.
     "$ROOT/scripts/runpod.sh" "$@"
   else
     # The same dispatch rule scripts/runpod.sh applies: nothing, or a leading
     # option, means the full gated pipeline. Without this the two paths disagree
-    # - `./run.sh train` worked on a pod and died locally on `invalid choice:
-    # configs/...yaml`, because `python -m kd --config X` names no subcommand.
+    # - `python -m kd --config X` names no subcommand and dies on `invalid
+    # choice`, which is what made `train` work on a pod and fail locally.
     if [ $# -eq 0 ] || [ "${1#-}" != "$1" ]; then
       set -- pipeline "$@"
     fi
@@ -248,20 +171,18 @@ kd() {
 
 
 ensure_uv() {
-  if command -v uv >/dev/null 2>&1; then
-    return
-  fi
+  command -v uv >/dev/null 2>&1 && return
   step "Installing uv (the tool that manages Python for you)"
   curl -LsSf https://astral.sh/uv/install.sh | sh
   # The installer edits your shell profile, which does nothing for the shell
-  # already running. Put its directories on the path now so this run continues
-  # rather than telling you to open a new terminal.
+  # already running. Put its directories on the path now, so this run continues
+  # instead of telling you to open a new terminal.
   for dir in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
     [ -d "$dir" ] && PATH="$dir:$PATH"
   done
   export PATH
   command -v uv >/dev/null 2>&1 \
-    || die "uv installed but is not on PATH. Open a new terminal and run this again."
+    || die "uv installed but is not on PATH. Open a new terminal and try again."
 }
 
 
@@ -275,34 +196,27 @@ setup() {
   step "Installing the project"
   note "First time this takes a few minutes. After that it is instant."
   # --extra remote is not optional for this workflow, whatever pyproject.toml
-  # calls it: the teacher lives in S3, so boto3 is a hard requirement here. A
-  # plain `uv sync` PRUNES it, and the failure that produces is a confusing one
-  # - the config is right, the credentials are right, and the run still cannot
-  # read its inputs.
+  # calls it: a teacher in S3 means boto3 is a hard requirement. A plain
+  # `uv sync` PRUNES it, and the failure that produces is a confusing one - the
+  # config is right, the credentials are right, and the run cannot read its
+  # inputs.
   uv sync --extra remote
 }
 
 
-# ---------------------------------------------------------------------------
-#  Checks worth doing before anything expensive
-# ---------------------------------------------------------------------------
-credentials_note() {
-  # Presence only. Whether they actually WORK is what `doctor` answers, by
-  # listing the bucket - and that is the check that matters, because a key that
-  # exists and is refused looks identical to a key that works until it is used.
-  # The file counts too. Refusing to start on a machine where S3 works, because
-  # the credentials happen to live in ~/.aws rather than in the environment,
-  # would be a guard that only ever gets in the way.
-  if [ -z "${AWS_ACCESS_KEY_ID:-}" ] && [ -z "${AWS_PROFILE:-}" ] \
-     && [ ! -f "${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}" ]; then
-    warn "No AWS credentials in this shell."
-    warn "  The teacher model lives in S3. Set them and run this again:"
-    warn "    export AWS_ACCESS_KEY_ID=..."
-    warn "    export AWS_SECRET_ACCESS_KEY=..."
-    warn "    export AWS_DEFAULT_REGION=us-east-1"
-    return 1
-  fi
-  return 0
+require_config() {
+  [ -n "$CONFIG" ] || die "Which config? --config is required - this script has
+no default and never picks one for you.
+
+    ./run.sh --config configs/enlibraQ3-8B.yaml
+
+Profiles in this repository:
+$(profiles)"
+
+  [ -f "$ROOT/$CONFIG" ] || [ -f "$CONFIG" ] || die "No such config: $CONFIG
+
+Profiles in this repository:
+$(profiles)"
 }
 
 
@@ -316,7 +230,6 @@ pod_guards() {
     confirm "Continue anyway?" \
       || die "Stopped. Run 'tmux new -s kd' and try again."
   fi
-
   if [ -z "${KD_PRICE_PER_HOUR:-}" ]; then
     warn "KD_PRICE_PER_HOUR is not set, so the spending cap cannot work."
     warn "  Set it to the hourly rate you agreed to, then run this again:"
@@ -326,155 +239,63 @@ pod_guards() {
 
 
 # ---------------------------------------------------------------------------
-#  What a bare ./run.sh does
-# ---------------------------------------------------------------------------
-automatic() {
-  say ""
-  if [ "$MODE" = "pod" ]; then
-    say "${BOLD}GPU detected - this is the real run.${OFF}"
-    note "It will train, score the result and upload it. Expect 1-3 hours."
-    note "config: $CONFIG"
-  else
-    say "${BOLD}No GPU here - running the smoke test.${OFF}"
-    note "Small stand-in models, the whole pipeline, nothing rented. This is"
-    note "the rehearsal you do before paying for a GPU."
-    note "running: $SMOKE_CONFIG"
-    note "rehearsing for: $CONFIG"
-  fi
-  note "Point somewhere else with:  ./run.sh --config configs/<yours>.yaml"
-
-  setup
-
-  step "What this machine can do, and what it can reach"
-  kd doctor --config "$CONFIG" || true
-
-  if [ "$MODE" = "pod" ]; then
-    credentials_note || die "Set your AWS credentials and run this again."
-    pod_guards
-
-    step "The plan"
-    kd check --config "$CONFIG"
-
-    step "Training"
-    note "Stages run in order and stop at the first real failure. If the run"
-    note "cannot finish inside its limits it is REFUSED before spending."
-    kd --config "$CONFIG"
-    finish_pod
-  else
-    step "The plan for the real run (nothing is trained here)"
-    kd check --config "$CONFIG"
-
-    step "Smoke test - the whole pipeline, small models"
-    note "First run downloads about 5 GB and takes 20-40 minutes."
-    kd pipeline --config "$SMOKE_CONFIG"
-    finish_local
-  fi
-}
-
-
-finish_local() {
-  say ""
-  say "${BOLD}Smoke test done.${OFF}"
-  say ""
-  say "  If every stage above said OK, this machine is not the problem and the"
-  say "  configuration is sound. Nothing here tells you how fast or how large"
-  say "  the real run will be - different models, different hardware."
-  say ""
-  say "  ${BOLD}Next:${OFF} start a RunPod pod with a 48 GB+ GPU (L40S or RTX A6000),"
-  say "  a PyTorch template, and a 120 GB volume at /workspace. Then on the pod:"
-  say ""
-  say "      cd /workspace"
-  say "      git clone <this repo> && cd knowledge-distillation"
-  say "      export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=..."
-  say "      export KD_PRICE_PER_HOUR=0.89        # the rate you agreed to"
-  say "      tmux new -s kd"
-  say "      ./run.sh"
-  say ""
-  say "  Full walkthrough: docs/START-HERE.md"
-}
-
-
-finish_pod() {
-  say ""
-  say "${BOLD}Run complete.${OFF}"
-  say ""
-  say "  Your results are in the run directory printed above, and - because"
-  say "  s3.enabled is true in the config - already uploaded to S3."
-  say ""
-  say "  ${BOLD}Now go and terminate the pod in the RunPod console.${OFF}"
-  say "  Nothing stops a pod you started by hand. It bills until you do."
-}
-
-
-# ---------------------------------------------------------------------------
 #  Dispatch
 # ---------------------------------------------------------------------------
-usage() {
-  sed -n '2,/^# ====/p' "$0" | sed 's/^#\{1,\} \{0,1\}//; s/^=\{3,\}.*//'
-}
+usage() { sed -n '2,/^# ====/p' "$0" | sed 's/^#\{1,\} \{0,1\}//; s/^=\{3,\}.*//'; }
 
 case "${1:-}" in
-  "")        automatic ;;
-  help|-h|--help) usage ;;
-  setup)     setup ;;
+  help|-h|--help) usage; exit 0 ;;
+  setup)          setup; exit 0 ;;
+esac
 
-  doctor)    setup; shift
-             kd doctor --config "$CONFIG" "$@" ;;
+require_config
+setup
 
-  check)     setup; shift
-             kd check --config "$CONFIG" "$@" ;;
+# Everything the caller typed goes to kd unchanged, against the one config they
+# named. No branch here reads MODE: what runs is the config's business.
+if [ $# -eq 0 ]; then
+  say ""
+  say "${BOLD}Running $CONFIG${OFF}"
+  [ "$MODE" = "pod" ] && note "GPU detected." || note "No GPU - CPU or Apple MPS."
+  note "Nothing is substituted. This config is what runs."
 
-  smoke)     setup; shift
-             kd pipeline --config "$SMOKE_CONFIG" "$@"; finish_local ;;
+  step "What this machine can do, and what it can reach"
+  note "Read the 'remote inputs' section: a FAIL there is a run that will abort"
+  note "in preflight, and on a pod that means paying to find out."
+  kd doctor --config "$CONFIG" || true
 
-  full)      setup; shift
-             say ""
-             say "${BOLD}Full local run: all the data, the whole evaluation.${OFF}"
-             note "config: $FULL_CONFIG"
-             note "Trains on all 1087 rows for 300 steps, then scores all 137"
-             note "held-out questions with base, distilled and teacher."
-             note ""
-             note "Several hours, and free. Safe to interrupt - checkpoints are"
-             note "written every 25 steps and each stage writes as it finishes."
-             if [ "$MODE" = "local" ]; then
-               note "Models are one size down (1.7B -> 0.6B) so this fits. Read the"
-               note "DIRECTION of the result, not the number."
-             fi
-             kd pipeline --config "$FULL_CONFIG" "$@"
-             say ""
-             say "${BOLD}Done.${OFF} The table above is the answer: if distilled"
-             say "beats base on accuracy and Elo, distillation works on this data."
-             say "If it does not, it will not work on the pod either - and you"
-             say "found that out for nothing." ;;
+  [ "$MODE" = "pod" ] && pod_guards
 
-  train)     setup
-             [ "$MODE" = "pod" ] || warn "No GPU here - this will be very slow."
-             credentials_note || die "Set your AWS credentials and run this again."
-             [ "$MODE" = "pod" ] && pod_guards
-             shift
-             kd --config "$CONFIG" "$@"
-             [ "$MODE" = "pod" ] && finish_pod ;;
+  step "The plan"
+  kd check --config "$CONFIG"
 
-  ask)       setup; shift
-             [ $# -gt 0 ] || die 'ask needs a question:  ./run.sh ask "why is the sky blue?"'
-             question="$1"; shift
-             config="$CONFIG"
-             # On a machine with no GPU the only adapter that exists is almost
-             # certainly the smoke one, whose base model is a size down. Naming
-             # the wrong base loads an adapter against weights it was never
-             # trained on, which produces noise rather than an error.
-             [ "$MODE" = "local" ] && config="$SMOKE_CONFIG"
-             if [ "$MODE" = "pod" ]; then
-               "$ROOT/scripts/runpod.sh" --setup-only >/dev/null
-               PYTHONPATH="$ROOT/src" python scripts/ask.py \
-                 --config "$config" --question "$question" "$@"
-             else
-               uv run --quiet python scripts/ask.py \
-                 --config "$config" --question "$question" "$@"
-             fi ;;
+  step "Running the pipeline"
+  kd --config "$CONFIG"
 
-  # Anything else is a kd subcommand. `./run.sh arena --limit 20` and
-  # `./run.sh evaluate` work without this script needing to know they exist.
-  *)         setup
-             kd "$@" ;;
+  say ""
+  say "${BOLD}Done.${OFF} The run bundle is named above."
+  if [ "$MODE" = "pod" ]; then
+    say ""
+    say "  ${BOLD}Now terminate the pod in the RunPod console.${OFF}"
+    say "  Nothing stops a pod you started by hand. It bills until you do."
+  fi
+  exit 0
+fi
+
+case "$1" in
+  ask) shift
+       [ $# -gt 0 ] || die 'ask needs a question:  ./run.sh --config X ask "why?"'
+       question="$1"; shift
+       if [ "$MODE" = "pod" ]; then
+         "$ROOT/scripts/runpod.sh" --setup-only >/dev/null
+         PYTHONPATH="$ROOT/src" python scripts/ask.py \
+           --config "$CONFIG" --question "$question" "$@"
+       else
+         uv run --quiet python scripts/ask.py \
+           --config "$CONFIG" --question "$question" "$@"
+       fi ;;
+
+  # Any kd subcommand, or a bare option list meaning the pipeline.
+  *) [ "$MODE" = "pod" ] && [ "$1" = "train" ] && pod_guards
+     kd "$@" --config "$CONFIG" ;;
 esac

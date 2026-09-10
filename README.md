@@ -53,12 +53,13 @@ couple of minutes.
 
 ## Getting started
 
-**New here?** Clone and run one script — it installs everything, works out
-whether it is on a laptop or a GPU, and does the right thing for each:
+**New here?** Clone and run one script. It installs everything and runs the
+config you name — `--config` is required, and nothing is ever substituted for
+it:
 
 ```bash
 git clone <this repo> && cd knowledge-distillation
-./run.sh
+./run.sh --config configs/enlibraQ3-8B-smoke.yaml
 ```
 
 Walkthrough: **[docs/START-HERE.md](docs/START-HERE.md)**. The rest of this page
