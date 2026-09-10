@@ -49,13 +49,24 @@ def resolve_tokenizer_source(config):
 # --------------------------------------------------------------------------- #
 # Generation helper
 # --------------------------------------------------------------------------- #
-def generate_sample(model, tokenizer, prompt, device, max_new_tokens=48):
-    """Sampled generation, used for the periodic quality probes during training."""
-    messages = [{"role": "user", "content": prompt}]
-    formatted = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs = tokenizer(formatted, return_tensors="pt").to(device)
+def generate_sample(model, tokenizer, prompt, device, max_new_tokens=512):
+    """Sampled generation, used for the periodic quality probes during training.
+
+    Two things here exist because of models that open with a reasoning block.
+
+    The rendering comes from kd.teacher.render_prompt, which positions the
+    prompt so the next token is an ANSWER rather than `<think>`. Without it a
+    Qwen3-family student spends the whole sample budget deliberating and the
+    probe shows you none of the thing it was printed to show.
+
+    And the default is 512 rather than 48. Forty-eight was enough when a sample
+    began at the answer; against a model that thinks first it is not enough to
+    escape the preamble, so every probe in the log ended mid-sentence and told
+    you nothing about whether the student was learning the target format.
+    """
+    from .teacher import render_prompt
+
+    inputs = tokenizer(render_prompt(tokenizer, prompt), return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -97,7 +108,7 @@ class TelemetryCallback(TrainerCallback):
     """
 
     def __init__(self, model, tokenizer, device, benchmark_prompts,
-                 eval_every=100, window=20, run=None):
+                 eval_every=100, window=20, run=None, sample_tokens=512):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -105,6 +116,7 @@ class TelemetryCallback(TrainerCallback):
         self.eval_every = eval_every
         self.window = window
         self.run = run
+        self.sample_tokens = int(sample_tokens)
         self.step_start = None
         self.run_start = None
         self.losses = []
@@ -183,7 +195,9 @@ class TelemetryCallback(TrainerCallback):
         self.model.eval()
         try:
             for prompt in self.benchmark_prompts:
-                text = generate_sample(self.model, self.tokenizer, prompt, self.device)
+                text = generate_sample(self.model, self.tokenizer, prompt,
+                                       self.device,
+                                       max_new_tokens=self.sample_tokens)
                 print(f"  Q: {prompt}\n  A: {text}\n")
         except Exception as exc:
             print(f"  !! benchmark generation failed: {exc}")
@@ -233,6 +247,7 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
     dtype = hardware["dtype"]
     seed = int(config["project"]["seed"])
     benchmark_prompts = list(config.get("benchmark_prompts") or [])
+    sample_tokens = int(training_cfg.get("benchmark_max_new_tokens") or 512)
 
     teacher_id = config["models"]["teacher"]
     student_id = config["models"]["student"]
@@ -304,7 +319,7 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
     print("\n[Phase 4] Student output BEFORE distillation:")
     for prompt in benchmark_prompts[:1]:
         print(f"  Q: {prompt}\n  A: "
-              f"{generate_sample(student_model, tokenizer, prompt, device)}\n")
+              f"{generate_sample(student_model, tokenizer, prompt, device, sample_tokens)}\n")
 
     # 6. Training configuration
     # NOTE: transformers 5.x removed `warmup_ratio`; `warmup_steps` accepts a float in
@@ -351,7 +366,8 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
 
     # 7. Trainer
     telemetry = TelemetryCallback(student_model, tokenizer, device, benchmark_prompts,
-                                  eval_every=eval_every, run=run)
+                                  eval_every=eval_every, run=run,
+                                  sample_tokens=sample_tokens)
     trainer = GKDTrainer(
         model=student_model,
         teacher_model=teacher_model,
@@ -374,7 +390,7 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
     print("\n[Phase 6] Student output AFTER distillation:")
     for prompt in benchmark_prompts:
         print(f"  Q: {prompt}\n  A: "
-              f"{generate_sample(student_model, tokenizer, prompt, device)}\n")
+              f"{generate_sample(student_model, tokenizer, prompt, device, sample_tokens)}\n")
 
     summary = {
         "steps_completed": int(trainer.state.global_step),

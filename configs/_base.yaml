@@ -114,6 +114,12 @@ training:
   save_total_limit: 2
   eval_enabled: true
   benchmark_every: 100
+  # How many tokens the periodic sample generations are allowed. These probes
+  # are the most informative thing in a training log - they are where you watch
+  # the target format appear - so they have to be long enough to reach it. A
+  # model that opens with a reasoning block needs several hundred just to get
+  # past the preamble.
+  benchmark_max_new_tokens: 512
 
 gkd:
   lmbda: 0.5            # on-policy fraction; raise toward 1.0 for more student rollouts
