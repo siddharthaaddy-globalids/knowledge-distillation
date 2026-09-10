@@ -118,19 +118,19 @@ limits:
   max_cost_usd: null
 
 s3:
-  # Nothing here is rented and nothing is worth keeping, so this needs no
-  # credentials - which also means it runs on a machine that has none. The
-  # corpus is on disk and the models come from the Hub.
+  # ON, to the same bucket and prefix as the pod run - inherited, not restated,
+  # so the two cannot drift.
   #
-  # This profile therefore proves nothing about S3. The only thing S3 is still
-  # needed for is the teacher, and the cheap way to test that is not a pipeline
-  # run at all - it is one listing, which costs nothing and downloads nothing:
+  # This is what makes the smoke test worth running for S3: it exercises the
+  # UPLOAD path, which needs s3:PutObject - a different permission from reading
+  # the teacher, and the one that decides whether a finished pod run survives
+  # the pod. Proving it here costs nothing; discovering it is missing at the
+  # end of a paid run costs the run.
   #
-  #     aws s3 ls s3://enlibra/dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/models/rl/
-  #
-  # If that prints files, the pod will be able to fetch the teacher. If it says
-  # AccessDenied, no amount of pipeline configuration will help.
-  enabled: false
+  # The models still come from the Hub and the corpus is on disk, so nothing
+  # here DOWNLOADS from S3. And `upload` is a non-gate stage: on a machine with
+  # no credentials it reports the failure and the run still finishes.
+  enabled: true
 
 runpod:
   enabled: false

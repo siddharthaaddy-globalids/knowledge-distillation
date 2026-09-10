@@ -112,7 +112,14 @@ will not help — the permission is missing from your AWS user, not from your ke
 Ask whoever administers the AWS account for `s3:ListBucket` on the bucket and
 `s3:GetObject` on that prefix.
 
-Everything else in Part 1 works without it. Only the real run needs it.
+Everything else in Part 1 works without it. Only fetching the teacher needs it.
+
+The smoke profile now uploads its bundle too, to the same place the pod run
+will. That is deliberate: the upload path needs **`s3:PutObject`**, a *different*
+permission from reading the teacher, and it is the one that decides whether a
+finished pod run survives the pod. Proving it here costs nothing. `upload` is a
+non-gate stage, so if the permission is missing you get a clear failure and the
+run still finishes.
 
 ### Talk to what you trained
 
@@ -294,7 +301,7 @@ before the pod goes away:
 
 ```
 [9/9] upload               OK       12s
-      6 files, 84.3 MB -> s3://enlibra/dss/dev/kd/runs/<run-id>
+      6 files, 84.3 MB -> s3://enlibra/dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/gkd/runs/<run-id>
 ```
 
 | | |
@@ -305,7 +312,7 @@ before the pod goes away:
 | `run.log`, `events.jsonl` | everything the terminal showed |
 | `config.resolved.yaml`, `manifest.json` | exactly what produced it |
 
-This needs **`s3:PutObject`** on `dss/dev/kd/*` — a *different* permission from
+This needs **`s3:PutObject`** on `dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/gkd/*` — a *different* permission from
 reading the teacher. If the upload stage fails, that is why, and nothing is lost:
 the run is still on the pod's disk.
 
@@ -326,7 +333,7 @@ terminate it:
 
 ```bash
 aws s3 cp --recursive /workspace/runs/<run-id> \
-    s3://enlibra/dss/dev/kd/runs/<run-id>/
+    s3://enlibra/dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/gkd/runs/<run-id>/
 ```
 
 **Copy it to your Mac instead of S3** — run this on your Mac, using the SSH
@@ -340,7 +347,7 @@ scp -P <port> -i ~/.ssh/id_ed25519 -r \
 **Use it later:**
 
 ```bash
-aws s3 cp --recursive s3://enlibra/dss/dev/kd/runs/<run-id>/final_adapter ./my-adapter
+aws s3 cp --recursive s3://enlibra/dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/gkd/runs/<run-id>/final_adapter ./my-adapter
 ./run.sh --config configs/enlibraQ3-8B.yaml ask "What are stars formed from?" \n    --adapter ./my-adapter
 ```
 
@@ -393,7 +400,7 @@ Anything else is passed straight through, so `./run.sh arena --limit 20` and
 | It says | What to do |
 |---|---|
 | `models.teacher FAIL ... access denied` | A permissions problem, not a key problem. New keys will not help — ask your AWS administrator. |
-| `PutObject ... is not authorized` at the `upload` stage | A **different** permission from reading the teacher: the run needs `s3:PutObject` on `dss/dev/kd/*`. Nothing is lost — the bundle is still on disk. |
+| `PutObject ... is not authorized` at the `upload` stage | A **different** permission from reading the teacher: the run needs `s3:PutObject` on `dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/gkd/*`. Nothing is lost — the bundle is still on disk. |
 | The run swaps / a step takes minutes on a Mac | The models do not fit. See [the memory table](#can-i-force-the-real-8b-teacher-on-the-mac). |
 | `No AWS credentials in this shell` | Run the three `export` lines above, then run the script again. |
 | `You are not inside tmux` | Run `tmux new -s kd`, then the script again. |

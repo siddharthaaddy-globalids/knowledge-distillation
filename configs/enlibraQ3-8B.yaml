@@ -263,7 +263,13 @@ s3:
   # preflight refuses to fetch it while this is false.
   enabled: true
   bucket: enlibra
-  prefix: dss/dev/kd
+  # Bundles land beside the teacher they were distilled from, under that run's
+  # own outputs/ tree, rather than in a separate kd/ corner of the bucket.
+  #
+  # kd.remote.s3.run_prefix appends `runs/<run-id>`, so a full bundle URI is
+  #   s3://enlibra/dss/dev/runs/98141935-.../outputs/gkd/runs/<run-id>/
+  # and every run keeps its own folder instead of overwriting the last one.
+  prefix: dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/gkd
   # Credentials come from the environment - AWS_ACCESS_KEY_ID and
   # AWS_SECRET_ACCESS_KEY, or AWS_PROFILE - never from this file.
   #

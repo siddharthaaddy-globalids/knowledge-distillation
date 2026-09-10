@@ -1,0 +1,109 @@
+# ===========================================================================
+#  enLibra SFT teacher -> Qwen3-1.7B, on a Mac mini            [smoke test]
+#
+#    ./run.sh --config configs/enlibraQ3-4B-smoke.yaml
+#
+#  The same run as configs/enlibraQ3-4B.yaml with one thing changed: it trains
+#  on a small slice of the corpus instead of all of it, so it finishes in
+#  minutes. Same teacher, same student, same LoRA, same token budgets, same
+#  held-out set, same S3 destination.
+#
+#  Everything not listed below is inherited, deliberately. Restating a value
+#  here would let it drift from the run this is meant to rehearse, and a
+#  rehearsal of a different run is worse than none.
+#
+#  MEMORY - READ THIS BEFORE RUNNING IT
+#  ------------------------------------
+#  The models are the real ones, not stand-ins. A ~4B teacher and a 1.7B student
+#  are together about 11 GB of bfloat16 weights, both resident at once.
+#
+#  On a 16 GB Mac that is over the ~9.6 GB kd.paths treats as the working budget
+#  (60% of RAM, leaving room for activations and the OS). macOS will not refuse -
+#  it swaps, and the run gets slow rather than failing honestly. Expect it to be
+#  slow. It is a shape test, not a speed test.
+#
+#  If it thrashes, drop the student for the run:
+#      ./run.sh --config configs/enlibraQ3-4B-smoke.yaml \
+#          --set models.student=Qwen/Qwen3-0.6B
+#  which brings the pair to about 8.9 GB and inside the budget. It stops being
+#  the real student at that point, so prefer swapping only when you have to.
+#
+#  Nothing here is free of S3: the teacher is fetched from it and the bundle is
+#  uploaded to it. That is the point of running it - the credentials, the
+#  bucket policy and both permissions get proved on a machine that costs
+#  nothing, rather than on a GPU that bills by the second.
+# ===========================================================================
+extends: enlibraQ3-4B.yaml
+
+project:
+  name: enlibra-q3-sft-smoke
+
+hardware:
+  device: mps
+  # transformers permits bfloat16 on MPS only from macOS 14.0; below that
+  # kd.config falls back to float32 and says so - slower, not broken, but at
+  # float32 these two models are ~22 GB and will not fit at all. On an Intel Mac
+  # add --set hardware.device=cpu and expect it to take all day.
+  dtype: bfloat16
+
+dataset:
+  # A VERY SMALL SLICE. This is the one difference from the pod profile.
+  #
+  # The domain names and files match the parent exactly - this block replaces
+  # the parent's rather than merging into it, so a domain renamed upstream and
+  # not renamed here would rehearse a corpus the real run does not have. Only
+  # the quotas change.
+  #
+  # The pass rate printed per domain is the number to read: anything below 100%
+  # means the token budgets are dropping rows, and the real run would silently
+  # train on part of the corpus.
+  validation_size: 8
+  domains:
+    - name: curriculum-sft
+      data_files: sft-1to3hop.jsonl
+      quota: 24
+      pool: 32
+    - name: curriculum-rl
+      data_files: rl-1to2hop.jsonl
+      quota: 8
+      pool: 12
+    - name: identity
+      data_files: identity.jsonl
+      quota: 4
+      pool: 6
+
+training:
+  # Enough steps to prove the loop runs and a checkpoint is written, not enough
+  # to learn anything. 4 steps x batch 1 x accum 2 consumes 8 samples.
+  max_steps: 4
+  gradient_accumulation_steps: 2
+  save_steps: 4
+  save_total_limit: 1
+  benchmark_every: 4
+
+evaluation:
+  samples: 8
+  # Four questions instead of 137. Enough to prove the stage works end to end -
+  # the file parses, three models load one after another without exhausting the
+  # machine, the <Answer> tag is found, the ratings come out - and nowhere near
+  # enough to mean anything. Elo from four questions is noise; read the fact
+  # that the stage finished, not the numbers.
+  #
+  # This is the second deviation from the parent, and it is not optional: three
+  # models generating to an 8192-token ceiling across 137 questions on MPS is
+  # hours, and a barely-trained student runs to that ceiling every time because
+  # it has not learned to emit an end-of-turn token.
+  arena_limit: 4
+  arena_max_new_tokens: 2048
+
+limits:
+  # Generous, because most of it is one-time: fetching the teacher from S3, then
+  # downloading the student from the Hub. The smoke stage projects the run
+  # against this and REFUSES anything that cannot finish inside it, so a tight
+  # ceiling here would decline the run before it started.
+  max_runtime_minutes: 120
+  max_cost_usd: null
+
+runpod:
+  # Nothing is rented by this profile.
+  enabled: false

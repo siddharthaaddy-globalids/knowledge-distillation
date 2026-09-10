@@ -1,0 +1,219 @@
+# ===========================================================================
+#  enLibra space curriculum - the SFT teacher -> Qwen3-1.7B     [rented GPU]
+#
+#    ./run.sh --config configs/enlibraQ3-4B.yaml
+#
+#  The laptop counterpart is configs/enlibraQ3-4B-smoke.yaml, which changes one
+#  thing: how much of the corpus it trains on. Same teacher, same student, same
+#  everything else.
+#
+#  WHY A SECOND PAIR OF PROFILES
+#  -----------------------------
+#  configs/enlibraQ3-8B.yaml distils the RL-tuned 8B teacher. This one distils
+#  the SFT teacher from a different curriculum run, which is roughly half the
+#  size - so it fits a far cheaper GPU, and is the sensible thing to try first.
+#  The two are separate files rather than one file with switches because a run
+#  should be describable by the single path you pointed at.
+#
+#  ABOUT THE TEACHER'S SIZE
+#  ------------------------
+#  Reported as "4B or 3B". Nothing here depends on knowing which: the checkpoint
+#  carries its own config, and the preflight stage prints what actually loaded.
+#  What the number changes is the GPU, so read `weights` in the preflight output
+#  before trusting the sizing note under `runpod` below.
+#
+#  Note that the estimate can UNDER-report for an s3:// teacher. kd.paths reads
+#  parameter counts from the Hub, and a checkpoint fetched into a local cache
+#  has no Hub entry - so the printed figure may cover the student alone. Check
+#  the size of the download itself if it matters.
+# ===========================================================================
+extends: _base.yaml
+
+project:
+  name: enlibra-q3-sft-to-1.7b
+
+models:
+  # The SFT-stage teacher, merged, in object storage. Preflight fetches it into
+  # s3.cache_dir before anything tries to load it - which is what turns a bad
+  # credential into a two-second failure rather than a forty-minute one.
+  #
+  # If this prefix turns out to hold a LoRA adapter rather than a whole model -
+  # an adapter_config.json and a few hundred MB, not several GB - it belongs in
+  # teacher_adapter instead, against whichever stock base it was trained on:
+  #
+  #     teacher: Qwen/Qwen3-4B
+  #     teacher_adapter: s3://enlibra/dss/dev/runs/9eb5db9e-.../outputs/models/sft/
+  #
+  # That form is better whenever you have the choice: a merged export written by
+  # another framework often keeps that framework's key layout, and transformers
+  # does not raise on keys it cannot map - it randomly initialises them and
+  # warns. The teacher-check stage exists to catch exactly that, and it is a
+  # gate, so a teacher that fails it stops the run before any budget is spent.
+  teacher: s3://enlibra/dss/dev/runs/9eb5db9e-efe4-4c8d-9f6d-3adf665a44b9/outputs/models/sft/
+  student: Qwen/Qwen3-1.7B
+
+  # From the STUDENT, not the teacher. Every Qwen3 shares one vocabulary (151669
+  # entries, identical dicts, identical chat template), which is what GKD needs.
+  # The student's copy is the canonical one; a custom export's tokenizer files
+  # are the part of it least worth trusting.
+  tokenizer: student
+
+hardware:
+  device: auto
+  dtype: bfloat16
+
+dataset:
+  # Committed to the repository, so a pod gets the corpus from `git clone` with
+  # no download and no credentials. The teacher is the only thing this profile
+  # fetches from object storage.
+  source: ./data/enlibra-curriculum
+
+  # No cap. These are the budgets kd.data filters every sample against, and a
+  # sample over either is dropped SILENTLY - so they sit at Qwen3's full native
+  # context, where the filter can never fire. Nothing in the corpus comes close
+  # (longest row: 786 tokens), and it costs nothing: max_total_tokens becomes
+  # the collator's max_length, a truncation ceiling rather than an allocation.
+  max_prompt_tokens: 32768
+  max_total_tokens: 32768
+
+  validation_size: 48
+
+  # kd.data's built-in synthetic prompts are general-purpose calibration for a
+  # general-purpose student. This student is deliberately narrow.
+  include_synthetic: false
+
+  # THE FULL CORPUS - 1095 rows. This is the only thing the -smoke profile
+  # changes, so keep the domain NAMES stable: that file overrides this block
+  # wholesale rather than merging into it.
+  #
+  # eval-1to5hop.jsonl is deliberately absent. Those 137 rows are the score,
+  # named by evaluation.arena_file below, and a held-out set the student trained
+  # on measures nothing.
+  domains:
+    - name: curriculum-sft
+      data_files: sft-1to3hop.jsonl
+      quota: 937
+      pool: 1000
+    - name: curriculum-rl
+      data_files: rl-1to2hop.jsonl
+      quota: 143
+      pool: 180
+    # Fifteen distinct persona exchanges, 1.4% of the mix - almost certainly too
+    # thin to survive two epochs against a thousand physics questions. There is
+    # no way to weight them up from here: kd.data dedupes on the prompt, so
+    # repeating a row changes nothing. The fix is more of them in the export.
+    - name: identity
+      data_files: identity.jsonl
+      quota: 15
+      pool: 20
+
+lora:
+  r: 32
+  alpha: 64
+  # Qwen3 is a standard dense transformer - no hybrid attention, no vision
+  # tower, no MTP head - so the plain Llama-style list reaches every layer.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+training:
+  # 1047 training rows at an effective batch of 8 is ~131 steps per epoch, so
+  # this is roughly 2.3 passes. More than that on a corpus this size starts
+  # memorising explanations rather than learning to produce them.
+  max_steps: 300
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-4
+  warmup: 0.05
+  save_steps: 50
+  save_total_limit: 2
+  benchmark_every: 50
+
+gkd:
+  # OFF-POLICY, and this is the setting to understand before changing anything
+  # else here.
+  #
+  # lmbda is the fraction of batches for which the student generates its own
+  # completion before the teacher scores it. Qwen3's chat template renders the
+  # prompt ending at `<|im_start|>assistant\n` but renders a complete exchange
+  # with `<think>\n\n</think>\n\n` in front of the answer. On-policy, the student
+  # therefore generates from a position where Qwen3 opens a real reasoning
+  # chain, gets cut off at max_new_tokens mid-thought, and the teacher scores a
+  # fragment. 0.0 sidesteps that entirely and is several times faster besides.
+  #
+  # It gives up the on-policy correction that makes GKD better than plain KD,
+  # which is worth revisiting once this has produced a student worth correcting.
+  lmbda: 0.0
+  beta: 0.5
+  temperature: 0.7
+  # Unused while lmbda is 0.0. A ceiling, not a length.
+  max_new_tokens: 8192
+  seq_kd: false
+
+evaluation:
+  samples: 48
+  report_format: html
+
+  # The 137 held-out rows, scored by the `arena` stage right after training -
+  # on the pod, where the teacher is already resident and already paid for.
+  # Doing it later elsewhere means downloading the teacher again.
+  #
+  # Expect a lower number than the training distribution would give: these
+  # questions run to 5 hops where training stops at 3, so 54 of them ask for a
+  # chain a step longer than the student has ever been shown.
+  arena_file: ./data/enlibra-curriculum/eval-1to5hop.jsonl
+  arena_limit: null
+  arena_max_new_tokens: 8192
+  arena_elo_rounds: 25
+
+# Sample generations during training, every benchmark_every steps. The most
+# informative thing in the log: the student should go from noise to the
+# <Explanation>/<Answer> shape within the first hundred steps or so.
+benchmark_prompts:
+  - Who are you?
+  - Explain in two sentences what a star is formed from.
+
+limits:
+  # Covers the whole run, not just training: the teacher download, the
+  # teacher-check load, the smoke steps and the arena afterwards are all elapsed
+  # time counted against this.
+  max_runtime_minutes: 240
+  max_cost_usd: 6.00
+  confirm_above_usd: 2.00
+
+s3:
+  # Required, not optional: models.teacher is an s3:// URI and preflight refuses
+  # to fetch it while this is false.
+  enabled: true
+  bucket: enlibra
+  # Bundles land beside the teacher they were distilled from, in that run's own
+  # outputs/ tree. kd.remote.s3.run_prefix appends `runs/<run-id>`, so a full
+  # bundle URI is
+  #   s3://enlibra/dss/dev/runs/9eb5db9e-.../outputs/gkd/runs/<run-id>/
+  # and each run keeps its own folder rather than overwriting the last.
+  prefix: dss/dev/runs/9eb5db9e-efe4-4c8d-9f6d-3adf665a44b9/outputs/gkd
+  # Credentials come from the environment, never from this file. The identity
+  # needs s3:ListBucket on the bucket plus s3:GetObject on the teacher prefix to
+  # READ, and s3:PutObject on the prefix above to WRITE - three grants, and the
+  # last one is the one people forget until a pod is already terminated.
+  upload: [adapter, logs, report, metrics]
+
+runpod:
+  # Only read by `kd runpod launch`. The by-hand path - ./run.sh on a pod you
+  # started yourself - ignores this block and takes its cost ceiling from
+  # KD_PRICE_PER_HOUR instead.
+  enabled: true
+  # A 4B teacher plus a 1.7B student is ~11 GB of bfloat16 weights, so a 24 GB
+  # card is enough and this run is far cheaper than the 8B profile's, which
+  # needs 48 GB. Confirm against the `weights` line preflight prints before
+  # committing: if the teacher is larger than reported, move up a size.
+  gpu_type: RTX A5000
+  max_price_per_hour: 0.60
+  spot: true
+  volume_gb: 80
+  container_disk_gb: 30
