@@ -192,7 +192,13 @@ done < <(block dependencies | grep -Ev "$SKIP")
 for extra in $EXTRAS; do
   found=0
   while IFS= read -r req; do
-    [ -n "$req" ] && REQS+=("$req") && found=1
+    # SKIP applies here too. Filtering only [project.dependencies] removed
+    # gradio, which lives there, and left runpod - which lives in the `remote`
+    # extra - to go on failing the install for exactly the reason it was added
+    # to SKIP for.
+    [ -n "$req" ] || continue
+    found=1
+    printf '%s' "$req" | grep -Eq "$SKIP" || REQS+=("$req")
   done < <(block "$extra")
   [ "$found" = "1" ] \
     || die "no optional-dependencies group called '$extra' in pyproject.toml"
@@ -200,14 +206,30 @@ done
 
 # Skip the install when it is already satisfied. Reconnecting to a pod, or a
 # second run in the same shell, should not repeat ninety seconds of pip.
+# boto3 stands in for the whole `remote` extra, because runpod is in SKIP:
+# checking for a package this script deliberately does not install would fail
+# forever and reinstall everything on every invocation.
 if "$PY" -c 'import transformers, trl, peft, accelerate, datasets, yaml' 2>/dev/null \
-   && { [ -z "$EXTRAS" ] || "$PY" -c 'import boto3, runpod' 2>/dev/null; }; then
+   && { [ -z "$EXTRAS" ] || "$PY" -c 'import boto3' 2>/dev/null; }; then
   log "Dependencies already present - skipping install"
 else
-  log "Installing dependencies (torch excluded - the template's build is kept)"
+  log "Installing dependencies (the template's torch build is kept)"
   printf '      %s\n' "${REQS[@]}"
-  "$PY" -m pip install --quiet --no-cache-dir --disable-pip-version-check \
-    "${REQS[@]}" || die "pip install failed"
+  if ! "$PY" -m pip install --quiet --no-cache-dir --disable-pip-version-check \
+       "${REQS[@]}"; then
+    # Second attempt, ignoring what is already there.
+    #
+    # A base image installs some Python packages through apt, and those carry no
+    # RECORD file - so pip cannot uninstall one to put a newer version in its
+    # place, stops with "uninstall-no-record-file", and installs nothing at all.
+    # --ignore-installed puts the new version alongside instead of over, which on
+    # a machine that exists to run one job and then be destroyed is the right
+    # trade.
+    warn "pip refused to replace a package the base image owns; retrying with"
+    warn "  --ignore-installed, which installs alongside rather than over it"
+    "$PY" -m pip install --quiet --no-cache-dir --disable-pip-version-check \
+      --ignore-installed "${REQS[@]}" || die "pip install failed"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
