@@ -89,6 +89,17 @@ jobs:
         # import boto3 at module level.
         run: uv run python tests/test_s3.py
 
+      - name: The arena reads the letter a model settled on
+        # The one place every player can lose a question at once. No models are
+        # loaded; these are strings through the answer patterns.
+        run: uv run python tests/test_arena_parser.py
+
+      - name: The arena cannot lose what it measured
+        run: uv run python tests/test_arena_output.py
+
+      - name: Reports render from whatever was measured
+        run: uv run python tests/test_report.py
+
       - name: The remote extra resolves and its client constructs
         run: |
           uv sync --extra remote

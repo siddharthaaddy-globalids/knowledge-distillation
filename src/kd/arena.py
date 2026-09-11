@@ -74,16 +74,35 @@ ANSWER_PATTERNS = [
     # Tried first, so a tagged answer always beats whatever the explanation
     # above it happened to mention.
     ("tagged", re.compile(rf"<Answer>\s*:?\s*\n?\s*([{OPTIONS}])\b", re.I)),
-    # "the answer is C", "Answer: D", "answer is **B**"
+    # "the answer is C", "Answer: D", "answer is **B**", and - the shape that
+    # cost a run all three columns on a question - "The correct answer is:\n\nD."
+    # The optional colon after "is" and the \s* that spans the blank line are
+    # both load-bearing.
     ("labelled", re.compile(
-        rf"\banswers?\s*(?:is|:|=)\s*\**\(?([{OPTIONS}])\)?\b", re.I)),
-    # "option C", "choice B"
-    ("named", re.compile(
-        rf"\b(?:option|choice)\s+\**\(?([{OPTIONS}])\)?\b", re.I)),
+        rf"\banswers?\s*(?:is\s*:?|:|=)\s*\**\(?([{OPTIONS}])\)?\b", re.I)),
     # A line that is nothing but the letter: "C", "**C**", "(C)", "D."
     # Anchored to the whole line, so "A star forms..." cannot match.
     ("bare", re.compile(
         rf"(?:^|\n)[ \t]*\**\(?([{OPTIONS}])\)?\**[ \t]*[.):]?[ \t]*$", re.M)),
+    # The chosen option restated on its own line straight after a colon:
+    #
+    #     ...the most accurate description is:
+    #
+    #     **C. Beams of highly relativistic charged baryons...**
+    #
+    # The colon is what separates a conclusion from a list. A model working
+    # through the options writes "A. ...", "B. ..." too, but as a list rather
+    # than as the one line following "is:" - and when it does introduce that
+    # list with a colon, the conclusion that follows it is the LAST match, which
+    # is the one that wins.
+    ("restated", re.compile(
+        rf":[ \t]*\n\s*\**\(?([{OPTIONS}])\)?[.:)](?=\s)", re.I)),
+    # "option C", "choice B". Last, because it is the weakest: a model that
+    # gives its answer and then reviews the ones it rejected - "Option A talks
+    # about..." - names a rejected letter LAST, and this pattern would pick it.
+    # Every shape above catches the actual answer before it gets the chance.
+    ("named", re.compile(
+        rf"\b(?:option|choice)\s+\**\(?([{OPTIONS}])\)?\b", re.I)),
 ]
 
 # How many unanswered completions to keep per player, and how much of each.
