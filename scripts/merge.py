@@ -252,7 +252,14 @@ def load_merged(path, device="auto", dtype="auto"):
 # Talking to it
 # --------------------------------------------------------------------------- #
 def generate(model, tokenizer, prompt, device, max_new_tokens=512,
-             temperature=0.0, system=None):
+             temperature=0.0, system=None, stream=False):
+    """Answer `prompt`. With stream=True the answer is printed as it is decoded.
+
+    A silent model.generate() is indistinguishable from a hung one - on CPU a
+    512-token answer is minutes of nothing. Streaming makes the wait legible,
+    and the token count printed first says how much of the prompt actually
+    arrived, which is the number you want when a paste looks truncated.
+    """
     import torch
 
     from kd.teacher import render_prompt
@@ -269,6 +276,15 @@ def generate(model, tokenizer, prompt, device, max_new_tokens=512,
 
     inputs = tokenizer(text, return_tensors="pt").to(device)
     greedy = temperature <= 0
+
+    streamer = None
+    if stream:
+        from transformers import TextStreamer
+        log(f"[{inputs.input_ids.shape[1]} prompt tokens in, generating up to "
+            f"{max_new_tokens} - Ctrl-C to cut it short]")
+        streamer = TextStreamer(tokenizer, skip_prompt=True,
+                                skip_special_tokens=True)
+
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -277,6 +293,7 @@ def generate(model, tokenizer, prompt, device, max_new_tokens=512,
             temperature=None if greedy else temperature,
             top_p=None if greedy else 0.9,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            streamer=streamer,
         )
     completion = outputs[0][inputs.input_ids.shape[1]:]
     return tokenizer.decode(completion, skip_special_tokens=True).strip()
@@ -301,6 +318,10 @@ def read_question(first="\n> ", rest="  "):
             line = input(first if not lines else rest)
         except (EOFError, KeyboardInterrupt):
             return None
+        # A terminal in bracketed-paste mode wraps a paste in these; a readline
+        # that does not consume them leaves them in the text, where they become
+        # part of the question and the rest of the first line goes missing.
+        line = line.replace("\x1b[200~", "").replace("\x1b[201~", "")
         if not lines and line.strip().lower() in ("quit", "exit"):
             return None
         if not line.strip():
@@ -326,9 +347,13 @@ def chat(model, tokenizer, device, max_new_tokens, temperature, system):
         if question is None:
             log("\nbye")
             return
-        print(generate(model, tokenizer, question, device,
-                       max_new_tokens=max_new_tokens,
-                       temperature=temperature, system=system))
+        log(f"[{len(question.splitlines())} lines, {len(question)} chars received]")
+        try:
+            generate(model, tokenizer, question, device,
+                     max_new_tokens=max_new_tokens,
+                     temperature=temperature, system=system, stream=True)
+        except KeyboardInterrupt:
+            log("\n[stopped]")
 
 
 def main(argv=None):
