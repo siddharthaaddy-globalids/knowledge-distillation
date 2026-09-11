@@ -27,10 +27,14 @@
 #
 #      --out DIR            write the merged model (otherwise merge in memory)
 #      --ask "..."          ask one question and exit
+#      --ask -              read the question from stdin, so a long one can
+#                           come from a file: ./infer.sh --ask - < question.txt
+#      --max-new-tokens N   answer length ceiling (default 512)
 #      --chat               interactive prompt loop
 #      --merged DIR         skip merging; load a model already merged
 #      --base ID            override the base the adapter names
 #      --system "..."       system turn, if training used one
+#      --think              show the reasoning trace (Qwen3-style models)
 #      --temperature 0.7    sample instead of greedy
 #      --device cuda|mps|cpu
 #      ./infer.sh --help    all of them

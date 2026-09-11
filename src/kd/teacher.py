@@ -179,7 +179,7 @@ def significant_missing(loading_info):
     return [key for key in missing if not key.endswith(IGNORABLE_MISSING)]
 
 
-def render_prompt(tokenizer, prompt):
+def render_prompt(tokenizer, prompt, system=None, enable_thinking=False):
     """The prompt, positioned so the next token is an ANSWER rather than a preamble.
 
     Qwen3 and its relatives render `...assistant\\n` and then open a reasoning
@@ -196,12 +196,21 @@ def render_prompt(tokenizer, prompt):
     prompt, so generation starts at the answer. Templates that do not know the
     argument ignore it - verified against SmolLM2, whose output is byte-identical
     either way - so this is safe to pass unconditionally.
+
+    `enable_thinking=True` is the opposite request: leave the reasoning block
+    open so the trace is generated and can be read. Training and evaluation
+    never want that; scripts/merge.py offers it as --think for looking at what
+    a model deliberates before it answers. `system` prepends a system turn;
+    every caller here renders the same way whether or not one is given, so a
+    system turn cannot silently flip thinking back on.
     """
     messages = [{"role": "user", "content": prompt}]
+    if system:
+        messages.insert(0, {"role": "system", "content": system})
     try:
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=False)
+            enable_thinking=enable_thinking)
     except TypeError:
         # A template implementation that rejects unknown kwargs outright.
         return tokenizer.apply_chat_template(

@@ -252,8 +252,14 @@ def load_merged(path, device="auto", dtype="auto"):
 # Talking to it
 # --------------------------------------------------------------------------- #
 def generate(model, tokenizer, prompt, device, max_new_tokens=512,
-             temperature=0.0, system=None, stream=False):
+             temperature=0.0, system=None, stream=False, think=False):
     """Answer `prompt`. With stream=True the answer is printed as it is decoded.
+
+    think=True leaves the model's reasoning block open, so on a Qwen3-style
+    model the deliberation is generated and shown ahead of the answer, tags
+    included. Off by default: that trace can eat the whole token budget before
+    an answer appears, and every other reader of this model - training, the
+    confidence probe, the arena - runs with it closed.
 
     A silent model.generate() is indistinguishable from a hung one - on CPU a
     512-token answer is minutes of nothing. Streaming makes the wait legible,
@@ -264,15 +270,9 @@ def generate(model, tokenizer, prompt, device, max_new_tokens=512,
 
     from kd.teacher import render_prompt
 
-    if system:
-        messages = [{"role": "system", "content": system},
-                    {"role": "user", "content": prompt}]
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
-    else:
-        # The same rendering training used, which for a model that opens with a
-        # reasoning block positions the prompt past it.
-        text = render_prompt(tokenizer, prompt)
+    # The same rendering training used, which for a model that opens with a
+    # reasoning block positions the prompt past it - unless asked not to.
+    text = render_prompt(tokenizer, prompt, system=system, enable_thinking=think)
 
     inputs = tokenizer(text, return_tensors="pt").to(device)
     greedy = temperature <= 0
@@ -282,6 +282,8 @@ def generate(model, tokenizer, prompt, device, max_new_tokens=512,
         from transformers import TextStreamer
         log(f"[{inputs.input_ids.shape[1]} prompt tokens in, generating up to "
             f"{max_new_tokens} - Ctrl-C to cut it short]")
+        # <think>/</think> are ordinary tokens on Qwen3, so they survive this
+        # and a --think trace arrives with its boundaries intact.
         streamer = TextStreamer(tokenizer, skip_prompt=True,
                                 skip_special_tokens=True)
 
@@ -331,7 +333,8 @@ def read_question(first="\n> ", rest="  "):
         lines.append(line)
 
 
-def chat(model, tokenizer, device, max_new_tokens, temperature, system):
+def chat(model, tokenizer, device, max_new_tokens, temperature, system,
+         think=False):
     """A plain read-generate loop. Each turn stands alone - no history is kept.
 
     Deliberately stateless: this exists to check what the model does with a
@@ -351,7 +354,8 @@ def chat(model, tokenizer, device, max_new_tokens, temperature, system):
         try:
             generate(model, tokenizer, question, device,
                      max_new_tokens=max_new_tokens,
-                     temperature=temperature, system=system, stream=True)
+                     temperature=temperature, system=system, stream=True,
+                     think=think)
         except KeyboardInterrupt:
             log("\n[stopped]")
 
@@ -386,6 +390,10 @@ def main(argv=None):
                         help="System turn to prepend. Use the same one training "
                              "used, or none.")
 
+    parser.add_argument("--think", action="store_true",
+                        help="Show the reasoning trace on models that have one "
+                             "(Qwen3 and relatives). Off by default, and a no-op "
+                             "on models without a thinking mode.")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="0 is greedy and reproducible (default)")
@@ -429,10 +437,11 @@ def main(argv=None):
         question = sys.stdin.read() if args.ask == "-" else args.ask
         print(generate(model, tokenizer, question, device,
                        max_new_tokens=args.max_new_tokens,
-                       temperature=args.temperature, system=args.system))
+                       temperature=args.temperature, system=args.system,
+                       think=args.think))
     if args.chat:
         chat(model, tokenizer, device, args.max_new_tokens, args.temperature,
-             args.system)
+             args.system, think=args.think)
     return 0
 
 
