@@ -282,6 +282,34 @@ def generate(model, tokenizer, prompt, device, max_new_tokens=512,
     return tokenizer.decode(completion, skip_special_tokens=True).strip()
 
 
+def read_question(first="\n> ", rest="  "):
+    """One question, which may run to several lines. None means stop.
+
+    input() hands back a single line, so a pasted block used to arrive as its
+    first line plus a queue of leftovers asked as further questions - and the
+    first empty line inside the paste ended the session outright. Here an empty
+    line ENDS THE QUESTION and leaving is explicit instead. That costs a second
+    Enter on a one-line question, and makes pasting a question work at all.
+
+    A block with a blank line INSIDE it still splits there; nothing in-band can
+    tell that apart from the end of a question. Send those with --ask and a
+    quoted heredoc, which has no terminator to collide with.
+    """
+    lines = []
+    while True:
+        try:
+            line = input(first if not lines else rest)
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not lines and line.strip().lower() in ("quit", "exit"):
+            return None
+        if not line.strip():
+            if not lines:
+                continue            # a stray Enter at an empty prompt
+            return "\n".join(lines).strip()
+        lines.append(line)
+
+
 def chat(model, tokenizer, device, max_new_tokens, temperature, system):
     """A plain read-generate loop. Each turn stands alone - no history is kept.
 
@@ -290,16 +318,13 @@ def chat(model, tokenizer, device, max_new_tokens, temperature, system):
     identical questions.
     """
     log("")
-    log("Type a question. Ctrl-C or an empty line to stop.")
+    log("Type or paste a question. An empty line sends it.")
+    log("`quit`, Ctrl-D or Ctrl-C to stop.")
     log("-" * 70)
     while True:
-        try:
-            question = input("\n> ").strip()
-        except (EOFError, KeyboardInterrupt):
+        question = read_question()
+        if question is None:
             log("\nbye")
-            return
-        if not question:
-            log("bye")
             return
         print(generate(model, tokenizer, question, device,
                        max_new_tokens=max_new_tokens,
