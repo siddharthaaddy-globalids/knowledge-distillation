@@ -445,11 +445,10 @@ S3 copy, and these two commands with the paths filled in.
 | `PutObject ... is not authorized` at the `upload` stage | A **different** permission from reading the teacher: the run needs `s3:PutObject` on `dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/gkd/*`. Nothing is lost — the bundle is still on disk. |
 | The run swaps / a step takes minutes on a Mac | The models do not fit. See [the memory table](#can-i-force-the-real-8b-teacher-on-the-mac). |
 | `No AWS credentials in this shell` | Run the three `export` lines above, then run the script again. |
-| `You are not inside tmux` | Run `tmux new -s kd`, then the script again. |
+| `You are not inside tmux` | A warning, not a stop: the run continues. Run `tmux new -s kd` first if the connection might drop. |
 | `REFUSED at smoke` | Working as designed: the run cannot finish inside its limits. The message says which number to change. **Nothing was spent.** |
 | `torch cannot see the GPU` | Wrong pod template. Use a **PyTorch** template. |
-| `This looks like a rented machine, but no GPU is visible` | Exactly what it says — you are paying for a machine whose GPU is not there. Check `nvidia-smi`, and redeploy on a **PyTorch** template. |
-| `Nothing is attached to answer this question` | You piped input, or ran it from a script. Set `KD_YES=1` to accept the confirmations in advance. |
+| `This looks like a rented machine, but no GPU is visible` | On a pod: you are paying for a machine whose GPU is not there — check `nvidia-smi`, and redeploy on a **PyTorch** template. On your own machine it only means `KD_PRICE_PER_HOUR` is exported; the run continues on CPU either way. |
 | `uv installed but is not on PATH` | Open a new terminal and run the script again. |
 | `No such config: ...` | The path after `--config` is wrong. The message lists the ones that exist. |
 | Run died when SSH dropped | Use `tmux`. |

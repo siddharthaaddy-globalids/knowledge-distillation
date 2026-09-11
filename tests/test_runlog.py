@@ -69,11 +69,21 @@ def test_creates_the_bundle(workspace):
 
 
 def test_run_id_shape(workspace):
+    """<profile>-<YYYY-MM-DD>-<HHMM>: readable, sortable within a profile, no hash."""
+    import re
+
     with runlog.Run(make_config(workspace)) as run:
-        parts = run.run_id.split("-")
-        assert len(parts) == 3, f"expected <stamp>-<profile>-<sha>, got {run.run_id}"
-        assert parts[0].endswith("Z") and len(parts[0]) == 16, parts[0]
-        assert parts[1] == "smoke", parts[1]
+        assert re.fullmatch(r"smoke-\d{4}-\d{2}-\d{2}-\d{4}", run.run_id), run.run_id
+
+
+def test_two_runs_in_one_minute_do_not_share_a_directory(workspace):
+    config = make_config(workspace)
+    with runlog.Run(config, quiet=True) as first:
+        with runlog.Run(config, quiet=True) as second:
+            assert second.run_id == first.run_id + "-2", (first.run_id, second.run_id)
+            assert second.dir != first.dir
+            with runlog.Run(config, quiet=True) as third:
+                assert third.run_id == first.run_id + "-3", third.run_id
 
 
 def test_output_dir_pins_the_directory(workspace):

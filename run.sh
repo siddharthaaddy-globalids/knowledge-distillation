@@ -73,25 +73,11 @@ profiles() {
   done
 }
 
-# Ask a yes/no question, and default to NO on every path that is not an explicit
-# yes. Every use of this guards something that costs money, so silence, a closed
-# pipe and a stray newline all have to mean "stop".
-#
-# KD_YES=1 answers everything in advance, for anyone driving this from a script.
-confirm() {
-  if [ -n "${KD_YES:-}" ]; then
-    warn "KD_YES is set - continuing without asking."
-    return 0
-  fi
-  if [ ! -t 0 ]; then
-    warn "Nothing is attached to answer this question."
-    warn "  Run it in a terminal, or set KD_YES=1 to accept in advance."
-    return 1
-  fi
-  printf '\n   %s [y/N] ' "$*"
-  read -r reply || reply=""
-  case "$reply" in [yY]*) return 0 ;; *) return 1 ;; esac
-}
+# This script never stops to ask a question. The checks below used to end in a
+# [y/N] prompt; they now say what they saw and carry on, because the person who
+# typed the command has already decided to run it, and a prompt they have to
+# answer every time is a prompt they stop reading. What the check found is
+# still printed, loudly, so it is in the terminal and in the log.
 
 
 # ---------------------------------------------------------------------------
@@ -143,11 +129,11 @@ if [ "$MODE" = "local" ] && rented_looking; then
   [ -n "${KD_PRICE_PER_HOUR:-}" ] && \
     warn "  KD_PRICE_PER_HOUR is set: ${KD_PRICE_PER_HOUR}/hour"
   warn ""
-  warn "  Whatever you run next will fall back to CPU on a machine that is"
-  warn "  billing you for a GPU. Almost always the pod template - use a"
-  warn "  PyTorch template, and check:   nvidia-smi"
-  confirm "Continue on CPU anyway?" \
-    || die "Stopped. Fix the GPU, or terminate this pod before it bills further."
+  warn "  If this IS a pod, whatever runs next falls back to CPU on a machine"
+  warn "  that is billing you for a GPU - almost always the pod template. Use"
+  warn "  a PyTorch template, and check:   nvidia-smi"
+  warn "  If it is your own machine with KD_PRICE_PER_HOUR exported, ignore this."
+  warn "  Continuing on CPU."
 fi
 
 
@@ -227,8 +213,7 @@ pod_guards() {
     warn "You are not inside tmux."
     warn "  If your connection drops, this run dies and the pod keeps billing."
     warn "  Strongly recommended:   tmux new -s kd    then run this again."
-    confirm "Continue anyway?" \
-      || die "Stopped. Run 'tmux new -s kd' and try again."
+    warn "  Continuing without it."
   fi
   if [ -z "${KD_PRICE_PER_HOUR:-}" ]; then
     warn "KD_PRICE_PER_HOUR is not set, so the spending cap cannot work."

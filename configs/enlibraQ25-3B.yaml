@@ -222,6 +222,9 @@ s3:
   # outputs/ tree. kd.remote.s3.run_prefix appends `runs/<run-id>`, so a full
   # bundle URI is
   #   s3://enlibra/dss/dev/runs/9eb5db9e-.../outputs/gkd/runs/<run-id>/
+  #
+  # where <run-id> is <profile>-<YYYY-MM-DD>-<HHMM> in UTC, the same name as
+  # the directory under runs/ - e.g. enlibraQ25-3B-2026-09-10-1416.
   # and each run keeps its own folder rather than overwriting the last.
   prefix: dss/dev/runs/9eb5db9e-efe4-4c8d-9f6d-3adf665a44b9/outputs/gkd
   # Credentials come from the environment, never from this file. The identity

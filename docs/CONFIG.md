@@ -292,7 +292,7 @@ Optional. See [RUNPOD.md](RUNPOD.md) for how it fits with a rented GPU.
 |---|---|---|
 | `enabled` | `false` | |
 | `bucket` | `null` | |
-| `prefix` | `kd` | Bundles land at `<prefix>/runs/<run-id>/`. |
+| `prefix` | `kd` | Bundles land at `<prefix>/runs/<run-id>/`, where the run id is `<profile>-<YYYY-MM-DD>-<HHMM>` in UTC, e.g. `enlibraQ25-3B-2026-09-10-1416` — the same name as the directory under `runs/`. |
 | `endpoint_url` | `null` | Set for MinIO, R2, or RunPod volumes. |
 | `region` | `null` | |
 | `cache_dir` | `~/.cache/kd/s3` | Fetched inputs are cached here, so a second run costs a listing rather than gigabytes. |

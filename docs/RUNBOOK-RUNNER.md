@@ -70,9 +70,9 @@ A successful run looks like this:
 [7/8] publish              skipped - publish.enabled is false
 [8/8] upload               skipped - s3.enabled is false
 
-  run bundle : runs/20260908T152208Z-smoke-25561e8
-  adapter    : runs/20260908T152208Z-smoke-25561e8/final_adapter
-  report     : runs/20260908T152208Z-smoke-25561e8/report.html
+  run bundle : runs/smoke-2026-09-08-1522
+  adapter    : runs/smoke-2026-09-08-1522/final_adapter
+  report     : runs/smoke-2026-09-08-1522/report.html
 ```
 
 Open that `report.html` in a browser. It leads with one number — **how close

@@ -32,9 +32,9 @@ newest under `runs/`, and prints which:
 It always says what it resolved, so you never have to guess:
 
 ```
-   newest adapter: runs/20260910T091455Z-.../final_adapter
+   newest adapter: runs/enlibraQ25-3B-2026-09-10-0914/final_adapter
 ==> base    : Qwen/Qwen2.5-1.5B-Instruct
-==> adapter : runs/20260910T091455Z-.../final_adapter
+==> adapter : runs/enlibraQ25-3B-2026-09-10-0914/final_adapter
 ```
 
 ---

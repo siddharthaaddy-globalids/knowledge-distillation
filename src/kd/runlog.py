@@ -3,7 +3,7 @@ Run directories, logging and the run manifest.
 
 Every invocation creates one directory holding everything that run produced:
 
-    runs/20260908T1412Z-finance-bb0c874/
+    runs/finance-2026-09-08-1412/
         config.resolved.yaml   every value, after all overrides
         manifest.json          git sha, versions, timings, exit code
         run.log                full detail - everything the terminal showed
@@ -85,10 +85,19 @@ def package_versions():
 
 
 def make_run_id(profile, when=None):
-    """<utc-timestamp>-<profile>-<git-sha7>, sortable oldest to newest by name."""
+    """<profile>-<YYYY-MM-DD>-<HHMM>, in UTC: enlibraQ25-3B-2026-09-10-1416.
+
+    The profile leads, so a bucket listing groups a profile's runs together and
+    the date sorts them within it. Nothing else: the git sha that used to end
+    the name looked like noise to everyone who was not the person who ran it,
+    and it lives in manifest.json regardless. UTC because the same run is
+    named the same whether it was started from a laptop or a pod.
+
+    Two runs of one profile in one minute would collide; Run appends -2, -3
+    to the second and later ones rather than sharing a directory.
+    """
     when = when or datetime.now(timezone.utc)
-    stamp = when.strftime("%Y%m%dT%H%M%SZ")
-    return f"{stamp}-{profile}-{git_sha()}"
+    return f"{profile}-{when.strftime('%Y-%m-%d-%H%M')}"
 
 
 # --------------------------------------------------------------------------- #
@@ -239,6 +248,13 @@ class Run:
             self.dir = os.path.abspath(os.path.expanduser(pinned))
         else:
             runs_dir = os.path.expanduser(project.get("runs_dir") or "./runs")
+            if not run_id:
+                # A generated id is only as fine-grained as a minute, so the
+                # second run of a profile inside one gets a suffix rather than
+                # the first run's directory.
+                base, extra = self.run_id, 2
+                while os.path.exists(os.path.join(runs_dir, self.run_id)):
+                    self.run_id, extra = f"{base}-{extra}", extra + 1
             self.dir = os.path.abspath(os.path.join(runs_dir, self.run_id))
         os.makedirs(self.dir, exist_ok=True)
         os.makedirs(os.path.join(self.dir, CHECKPOINT_DIR), exist_ok=True)
