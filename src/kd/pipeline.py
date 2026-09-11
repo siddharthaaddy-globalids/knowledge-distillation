@@ -95,6 +95,11 @@ class Context:
             # adapter_dir_of first: a path copied out of a bucket listing names
             # adapter_config.json, and the directory is what loads.
             named = paths.adapter_dir_of(named)
+            # The URI as typed survives the rewrite below, because the report
+            # says where the adapter lives in the bucket and the local path
+            # alone cannot say that.
+            if paths.is_remote(named):
+                self.options.setdefault("adapter_source", named)
             # Written back so the next stage to ask sees a local path: localise
             # is a no-op on one, so evaluate and arena share the one download
             # without either needing to know the other ran.
@@ -460,6 +465,7 @@ def stage_arena(ctx):
         payload["similarity"] = None
         ctx.log.warning(f"      !! similarity skipped: {exc}")
     if payload.get("similarity"):
+        payload["closeness"] = arena.closeness(payload)   # now with explanations
         write_payload()
 
     ctx.log.info("")
@@ -468,7 +474,8 @@ def stage_arena(ctx):
     if payload.get("similarity"):
         for line in arena.render_similarity(payload["similarity"]).splitlines():
             ctx.log.info(line)
-    ctx.run.write_metrics({"arena": payload["players"]})
+    ctx.run.write_metrics({"arena": payload["players"],
+                           "closeness": payload.get("closeness")})
     ctx.run.event("arena", "ratings", **payload["players"])
     return {"arena": target, "arena_transcript": transcript}
 
@@ -508,6 +515,17 @@ def stage_report(ctx):
         raise StageFailed(
             "nothing to report on: no evaluation.json and no arena.json, in this "
             "run or any earlier one. Run the evaluate or arena stage first.")
+
+    # Where the adapter is - here, and in the bucket. Taken from the payloads
+    # rather than resolved again, because the adapter THEY name is the one the
+    # numbers are about, and resolving afresh could fetch something else.
+    from . import paths
+
+    adapter = payload.get("adapter") or (payload.get("arena") or {}).get("adapter")
+    payload["adapter_locations"] = paths.adapter_locations(
+        adapter, ctx.config, source=ctx.options.get("adapter_source"),
+        run_id=ctx.run.run_id, run_dir=ctx.run.dir) if adapter else None
+    payload["profile"] = ctx.config["_meta"].get("source")
 
     suffix = str((ctx.config.get("evaluation") or {}).get("report_format", "html"))
     written = write_report(payload, ctx.run.path(f"report.{suffix.lstrip('.')}"))

@@ -68,6 +68,11 @@ ARENA = {
 
 ARENA_ONLY = {"arena": ARENA, "student": "Qwen/Qwen2.5-1.5B-Instruct",
               "teacher": "s3://bucket/teacher/", "adapter": "/cache/final_adapter",
+              "adapter_locations": {
+                  "local": "/cache/final_adapter",
+                  "s3": "s3://bucket/kd/runs/run-1/final_adapter",
+                  "s3_status": "the copy it was fetched from", "note": None},
+              "profile": "configs/enlibraQ25-flow.yaml",
               "device": "mps", "dtype": "bfloat16"}
 
 FULL = dict(ARENA_ONLY, **{
@@ -150,19 +155,83 @@ def test_every_row_matches_its_headers():
                 assert len(row) == 4, f"{title}: {row}"
 
 
-def test_the_headline_falls_back_to_the_answer_key():
-    """gap_recovered_pct comes from kd.evaluate; the arena can say it too."""
+def test_the_headline_is_closeness_to_the_teacher():
+    """The main score: how often the distilled student gave the teacher's answer."""
+    for payload in (ARENA_ONLY, FULL):
+        html = render(payload, ".html", scratch())
+        assert ">71%<" in html, html[html.find('class="big"'):][:160]
+        assert "gives the teacher's answer" in html, "wrong caption"
+        assert "closed by training" not in html[html.find('class="big"'):][:200]
+
+
+def test_the_headline_falls_back_to_the_token_level_figure():
+    """No arena: kd.evaluate's next-token agreement is the same question."""
+    payload = {k: v for k, v in FULL.items() if k != "arena"}
+    html = render(payload, ".html", scratch())
+    assert ">69%<" in html, html[html.find('class="big"'):][:160]
+    assert "predicts the teacher's next token" in html
+
+
+def test_closeness_is_derived_when_the_arena_did_not_write_it():
+    """An arena.json from before the block existed gets the same headline."""
+    from kd.report import _closeness
+    close = _closeness(ARENA)
+    assert close["distilled"]["same_answer_pct"] == 0.71, close
+    assert abs(close["distilled"]["explanation_cosine"] - 0.85) < 1e-9, close
+    # ...and the arena's own block wins when it is there.
+    written = dict(ARENA, closeness={"reference": "teacher", "players": {
+        "distilled": {"same_answer": 1, "of": 2, "same_answer_pct": 0.5,
+                      "explanation_cosine": None}}})
+    assert _closeness(written)["distilled"]["same_answer_pct"] == 0.5
+
+
+def test_closeness_section_comes_first_and_the_agreement_row_moved_into_it():
+    sections = _sections(ARENA_ONLY)
+    assert sections[0][0].startswith("How close is it to the teacher?"), sections[0][0]
+    labels = [row[0] for row in sections[0][1]]
+    assert labels[0] == "Gave the teacher's answer", labels
+    assert any("cosine" in l for l in labels), labels
+    assert any("share of the teacher" in l for l in labels), labels
+    key = [s for s in sections if s[0].startswith("The answer key")][0]
+    assert not any("teacher's letter" in row[0] for row in key[1]), key[1]
+
+
+def test_summary_leads_with_closeness():
+    for payload in (ARENA_ONLY, FULL):
+        first = plain_summary(payload)[0]
+        assert "gave the teacher's answer 71.0%" in first, first
+        assert "up from 44.0%" in first, first
+
+
+def test_the_adapter_section_names_both_copies_and_the_eval_command():
     html = render(ARENA_ONLY, ".html", scratch())
-    assert "answer key, closed by training" in html, "no arena-derived headline"
-    # (0.60 - 0.40) / (0.70 - 0.40) = 66.7%
-    assert ">67%<" in html, html[html.find('class="big"'):][:120]
+    assert "The adapter" in html
+    assert "s3://bucket/kd/runs/run-1/final_adapter" in html
+    assert "/cache/final_adapter" in html
+    assert ("./run.sh --config configs/enlibraQ25-flow.yaml --from evaluate "
+            "--adapter s3://bucket/kd/runs/run-1/final_adapter") in html, "no re-run command"
+    assert "arena --adapter s3://bucket/kd/runs/run-1/final_adapter" in html
+    md = render(ARENA_ONLY, ".md", scratch())
+    assert "## The adapter" in md and "--from evaluate --adapter s3://" in md
 
 
-def test_the_headline_prefers_the_measured_one():
-    """With both available, the token-level figure is the truer answer."""
-    html = render(FULL, ".html", scratch())
-    assert ">62%<" in html, html[html.find('class="big"'):][:120]
-    assert "of the distance to the teacher, closed by training" in html
+def test_the_adapter_section_says_why_there_is_no_s3_copy():
+    payload = dict(ARENA_ONLY, adapter_locations={
+        "local": "runs/r1/final_adapter", "s3": None, "s3_status": None,
+        "note": "s3.enabled is false, so this run does not upload it"})
+    html = render(payload, ".html", scratch())
+    assert "not there - s3.enabled is false" in html, "the reason is missing"
+    # With no S3 copy, the re-run command names the local path.
+    assert "--from evaluate --adapter runs/r1/final_adapter" in html
+
+
+def test_the_adapter_section_survives_an_older_payload():
+    """Only `adapter`, no locations block: still a section, never a crash."""
+    payload = {k: v for k, v in ARENA_ONLY.items()
+               if k not in ("adapter_locations", "profile")}
+    html = render(payload, ".html", scratch())
+    assert "The adapter" in html and "/cache/final_adapter" in html
+    assert "--config &lt;profile&gt;.yaml" in html
 
 
 def test_summary_reads_differently_for_each_shape():

@@ -234,6 +234,21 @@ def test_a_failed_report_still_leaves_the_numbers_and_the_transcript():
     assert "arena-transcript.jsonl" in files(directory), files(directory)
 
 
+def test_the_payload_carries_closeness_to_the_teacher():
+    """The headline block, with the explanation column filled in after similarity."""
+    code, directory = run()
+    assert code == 0
+    close = load(directory)["closeness"]
+    assert close["reference"] == "teacher", close
+    assert sorted(close["players"]) == ["base", "distilled"], close
+    # distilled matched the teacher's letter on both questions; base on one.
+    assert close["players"]["distilled"]["same_answer"] == 2, close
+    assert close["players"]["base"]["same_answer"] == 1, close
+    assert close["players"]["distilled"]["explanation_cosine"] == 0.8, close
+    html = open(os.path.join(directory, "arena-report.html"), encoding="utf-8").read()
+    assert ">100%<" in html and "gives the teacher's answer" in html
+
+
 def test_the_payload_names_what_was_scored():
     _code, directory = run()
     payload = load(directory)

@@ -75,8 +75,12 @@ A successful run looks like this:
   report     : runs/20260908T152208Z-smoke-25561e8/report.html
 ```
 
-Open that `report.html` in a browser. It leads with a plain-English summary, so
-it is readable by someone who does not know what perplexity is.
+Open that `report.html` in a browser. It leads with one number — **how close
+the distilled student is to the teacher**: how often it gave the teacher's answer
+on the held-out set — and a plain-English summary, so it is readable by someone
+who does not know what perplexity is. Accuracy and Elo follow as context. Near
+the end, **The adapter** names where the adapter lives on this machine and on
+S3, and gives the one command that re-runs just the evaluation against it.
 
 ### How the runner reads your arguments
 

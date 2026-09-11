@@ -307,8 +307,8 @@ before the pod goes away:
 | | |
 |---|---|
 | `final_adapter/` | **the LoRA adapter** — what you trained, tens of MB |
-| `report.html` | the readable summary |
-| `metrics.json`, `evaluation.json`, `arena.json` | the numbers — accuracy, Elo and the head-to-head record |
+| `report.html` | the readable summary — leads with how close the distilled student is to the teacher, and says where the adapter is (here and on S3) |
+| `metrics.json`, `evaluation.json`, `arena.json` | the numbers — closeness to the teacher, accuracy, Elo and the head-to-head record |
 | `run.log`, `events.jsonl` | everything the terminal showed |
 | `config.resolved.yaml`, `manifest.json` | exactly what produced it |
 
@@ -413,7 +413,7 @@ It writes three files beside each other, whether or not you ask:
 
 | | |
 |---|---|
-| `arena.json` | the numbers — accuracy, Elo, agreement, hop-wise similarity |
+| `arena.json` | the numbers — closeness to the teacher, accuracy, Elo, agreement, hop-wise similarity |
 | `arena-transcript.jsonl` | **every question and every word each model said about it**, one line per question |
 | `arena-report.html` | the readable version of `arena.json` |
 
@@ -430,6 +430,10 @@ perplexity and tokens/sec, which need the `evaluate` stage:
 
 That runs **evaluate → arena → report** into a *new* run directory under `runs/`,
 printed at the end. Add `--skip upload` to keep it off S3.
+
+You do not have to assemble either command by hand: every `report.html` ends
+with a section called **The adapter** that names the adapter's local path, its
+S3 copy, and these two commands with the paths filled in.
 
 ---
 

@@ -81,6 +81,90 @@ def mark_complete(local, detail=""):
         handle.write(detail + "\n")
 
 
+def cached_source(local):
+    """The s3:// URI a cache directory was fetched from, or None.
+
+    `download` writes the URI as the first line of the completion marker, so a
+    local path that came out of the bucket can still say where. That is what
+    lets a report name the S3 copy of an adapter when all it was handed is the
+    directory the pipeline had already fetched.
+    """
+    marker = os.path.join(str(local or ""), COMPLETE_MARKER)
+    if not os.path.isfile(marker):
+        return None
+    try:
+        with open(marker, encoding="utf-8") as handle:
+            first = handle.readline().strip()
+    except OSError:
+        return None
+    return first if is_remote(first) else None
+
+
+def adapter_locations(adapter, config, source=None, run_id=None, run_dir=None):
+    """Where an adapter is: on this machine, and in the bucket.
+
+    Returns {"local", "s3", "s3_status", "note"}. `s3` is None when there is
+    no copy in object storage that anything can vouch for, and `note` then
+    says why - which is the difference between "not uploaded" and "uploaded,
+    and the report could not find the record".
+
+    Four ways an adapter can have an S3 address, checked in order of how sure
+    each one is:
+
+      fetched      `source` is the s3:// URI someone typed, or the cache
+                   marker says the directory was downloaded from one. The
+                   copy in the bucket is the original; the local one is a
+                   cache of it.
+      this run     the adapter is `run_dir`'s own and s3.enabled: the upload
+                   stage ships it to <prefix>/runs/<run_id>/final_adapter at
+                   the end of the run. The report is written BEFORE that
+                   stage, so this is a destination, and the status says so.
+      earlier run  the adapter sits in another run bundle whose events.jsonl
+                   records an upload. That record names the bundle; the
+                   adapter is the same relative path inside it.
+      none         s3 is off, or nothing recorded an upload.
+    """
+    from . import runlog
+
+    local = os.path.normpath(str(adapter)).replace("\\", "/") if adapter else None
+    settings = config.get("s3") or {}
+    out = {"local": local, "s3": None, "s3_status": None, "note": None}
+    if not adapter:
+        out["note"] = "no adapter was evaluated"
+        return out
+
+    origin = source if is_remote(source) else cached_source(adapter)
+    if origin:
+        out.update(s3=adapter_dir_of(origin).rstrip("/"),
+                   s3_status="the copy it was fetched from")
+        return out
+
+    parent = os.path.dirname(os.path.abspath(str(adapter)))
+    leaf = os.path.basename(os.path.normpath(str(adapter)))
+    if run_dir and os.path.abspath(str(run_dir)) == parent:
+        if settings.get("enabled") and settings.get("bucket") and run_id:
+            from .remote import s3
+
+            bundle = s3.uri_of(settings["bucket"], s3.run_prefix(config, run_id))
+            out.update(s3=f"{bundle}/{leaf}",
+                       s3_status="uploaded at the end of this run")
+        else:
+            out["note"] = ("s3.enabled is false, so this run does not upload "
+                           "it - the local copy is the only one")
+        return out
+
+    recorded = runlog.recorded_upload(parent)
+    if recorded:
+        out.update(s3=f"{recorded.rstrip('/')}/{leaf}",
+                   s3_status=f"uploaded by run {os.path.basename(parent)}")
+    elif os.path.isfile(os.path.join(parent, runlog.MANIFEST)):
+        out["note"] = (f"run {os.path.basename(parent)} produced it and "
+                       f"recorded no upload")
+    else:
+        out["note"] = "not from a run bundle, and no upload is recorded for it"
+    return out
+
+
 BYTES_PER_PARAM = {"float32": 4, "bfloat16": 2, "float16": 2}
 
 # Binary gigabytes, because that is what an operating system means by "16 GB" and

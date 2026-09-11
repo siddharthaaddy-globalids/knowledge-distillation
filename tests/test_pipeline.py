@@ -503,6 +503,145 @@ def test_no_previous_run_resolves_to_nothing(workspace):
         run.close()
 
 
+# --------------------------------------------------------------------------- #
+# Where the adapter is - on this machine and in the bucket
+#
+# The report names both, and the way it learns the S3 address differs by how the
+# adapter arrived: typed as s3://, fetched into the cache, trained by this run,
+# or trained by an earlier run that recorded its upload.
+# --------------------------------------------------------------------------- #
+def _adapter_at(where):
+    os.makedirs(where, exist_ok=True)
+    with open(os.path.join(where, "adapter_config.json"), "w") as fh:
+        fh.write("{}")
+    return where
+
+
+def test_a_typed_s3_adapter_is_remembered_by_its_uri(workspace):
+    """resolve_adapter rewrites --adapter to a local path; the URI must survive."""
+    from kd import paths
+
+    config = make_config(workspace)
+    local = _adapter_at(os.path.join(workspace, "cache", "bucket", "kd", "a"))
+    ctx, run = _fresh_context(workspace, config)
+    ctx.options["adapter"] = "s3://bucket/kd/a/adapter_config.json"
+    saved = paths.localise
+    paths.localise = lambda where, *a, **k: local if paths.is_remote(where) else where
+    try:
+        assert os.path.normpath(ctx.resolve_adapter()) == os.path.normpath(local)
+        assert ctx.options["adapter_source"] == "s3://bucket/kd/a"
+        where = paths.adapter_locations(local, config,
+                                        source=ctx.options["adapter_source"])
+        assert where["s3"] == "s3://bucket/kd/a", where
+        assert where["s3_status"] == "the copy it was fetched from", where
+    finally:
+        paths.localise = saved
+        run.close()
+
+
+def test_a_cached_adapter_knows_where_it_was_fetched_from(workspace):
+    """The cache marker's first line is the URI, so a bare local path still says."""
+    from kd import paths
+
+    config = make_config(workspace)
+    local = _adapter_at(os.path.join(workspace, "cache", "final_adapter"))
+    paths.mark_complete(local, "s3://bucket/kd/runs/r9/final_adapter\n3 objects")
+    where = paths.adapter_locations(local, config)
+    assert where["s3"] == "s3://bucket/kd/runs/r9/final_adapter", where
+    assert where["s3_status"] == "the copy it was fetched from", where
+
+
+def test_this_runs_adapter_names_its_upload_destination(workspace):
+    """The report is written before the upload stage, so this is a destination."""
+    from kd import paths
+
+    config = make_config(workspace, **{"s3.enabled": True, "s3.bucket": "b",
+                                       "s3.prefix": "kd"})
+    ctx, run = _fresh_context(workspace, config)
+    try:
+        local = _adapter_at(run.adapter_dir)
+        where = paths.adapter_locations(local, config, run_id=run.run_id,
+                                        run_dir=run.dir)
+        assert where["s3"] == f"s3://b/kd/runs/{run.run_id}/final_adapter", where
+        assert "end of this run" in where["s3_status"], where
+    finally:
+        run.close()
+
+
+def test_this_runs_adapter_with_s3_off_says_so(workspace):
+    from kd import paths
+
+    config = make_config(workspace, **{"s3.enabled": False})
+    ctx, run = _fresh_context(workspace, config)
+    try:
+        local = _adapter_at(run.adapter_dir)
+        where = paths.adapter_locations(local, config, run_id=run.run_id,
+                                        run_dir=run.dir)
+        assert where["s3"] is None and "s3.enabled is false" in where["note"], where
+    finally:
+        run.close()
+
+
+def test_an_earlier_runs_adapter_uses_its_recorded_upload(workspace):
+    """events.jsonl remembers where the bundle went; the adapter sits inside it."""
+    from kd import paths
+
+    config = make_config(workspace)
+    # Explicit ids: two runs opened in the same second would share a directory.
+    with runlog.Run(config, quiet=True, run_id="quiet") as never:
+        _adapter_at(never.adapter_dir)
+        seeded = never.dir
+    with runlog.Run(config, quiet=True, run_id="old") as earlier:
+        _adapter_at(earlier.adapter_dir)
+        earlier.event("upload", "bundle", uri="s3://b/kd/runs/old", files=3)
+        adapter, run_dir = earlier.adapter_dir, earlier.dir
+    assert runlog.recorded_upload(run_dir) == "s3://b/kd/runs/old"
+    assert runlog.recorded_upload(seeded) is None
+    ctx, run = _fresh_context(workspace, config)
+    try:
+        where = paths.adapter_locations(adapter, config, run_id=run.run_id,
+                                        run_dir=run.dir)
+        assert where["s3"] == "s3://b/kd/runs/old/final_adapter", where
+        assert where["s3_status"].startswith("uploaded by run "), where
+        # ...and one that never uploaded says that, rather than guessing.
+        where = paths.adapter_locations(os.path.join(seeded, "final_adapter"),
+                                        config, run_id=run.run_id, run_dir=run.dir)
+        assert where["s3"] is None and "recorded no upload" in where["note"], where
+    finally:
+        run.close()
+
+
+def test_the_report_stage_says_where_the_adapter_is(workspace):
+    """What the report is handed, end to end: locations and the profile."""
+    from kd import report as report_module
+
+    config = make_config(workspace, **{"s3.enabled": True, "s3.bucket": "b",
+                                       "s3.prefix": "kd"})
+    captured = {}
+
+    def fake_write_report(payload, path):
+        captured.update(payload)
+        with open(path, "w") as fh:
+            fh.write("<html></html>")
+        return path
+
+    saved = report_module.write_report
+    report_module.write_report = fake_write_report
+    ctx, run = _fresh_context(workspace, config)
+    try:
+        _adapter_at(run.adapter_dir)
+        with open(run.path("arena.json"), "w") as fh:
+            json.dump({"questions": 2, "players": {}, "adapter": run.adapter_dir}, fh)
+        pipeline.stage_report(ctx)
+        where = captured["adapter_locations"]
+        assert where["local"].endswith("final_adapter"), where
+        assert where["s3"] == f"s3://b/kd/runs/{run.run_id}/final_adapter", where
+        assert captured["profile"].endswith("smoke.yaml"), captured["profile"]
+    finally:
+        report_module.write_report = saved
+        run.close()
+
+
 for _name, _fn in sorted(list(globals().items())):
     if _name.startswith("test_") and callable(_fn):
         check(_name, _fn)

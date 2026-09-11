@@ -22,6 +22,14 @@ Reading the result:
   * distilled above teacher - possible on a narrow set, and worth distrusting
                               until it survives a second eval file.
 
+THE HEADLINE IS CLOSENESS TO THE TEACHER
+----------------------------------------
+Distillation buys a student that answers like its teacher. So the number the
+report leads with is not who beat the answer key - that is as much a fact about
+the teacher as about the training - but how close the distilled student got to
+the teacher: how often it gave the teacher's answer, and how alike its
+explanations are. See `closeness`. Accuracy and Elo follow, as context.
+
 WHY ELO AND NOT JUST ACCURACY
 -----------------------------
 Accuracy answers "how often is it right". Elo answers "how often is it right
@@ -271,6 +279,60 @@ def letter_agreement(predictions):
     return table
 
 
+# --------------------------------------------------------------------------- #
+# Closeness to the teacher
+# --------------------------------------------------------------------------- #
+# The player the others are measured against. A constant rather than a setting
+# because the arena has exactly one ceiling, and a report that let it move would
+# be comparing against something the reader has to go and look up.
+REFERENCE = "teacher"
+
+
+def closeness(payload, reference=REFERENCE):
+    """How close each student is to the teacher. The headline.
+
+    Two views of one question, both from what the arena already measured, so
+    nothing here costs a generation:
+
+      same_answer          how often the player chose the TEACHER's letter,
+                           right or wrong. From `agreement`, so it is counted
+                           over every question and an unanswered one never
+                           agrees.
+      explanation_cosine   mean cosine between the player's explanations and
+                           the teacher's. From `similarity`, so None when
+                           sentence-transformers was absent.
+
+    Returns {"reference": ..., "players": {name: {...}}} for every player that
+    is not the reference, or {} when the teacher did not play - there is
+    nothing to be close to.
+
+    Read `distilled` against `base`: the rise between them is what training
+    bought, and base is what the small model would have said anyway.
+    """
+    players = payload.get("players") or {}
+    if reference not in players:
+        return {}
+    agreement = payload.get("agreement") or {}
+    pairs = (payload.get("similarity") or {}).get("pairs") or {}
+
+    def pair(table, name):
+        return table.get(f"{name} vs {reference}") or table.get(f"{reference} vs {name}")
+
+    out = {}
+    for name in sorted(players):
+        if name == reference:
+            continue
+        same = pair(agreement, name) or {}
+        alike = pair(pairs, name) or {}
+        out[name] = {
+            "same_answer": same.get("same"),
+            "of": same.get("of"),
+            "same_answer_pct": same.get("pct"),
+            "explanation_cosine": alike.get("overall"),
+        }
+    return {"reference": reference, "players": out}
+
+
 def summarise(predictions, golds, formats=None, unanswered=None,
               rounds=25, seed=42):
     """The whole payload: what each player answered, how often it was right, Elo.
@@ -320,7 +382,7 @@ def summarise(predictions, golds, formats=None, unanswered=None,
             "elo": round(ratings[name]["rating"], 1),
             "elo_spread": round(ratings[name]["spread"], 1),
         }
-    return {
+    payload = {
         "questions": total,
         "random_baseline": 0.25,
         "elo_rounds": rounds,
@@ -330,6 +392,10 @@ def summarise(predictions, golds, formats=None, unanswered=None,
         "predictions": {name: list(picks) for name, picks in predictions.items()},
         "gold": list(golds),
     }
+    # The headline, from the agreement table. Recomputed by the caller once the
+    # similarity table exists, which adds the explanation column.
+    payload["closeness"] = closeness(payload)
+    return payload
 
 
 def render(payload):
@@ -349,6 +415,9 @@ def render(payload):
     lines = [
         f"  {total} held-out questions, random baseline "
         f"{payload['random_baseline'] * 100:.0f}%",
+    ]
+    lines += render_closeness(payload.get("closeness") or closeness(payload))
+    lines += [
         "",
         "  " + "measure".ljust(34) + "".join(n.rjust(width + 2) for n in order),
         "  " + "-" * 34 + "".join("-" * (width + 2) for _ in order),
@@ -392,6 +461,40 @@ def render(payload):
         "  A gap smaller than it is noise.",
     ]
     return "\n".join(lines)
+
+
+def render_closeness(close):
+    """The headline block: how close each student is to the teacher.
+
+    Separate from the table because it is the one thing to read first, and a
+    row lost among eight others is not read first.
+    """
+    players = (close or {}).get("players") or {}
+    if not players:
+        return []
+    names = sorted(players)
+
+    def same(entry):
+        pct = entry.get("same_answer_pct")
+        if entry.get("same_answer") is None:
+            return "-"
+        return (f"{entry['same_answer']}/{entry['of']}"
+                + (f" ({pct * 100:.1f}%)" if isinstance(pct, float) else ""))
+
+    def alike(entry):
+        value = entry.get("explanation_cosine")
+        return f"{value:.3f}" if isinstance(value, float) else "-"
+
+    lines = ["", f"  how close to the {close.get('reference', REFERENCE)} "
+                 f"- the headline",
+             "    " + "".ljust(32) + "".join(n.rjust(18) for n in names)]
+    for label, cell in (("gave the teacher's answer", same),
+                        ("explanations alike (cosine)", alike)):
+        lines.append("    " + label.ljust(32) + "".join(
+            cell(players[n]).rjust(18) for n in names))
+    lines.append("    read distilled against base: the rise is what training "
+                 "bought")
+    return lines
 
 
 def split_prompt(prompt):
@@ -981,8 +1084,10 @@ def main(args=None):
     except Exception as exc:  # noqa: BLE001 - a download, an encode, a disk
         payload["similarity"] = None
         log.warning(f"      !! similarity skipped: {exc}")
-    if saving and payload.get("similarity"):
-        write_payload()          # now with the table in it
+    if payload.get("similarity"):
+        payload["closeness"] = closeness(payload)   # now with explanations
+        if saving:
+            write_payload()          # now with the table in it
 
     log.info("")
     log.info(render(payload))
@@ -1010,6 +1115,9 @@ def main(args=None):
                 "teacher": config["models"].get("teacher"),
                 "teacher_adapter": config["models"].get("teacher_adapter"),
                 "adapter": str(adapter) if adapter else None,
+                "adapter_locations": paths.adapter_locations(
+                    adapter, config, source=args.adapter) if adapter else None,
+                "profile": config["_meta"].get("source"),
                 "device": hardware["device"],
                 "dtype": hardware.get("dtype_name"),
             }, report)

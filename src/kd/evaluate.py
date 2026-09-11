@@ -800,6 +800,12 @@ def main(args=None):
         "teacher_adapter": teacher_adapter,
         "student": student_id,
         "adapter": adapter_dir,
+        # Where that adapter lives, here and in the bucket, and the profile
+        # that scored it: what the report's "The adapter" section prints, so a
+        # `kd evaluate --report` page says it too. The pipeline's report stage
+        # recomputes both with what it additionally knows about the run.
+        "adapter_locations": paths.adapter_locations(adapter_dir, config),
+        "profile": config["_meta"].get("source"),
         "device": device,
         "dtype": dtype_name,
         "samples": len(samples) - skipped,

@@ -159,6 +159,12 @@ student (no adapter, the control), the **distilled** student, and the
 **teacher** (the ceiling). Distilled below base means training hurt; distilled
 level with base means the format transferred but the capability did not.
 
+The headline is **closeness to the teacher**, not accuracy: how often each
+student gave the teacher's answer, and (when `sentence-transformers` is
+installed) how alike its explanations are. It is written to `arena.json` under
+`closeness` and to `metrics.json`, and it is the number the report leads with.
+Accuracy and Elo are reported beneath it as context.
+
 Whichever way it runs — as a pipeline stage or as `kd arena` — it writes
 `arena.json` (the numbers, including the hop-wise cosine between the players'
 explanations), `arena-transcript.jsonl` (every question and every word each

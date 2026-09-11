@@ -137,6 +137,33 @@ def discover_adapters(runs_dir="./runs", extra=()):
     return unique
 
 
+def recorded_upload(run_dir):
+    """The s3:// URI a run bundle was uploaded to, or None.
+
+    Read from events.jsonl rather than the manifest, because the upload stage
+    is the last one and its result is recorded as an event - the manifest only
+    knows that the stage ran. The last upload wins: a rescue upload after a
+    hard stop lands in the same prefix, so there is only ever one answer.
+    """
+    path = os.path.join(str(run_dir or ""), EVENTS)
+    if not os.path.isfile(path):
+        return None
+    found = None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if (record.get("stage") == "upload"
+                        and record.get("event") == "bundle" and record.get("uri")):
+                    found = record["uri"]
+    except OSError:
+        return None
+    return found
+
+
 def is_latest_alias(path, runs_dir):
     """True when `path` sits under the `latest` pointer rather than a real run."""
     relative = os.path.relpath(path, runs_dir)

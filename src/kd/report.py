@@ -9,6 +9,19 @@ needs to know what perplexity is to learn whether the training worked.
 Every claim in the summary is derived from the measurements rather than asserted.
 The HTML is a single file with no external assets, so it can be opened offline or
 sent to someone as-is.
+
+THE MAIN SCORE IS CLOSENESS TO THE TEACHER
+------------------------------------------
+Distillation buys a student that answers like its teacher, so that is what the
+page leads with: how often the distilled student gave the teacher's answer on
+the held-out set, and how alike its explanations are. Who beat the answer key
+comes after, as context - it is as much a fact about the teacher as about the
+training. See `_headline` and `_closeness_rows`.
+
+The page also says where the adapter it scored lives - on this machine and in
+the bucket - and the one command that re-runs only the evaluation against it,
+so the numbers can be reproduced without training anything. See
+`_adapter_facts`.
 """
 
 import math
@@ -46,14 +59,34 @@ def _arena_summary(arena):
         return lines + ["Scored on a held-out answer key."]
 
     pct = lambda e: (e.get("accuracy") or 0) * 100
+
+    # Closeness first. It is the main score, and the sentence that carries it
+    # has to come before anything about the answer key.
+    close = _closeness(arena)
+    cb, cd = close.get("base") or {}, close.get("distilled") or {}
+    same_b, same_d = cb.get("same_answer_pct"), cd.get("same_answer_pct")
+    if isinstance(same_d, (int, float)):
+        before = (f", up from {same_b * 100:.1f}% before training"
+                  if isinstance(same_b, (int, float)) else "")
+        lines.append(
+            f"On {total} held-out questions the distilled student gave the "
+            f"teacher's answer {same_d * 100:.1f}% of the time{before}. That is "
+            f"how close it is to the teacher, and it is the number to quote.")
+    cos_b, cos_d = cb.get("explanation_cosine"), cd.get("explanation_cosine")
+    if isinstance(cos_d, (int, float)):
+        before = (f", from {cos_b:.2f}"
+                  if isinstance(cos_b, (int, float)) else "")
+        lines.append(
+            f"Its explanations read like the teacher's at {cos_d:.2f} cosine "
+            f"similarity{before} (1.00 would be word for word).")
+
     moved = pct(dist) - pct(base)
     verb = ("is ahead of" if moved > 0 else
             "is level with" if moved == 0 else "is behind")
     lines.append(
-        f"On {total} held-out questions the distilled student answered "
-        f"{pct(dist):.1f}% correctly, against {pct(base):.1f}% for the same model "
-        f"before training - it {verb} where it started, by "
-        f"{abs(moved):.1f} points.")
+        f"On the answer key itself it scores {pct(dist):.1f}%, against "
+        f"{pct(base):.1f}% for the same model before training - it {verb} where "
+        f"it started, by {abs(moved):.1f} points.")
 
     if teacher:
         gap = pct(teacher) - pct(base)
@@ -97,7 +130,9 @@ def plain_summary(payload):
     fid, cap = payload["fidelity"], payload["capability"]
     lift = fid["agreement_lift_pts"]
     recovered = cap.get("gap_recovered_pct")
-    lines = []
+    # The answer-level closeness leads even when the token-level numbers are
+    # here: it is measured on real questions, and it is the main score.
+    lines = _arena_summary(payload.get("arena") or {}) if payload.get("arena") else []
 
     if lift > 0 and cap["perplexity_distilled"] < cap["perplexity_base"]:
         lines.append(
@@ -147,10 +182,125 @@ def plain_summary(payload):
     return lines
 
 
+def _closeness(arena):
+    """{player: {same_answer, of, same_answer_pct, explanation_cosine}}.
+
+    From the arena's own `closeness` block when it wrote one, else derived here
+    from the agreement and similarity tables - so an arena.json written before
+    the block existed still gets the same headline.
+    """
+    block = (arena.get("closeness") or {}).get("players")
+    if block:
+        return block
+    players = arena.get("players") or {}
+    if "teacher" not in players:
+        return {}
+    agreement = arena.get("agreement") or {}
+    pairs = (arena.get("similarity") or {}).get("pairs") or {}
+    pair = lambda table, name: (table.get(f"{name} vs teacher")
+                                or table.get(f"teacher vs {name}") or {})
+    return {name: {"same_answer": pair(agreement, name).get("same"),
+                   "of": pair(agreement, name).get("of"),
+                   "same_answer_pct": pair(agreement, name).get("pct"),
+                   "explanation_cosine": pair(pairs, name).get("overall")}
+            for name in sorted(players) if name != "teacher"}
+
+
+def _headline(payload):
+    """(percentage, caption) for the big number, or (None, caption).
+
+    How close the distilled student is to the teacher. The answer-level figure
+    from the arena leads when there is one - it is measured on real questions
+    with a real ceiling. kd.evaluate's token-level agreement is the fallback,
+    which is the same question asked of the next token instead of the answer.
+    """
+    close = _closeness(payload.get("arena") or {})
+    same = (close.get("distilled") or {}).get("same_answer_pct")
+    if isinstance(same, (int, float)) and math.isfinite(same):
+        return same * 100, "of the time the distilled student gives the teacher's answer"
+    token = (payload.get("closeness_to_teacher") or {}).get(
+        "prediction_agreement_distilled_pct")
+    if isinstance(token, (int, float)) and math.isfinite(token):
+        return token, "of the time the distilled student predicts the teacher's next token"
+    return None, "how close the distilled student is to the teacher"
+
+
+def _adapter_facts(payload):
+    """(facts, commands) for the section that says where the adapter is.
+
+    `facts` are (label, value) pairs: the local path, the S3 copy or why there
+    is none. `commands` re-run ONLY the evaluation against that adapter - the
+    whole point of naming the S3 copy is that anyone with the bucket can
+    reproduce these numbers without training anything, and the command they
+    need should not have to be assembled from three documents.
+    """
+    where = payload.get("adapter_locations") or {}
+    local = where.get("local") or payload.get("adapter") \
+        or (payload.get("arena") or {}).get("adapter")
+    if not local and not where.get("s3"):
+        return [], []
+
+    facts = [("On this machine", local or "-")]
+    if where.get("s3"):
+        status = where.get("s3_status")
+        facts.append(("On S3", where["s3"] + (f"  — {status}" if status else "")))
+    else:
+        facts.append(("On S3", f"not there - {where.get('note')}"
+                      if where.get("note") else "not recorded"))
+
+    profile = payload.get("profile") or "<profile>.yaml"
+    # The S3 copy when there is one: it is the address that works from any
+    # machine, which the local path is not.
+    target = where.get("s3") or local
+    commands = [
+        ("everything this report can show (evaluate, arena, report)",
+         f"./run.sh --config {profile} --from evaluate --adapter {target}"),
+        ("the answer key and the similarity table alone (no teacher fidelity)",
+         f"./run.sh --config {profile} arena --adapter {target}"),
+    ]
+    return facts, commands
+
+
 # What the four columns mean unless a section says otherwise. Most sections
 # compare the three models; the similarity table compares three PAIRS of them,
 # and labelling its columns with model names would misdescribe every cell.
 DEFAULT_HEADERS = ("Metric", "Base student", "Distilled", "Teacher")
+
+
+def _closeness_rows(arena, total, pct):
+    """Rows for the closeness section, columns Base / Distilled / Teacher.
+
+    The teacher column is the ceiling by definition - it agrees with itself on
+    everything - and is printed rather than left blank so the table says what
+    100% means.
+    """
+    close = _closeness(arena)
+    if not close:
+        return []
+    players = arena.get("players") or {}
+    cb, cd = close.get("base") or {}, close.get("distilled") or {}
+
+    def same(entry):
+        if entry.get("same_answer") is None:
+            return "-"
+        return f"{entry['same_answer']} / {entry['of']}  ({pct(entry.get('same_answer_pct'))})"
+
+    rows = [("Gave the teacher's answer", same(cb), same(cd),
+             f"{total} / {total}  (100.0%)")]
+    cos = lambda e: (f"{e['explanation_cosine']:.3f}"
+                     if isinstance(e.get("explanation_cosine"), float) else "-")
+    if any(isinstance(e.get("explanation_cosine"), float) for e in (cb, cd)):
+        rows.append(("Explanations alike (cosine, 0-1)", cos(cb), cos(cd), "1.000"))
+    # Accuracy as a share of the teacher's: the same closeness, asked of the
+    # answer key. Skipped when the teacher scored nothing, since a share of
+    # zero is not a number.
+    tea = (players.get("teacher") or {}).get("accuracy")
+    if isinstance(tea, float) and tea > 0:
+        share = lambda name: ((players.get(name) or {}).get("accuracy"))
+        cell = lambda v: (f"{v / tea * 100:.0f}%" if isinstance(v, float) else "-")
+        rows.append(("Accuracy, as a share of the teacher's",
+                     cell(share("base")), cell(share("distilled")), "100%"))
+    return rows
 
 
 def _sections(payload):
@@ -174,9 +324,9 @@ def _report_rows(payload):
                                  else "-")
     sections = []
 
-    # The answer key first when there is one. Fidelity below says how closely the
-    # student tracks the teacher; this says who was RIGHT, which is the question
-    # anyone outside the project asks first.
+    # Closeness to the teacher first: the main score. Then the answer key -
+    # who was RIGHT - as context. Fidelity further down says the same thing
+    # token by token.
     arena = payload.get("arena") or {}
     players = arena.get("players") or {}
     if players:
@@ -189,6 +339,14 @@ def _report_rows(payload):
             return (values.get("base", "-"), values.get("distilled", "-"),
                     values.get("teacher", "-"))
 
+        subset = (f" — a SUBSET of {arena['available']}, not the score"
+                  if arena.get("available") and arena.get("limited_to") else "")
+        close_rows = _closeness_rows(arena, total, pct)
+        if close_rows:
+            sections.append(
+                (f"How close is it to the teacher? — {total} held-out "
+                 f"questions{subset}", close_rows))
+
         rows = [
             ("Produced a parseable answer",
              *three(lambda e: f"{e['answered']} / {total}")),
@@ -200,26 +358,6 @@ def _report_rows(payload):
              *three(lambda e: f"{e.get('in_trained_format', 0)} / {total}")),
             ("Elo", *three(lambda e: f"{e['elo']:.0f}  ±{e['elo_spread']:.0f}")),
         ]
-        # Agreement is pairwise, and this table has one column per player - so
-        # report the pair that matters and let the columns do the work: how
-        # often each student picked the TEACHER's letter. That is what
-        # distillation is supposed to move, and a row per unordered pair would
-        # have left two thirds of every row empty to say it.
-        agreement = arena.get("agreement") or {}
-
-        def against_teacher(name):
-            entry = (agreement.get(f"{name} vs teacher")
-                     or agreement.get(f"teacher vs {name}"))
-            if not entry:
-                return "-"
-            return f"{entry['same']} / {entry['of']}  ({pct(entry['pct'])})"
-
-        if agreement and "teacher" in players:
-            rows.append(("Chose the teacher's letter",
-                         against_teacher("base"), against_teacher("distilled"),
-                         f"{total} / {total}  (100.0%)"))
-        subset = (f" — a SUBSET of {arena['available']}, not the score"
-                  if arena.get("available") and arena.get("limited_to") else "")
         sections.append(
             (f"The answer key — {total} held-out questions{subset} "
              f"(random baseline {arena.get('random_baseline', 0.25) * 100:.0f}%)",
@@ -263,7 +401,7 @@ def _report_rows(payload):
         return sections
 
     sections += [
-        ("How close is the student to the teacher?", [
+        ("How close is it to the teacher, token by token?", [
             ("Prediction agreement",
              fmt(close.get("prediction_agreement_base_pct"), ".2f") + "%",
              fmt(close.get("prediction_agreement_distilled_pct"), ".2f") + "%", "100%"),
@@ -393,6 +531,11 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:.45rem 1.4rem;
 dt{color:var(--muted)}
 dd{margin:0;word-break:break-word;
   font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.84rem}
+.cmd-h{margin:1rem 0 .35rem;font-size:.85rem;color:var(--muted)}
+.cmd{margin:0;padding:.7rem .9rem;background:var(--card);border-radius:8px;
+  font:400 .82rem/1.5 "IBM Plex Mono",ui-monospace,monospace;overflow-x:auto;
+  white-space:pre}
+code{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.85em}
 footer{border-top:1px solid var(--rule);padding-top:1.25rem;color:var(--muted);
   font-size:.85rem}
 @media (max-width:34rem){
@@ -408,7 +551,6 @@ def _render_html(payload, facts, sections, summary):
     esc = lambda t: (str(t).replace("&", "&amp;").replace("<", "&lt;")
                      .replace(">", "&gt;").replace('"', "&quot;"))
     close = payload.get("closeness_to_teacher") or {}
-    recovered = (payload.get("capability") or {}).get("gap_recovered_pct")
 
     def bar(label, base_pct, dist_pct):
         """base -> distilled -> teacher(=100) on one track.
@@ -430,7 +572,16 @@ def _render_html(payload, facts, sections, summary):
             f'<span class="tick d" style="left:{hi:.2f}%">distilled</span>'
             f'<span class="tick t">teacher</span></div></div>')
 
+    # The closeness bars lead, because they are the main score; the token-level
+    # pair from kd.evaluate follow when the evaluation ran.
+    answer = _closeness(payload.get("arena") or {})
+    ab, ad = answer.get("base") or {}, answer.get("distilled") or {}
+    as_pct = lambda v: (v * 100 if isinstance(v, (int, float)) else None)
     bars = "".join([
+        bar("Gives the teacher's answer",
+            as_pct(ab.get("same_answer_pct")), as_pct(ad.get("same_answer_pct"))),
+        bar("Explains it the way the teacher does (cosine as %)",
+            as_pct(ab.get("explanation_cosine")), as_pct(ad.get("explanation_cosine"))),
         bar("Predicts the same next word as the teacher",
             close.get("prediction_agreement_base_pct"),
             close.get("prediction_agreement_distilled_pct")),
@@ -448,8 +599,10 @@ def _render_html(payload, facts, sections, summary):
         f"<style>{_REPORT_CSS}</style>",
     ]
 
-    student = str(payload.get("student") or "the student").split("/")[-1]
-    teacher = str(payload.get("teacher") or "").split("/")[-1]
+    # rstrip first: an s3:// prefix ends in a slash, and a name split on that
+    # is empty - which used to make the lede forget the teacher entirely.
+    student = str(payload.get("student") or "the student").rstrip("/").split("/")[-1]
+    teacher = str(payload.get("teacher") or "").rstrip("/").split("/")[-1]
     body = ['<div class="wrap"><header>',
             '<p class="eyebrow">Knowledge distillation &middot; evaluation</p>',
             f'<h1>{esc(student)}</h1>',
@@ -460,33 +613,19 @@ def _render_html(payload, facts, sections, summary):
              'held-out answer key.</p>'),
             '</header>']
 
-    # The headline number is the share of the teacher gap that training closed.
-    # kd.evaluate measures it token by token; with only an arena payload the
-    # same quantity is available from the accuracy columns, and the caption says
-    # which one is on the page rather than leaving them to look identical.
-    arena_players = (payload.get("arena") or {}).get("players") or {}
-    caption = "of the distance to the teacher, closed by training"
-    if not isinstance(recovered, (int, float)) or not math.isfinite(recovered):
-        recovered = None
-        base, dist, tea = (arena_players.get("base"), arena_players.get("distilled"),
-                           arena_players.get("teacher"))
-        if base and dist and tea:
-            gap = (tea.get("accuracy") or 0) - (base.get("accuracy") or 0)
-            if gap > 0:
-                recovered = ((dist.get("accuracy") or 0)
-                             - (base.get("accuracy") or 0)) / gap * 100
-                caption = "of the teacher's lead on the answer key, closed by training"
-
-    big = (f"{recovered:.0f}%" if isinstance(recovered, (int, float))
-           and math.isfinite(recovered) else "&mdash;")
+    # The headline number is how close the distilled student is to the teacher.
+    # The caption says which measurement is on the page, because the answer-
+    # level and token-level figures would otherwise look identical.
+    value, caption = _headline(payload)
+    big = f"{value:.0f}%" if value is not None else "&mdash;"
     body.append(f'<section class="verdict"><div><div class="big">{big}'
-                f'<span>{caption}</span>'
+                f'<span>{esc(caption)}</span>'
                 '</div></div><div>'
                 + "".join(f"<p>{esc(line)}</p>" for line in summary)
                 + '</div></section>')
 
     if bars:
-        body.append(f'<section><h2>How far it moved</h2>{bars}</section>')
+        body.append(f'<section><h2>How close it got</h2>{bars}</section>')
 
     for title, rows, headers in sections:
         cells = "".join(
@@ -498,6 +637,21 @@ def _render_html(payload, facts, sections, summary):
             f'<section><h2>{esc(title)}</h2><div class="tbl"><table><thead><tr>'
             f'{head_cells}'
             f'</tr></thead><tbody>{cells}</tbody></table></div></section>')
+
+    adapter_facts, commands = _adapter_facts(payload)
+    if adapter_facts:
+        body.append(
+            '<section><h2>The adapter</h2><dl>'
+            + "".join(f"<dt>{esc(k)}</dt><dd>{esc(v)}</dd>" for k, v in adapter_facts)
+            + '</dl>'
+            + '<p class="lede">To re-run just the evaluation against it - no '
+              'training - from any machine with the bucket:</p>'
+            + "".join(f'<p class="cmd-h">{esc(what)}</p><pre class="cmd">{esc(cmd)}</pre>'
+                      for what, cmd in commands)
+            + '<p class="lede">Both open a new run directory under '
+              '<code>runs/</code> and pick the adapter up from where it is; add '
+              '<code>--skip upload</code> to keep the result off S3.</p>'
+            + '</section>')
 
     body.append('<section><h2>This run</h2><dl>'
                 + "".join(f"<dt>{esc(k)}</dt><dd>{esc(v)}</dd>" for k, v in facts)
@@ -531,9 +685,8 @@ def write_report(payload, path):
                          if payload.get("teacher_adapter") else "")))
     if payload.get("student"):
         facts.append(("Student", payload["student"]))
-    if payload.get("adapter") or arena.get("adapter"):
-        facts.append(("Adapter evaluated",
-                      payload.get("adapter") or arena.get("adapter")))
+    if payload.get("profile"):
+        facts.append(("Profile", payload["profile"]))
     if payload.get("device"):
         facts.append(("Hardware", f"{payload['device']} ({payload.get('dtype')})"))
     if payload.get("samples") is not None:
@@ -555,6 +708,17 @@ def write_report(payload, path):
                 else "Scored on a held-out answer key")
         out = ["# Distillation evaluation", "", lede, "", "## Summary", ""]
         out += [f"{line}\n" for line in summary]
+        adapter_facts, commands = _adapter_facts(payload)
+        if adapter_facts:
+            out += ["", "## The adapter", "", "| | |", "|---|---|"]
+            out += [f"| {k} | {v} |" for k, v in adapter_facts]
+            out += ["", "To re-run just the evaluation against it - no training - "
+                    "from any machine with the bucket:", ""]
+            for what, cmd in commands:
+                out += [f"{what}:", "", "```bash", cmd, "```", ""]
+            out += ["Both open a new run directory under `runs/` and pick the "
+                    "adapter up from where it is; add `--skip upload` to keep the "
+                    "result off S3."]
         out += ["", "## Run", "", "| | |", "|---|---|"]
         out += [f"| {k} | {v} |" for k, v in facts]
         for title, rows, headers in sections:

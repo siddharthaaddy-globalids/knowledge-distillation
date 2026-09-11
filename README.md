@@ -38,7 +38,7 @@ failure:
 | `train` | ✓ | |
 | `evaluate` | | Fidelity and capability, against the untrained base student. |
 | `arena` | | Accuracy and Elo on a held-out answer key. Off unless `evaluation.arena_file` is set. |
-| `report` | | A readable `report.html`. |
+| `report` | | A readable `report.html`, led by how close the distilled student is to the teacher. |
 | `publish` | | To the Hugging Face Hub. Off by default. |
 | `upload` | | To S3. Off by default; also runs after a failure, so logs survive. |
 

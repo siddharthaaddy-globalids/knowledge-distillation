@@ -32,6 +32,18 @@
 #  fact that the stages finished, not the numbers they printed.
 #
 #  Once this passes, go to configs/enlibraQ25-3B.yaml on a GPU.
+#
+#  TO PROVE THE EVAL-ONLY PATH TOO
+#  -------------------------------
+#  The report this run writes ends with a section called "The adapter", naming
+#  the adapter's local path, its S3 copy, and the command that re-runs just the
+#  evaluation against it - no training. Run that command as the second half of
+#  the smoke test; it is what scoring an adapter trained elsewhere looks like:
+#
+#    ./run.sh --config configs/enlibraQ25-flow.yaml --from evaluate #        --adapter s3://enlibra/dss/dev/runs/9eb5db9e-.../outputs/gkd/runs/<run-id>/final_adapter
+#
+#  That runs evaluate -> arena -> report -> upload into a new run directory.
+#  Add --skip upload to keep it off S3.
 # ===========================================================================
 extends: enlibraQ25-3B.yaml
 
@@ -82,7 +94,8 @@ evaluation:
   samples: 16
   # Six questions across three players is eighteen generations - enough to prove
   # the arena loads each model in turn, finds the <Answer> tag and produces
-  # ratings. The Elo from six questions is noise. Read that it finished.
+  # ratings. The closeness and Elo from six questions are noise, and the report
+  # says so at the top. Read that it finished.
   arena_limit: 6
   arena_max_new_tokens: 512
 
