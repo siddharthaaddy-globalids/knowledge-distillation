@@ -152,8 +152,7 @@ dataset:
       pool: 20
 
 lora:
-  r: 32
-  alpha: 64
+  # r and alpha are inherited from _base.yaml (64 / 128).
   # Qwen3 is a standard dense transformer - no hybrid attention, no vision tower,
   # no MTP head - so the plain Llama-style projection list reaches every layer.
   target_modules:
@@ -199,8 +198,10 @@ gkd:
   # than plain KD, which is worth revisiting once this run has produced a
   # student worth correcting.
   lmbda: 0.0
-  beta: 0.5
-  temperature: 0.7
+  # beta and temperature are inherited from _base.yaml (0.9 and 1.0): the
+  # reverse-leaning divergence the papers favour for a student this much
+  # smaller than its teacher, and the sampling temperature every on-policy
+  # recipe trains at. Temperature is inert while lmbda is 0.0.
   # No practical cap: 8192, against explanations that run to ~306 tokens. The
   # model reaches end-of-turn long before this, so the number never binds - it
   # is a runaway guard, not a length.

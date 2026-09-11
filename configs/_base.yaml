@@ -85,8 +85,12 @@ dataset:
       pool: 1500
 
 lora:
-  r: 32
-  alpha: 64
+  # Rank 64 with alpha at twice the rank. The one LoRA-specific on-policy
+  # distillation recipe (Thinking Machines, 2025) used 128 and found LoRA then
+  # trails full fine-tuning by only 6%; 32 was on the small side. See
+  # docs/papers/README.md.
+  r: 64
+  alpha: 128
   dropout: 0.05
   target_modules:
     - q_proj
@@ -135,11 +139,30 @@ training:
   # paid only by a model that will not stop, which is itself worth seeing.
   benchmark_max_new_tokens: 2048
 
+# The values the literature settles on for a student much smaller than its
+# teacher - Agarwal et al. 2024 (GKD), Ko et al. 2024 (DistiLLM), and the 2025
+# Thinking Machines recipe on Qwen3. Each is explained, with the papers'
+# numbers, in docs/papers/README.md, and every report repeats the explanation
+# next to the values a run actually used ("How it was trained").
 gkd:
-  lmbda: 0.5            # on-policy fraction; raise toward 1.0 for more student rollouts
-  beta: 0.5             # generalized JSD interpolation
-  temperature: 0.7
+  # On-policy fraction. Every GKD ablation has 0.5 beating 0, and gains need
+  # at least 0.25; DistiLLM ramps it up from 0 because a student's early
+  # rollouts mislead the teacher. Raise toward 1.0 for more student rollouts.
+  lmbda: 0.5
+  # Generalized JSD interpolation: 0 is forward KL (cover everything the teacher
+  # considers possible), 1 is reverse KL (commit to the teacher's modes). 0.9
+  # is the reverse-leaning value GKD recommends when the student should stay
+  # close to a reference, and the closest TRL offers to DistiLLM's skew KL.
+  beta: 0.9
+  # Sampling temperature for the student's own completions. 1.0 is the model's
+  # own distribution, which is what every on-policy recipe trains at: lower
+  # values only visit the student's confident paths, the ones least in need of
+  # correction. Inert while lmbda is 0.
+  temperature: 1.0
   max_new_tokens: 40
+  # true has the teacher rewrite each completion before the student trains on
+  # it. Never beats on-policy data in the literature, and costs a teacher
+  # generation per sample.
   seq_kd: false
 
 evaluation:
@@ -149,6 +172,9 @@ evaluation:
   gen_similarity: 0     # free-running BERTScore prompts; 0 = skip (slow: 3 models generate)
   similarity_model: roberta-large
   report_format: html   # html | md - written into the run bundle as report.<ext>
+  # The report's "How it was trained" section: the gkd knobs, what each does,
+  # and what each meant at the value this run used. Off hides the section.
+  report_training: true
   # --- the arena -----------------------------------------------------------
   # A held-out multiple-choice file - one {"messages": [...]} per line, the
   # assistant turn ending in an <Answer> tag - scored for accuracy, and turned

@@ -261,6 +261,198 @@ def _adapter_facts(payload):
     return facts, commands
 
 
+# --------------------------------------------------------------------------- #
+# How it was trained
+# --------------------------------------------------------------------------- #
+def training_settings(config):
+    """The training knobs the report explains, lifted from the resolved config.
+
+    Goes into the payload as `training`, so the report is self-contained: the
+    page says what the run did without the reader opening config.resolved.yaml
+    and knowing which of its ninety keys matter. Returns None when the profile
+    turns the section off with `evaluation.report_training: false`.
+    """
+    if not (config.get("evaluation") or {}).get("report_training", True):
+        return None
+    gkd = config.get("gkd") or {}
+    training = config.get("training") or {}
+    lora = config.get("lora") or {}
+    return {
+        "gkd": {key: gkd.get(key) for key in
+                ("beta", "lmbda", "temperature", "max_new_tokens", "seq_kd")},
+        "training": {key: training.get(key) for key in
+                     ("max_steps", "batch_size", "gradient_accumulation_steps",
+                      "learning_rate", "lr_scheduler_type", "warmup")},
+        "lora": {key: lora.get(key) for key in
+                 ("r", "alpha", "dropout", "target_modules")},
+    }
+
+
+def _number(value, default=None):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _training_summary(gkd):
+    """One paragraph: what the student actually did during training.
+
+    Built from the two settings that decide it, so the sentence is true of THIS
+    run rather than of GKD in general.
+    """
+    beta, lmbda = _number(gkd.get("beta"), 0.5), _number(gkd.get("lmbda"), 0.0)
+    if lmbda <= 0:
+        data = ("The student read the curriculum's own answers; nothing the "
+                "student wrote itself was used in training.")
+    elif lmbda >= 1:
+        data = ("Every training example was written by the student itself, then "
+                "corrected by the teacher token by token.")
+    else:
+        data = (f"In {lmbda:.0%} of batches the student wrote its own answer and "
+                f"was corrected on that; in the rest it read the curriculum's "
+                f"answers.")
+    if beta <= 0.35:
+        pull = ("was pulled to cover everything the teacher considered possible "
+                "at each token (forward KL: broad, cautious)")
+    elif beta >= 0.65:
+        pull = ("was pulled to commit to the teacher's most likely tokens "
+                "(reverse KL: sharp, decisive)")
+    else:
+        pull = ("was pulled toward the teacher's token probabilities with a "
+                "balanced penalty (symmetric JSD)")
+    return (f"{data} At every token the student {pull}. The loss is the "
+            f"generalised Jensen-Shannon divergence and nothing else - no "
+            f"cross-entropy on gold labels, no separate entropy term.")
+
+
+def _training_knobs(gkd):
+    """[(name, value, what it does, what it means at this value)] for the gkd knobs."""
+    beta, lmbda = _number(gkd.get("beta"), 0.5), _number(gkd.get("lmbda"), 0.0)
+    show = lambda v: "-" if v is None else (str(v).lower() if isinstance(v, bool) else str(v))
+    on_policy = lmbda > 0
+
+    if beta <= 0.35:
+        beta_now = ("Mostly forward KL: the student is punished for giving no "
+                    "weight to a token the teacher likes, so it spreads its bets. "
+                    "Safe, but a small student ends up blurry.")
+    elif beta >= 0.65:
+        beta_now = ("Mostly reverse KL: the student is punished for weight the "
+                    "teacher would not give, not for ignoring some of the "
+                    "teacher's options. Sharper, more decisive, less variety.")
+    else:
+        beta_now = ("Balanced: forward and reverse in equal measure, each "
+                    "compared to the average of the two. The middle of the "
+                    "road; push it up if explanations read vague next to the "
+                    "teacher's.")
+
+    if lmbda <= 0:
+        lmbda_now = ("Fully off-policy: ordinary distillation. Fast and safe, "
+                     "but the student is only ever corrected on good text - "
+                     "never on the mistakes it makes on its own.")
+    elif lmbda >= 1:
+        lmbda_now = ("Fully on-policy: the student writes every answer and is "
+                     "corrected on its own mistakes. Slow - a generation every "
+                     "step.")
+    else:
+        lmbda_now = (f"A coin flip per batch: {lmbda:.0%} of batches are on the "
+                     f"student's own text, the rest on the curriculum's.")
+
+    inert = "Inert in this run because lmbda is 0: it only applies when the student writes its own text."
+    temperature = _number(gkd.get("temperature"))
+    temp_now = inert if not on_policy else (
+        "Tame, mostly-likely tokens." if temperature is not None and temperature < 0.5
+        else "Wilder rollouts that exercise rarer situations." if temperature is not None and temperature > 0.9
+        else "Mostly likely tokens, with the occasional less likely one.")
+    tokens_now = inert if not on_policy else (
+        "The ceiling for one student rollout; a reasoning chain cut off here is "
+        "scored as a fragment.")
+    seq_kd = gkd.get("seq_kd")
+    seq_now = ("The teacher rewrites every curriculum completion before the student "
+               "sees it: more teacher-like, at a teacher generation per sample, and "
+               "the curriculum's own explanations are thrown away."
+               if seq_kd else
+               "The curriculum's own completions are used as written - the right "
+               "call while the curriculum is good.")
+
+    return [
+        ("beta", show(gkd.get("beta")),
+         "Which way the student is pulled toward the teacher. 0 = forward KL "
+         "(cover everything the teacher considers possible), 1 = reverse KL "
+         "(commit to what the teacher finds most likely), 0.5 = balanced.",
+         beta_now),
+        ("lmbda", show(gkd.get("lmbda")),
+         "Whose text the lesson is taught on: the fraction of batches where the "
+         "student writes its own answer and the teacher corrects THAT. This is "
+         "the G in GKD; at 0 it is plain distillation.",
+         lmbda_now),
+        ("temperature", show(gkd.get("temperature")),
+         "How adventurous the student is when it writes its own text for an "
+         "on-policy batch. Lower is tamer; higher exercises rarer situations.",
+         temp_now),
+        ("max_new_tokens", show(gkd.get("max_new_tokens")),
+         "How long a student rollout may run in an on-policy batch. A ceiling, "
+         "not a target.",
+         tokens_now),
+        ("seq_kd", show(seq_kd),
+         "Who writes the off-policy text: false = the curriculum's real "
+         "completions, true = the teacher generates a completion first and the "
+         "student trains on that.",
+         seq_now),
+    ]
+
+
+def _training_facts(block):
+    """(label, value) for the plainer settings: steps, batch, LR, LoRA."""
+    training, lora = block.get("training") or {}, block.get("lora") or {}
+    facts = []
+    steps = training.get("max_steps")
+    batch, accum = training.get("batch_size"), training.get("gradient_accumulation_steps")
+    if steps is not None:
+        facts.append(("Optimizer steps", str(steps)))
+    if batch is not None and accum is not None:
+        facts.append(("Effective batch", f"{batch} x {accum} = {int(batch) * int(accum)}"))
+    if training.get("learning_rate") is not None:
+        lr = f"{training['learning_rate']}"
+        if training.get("lr_scheduler_type"):
+            lr += f", {training['lr_scheduler_type']} schedule"
+        if training.get("warmup") is not None:
+            lr += f", warmup {training['warmup']}"
+        facts.append(("Learning rate", lr))
+    if lora.get("r") is not None:
+        facts.append(("LoRA", f"r={lora['r']}, alpha={lora.get('alpha')}, "
+                              f"dropout={lora.get('dropout')}"))
+    if lora.get("target_modules"):
+        facts.append(("LoRA targets", ", ".join(str(m) for m in lora["target_modules"])))
+    return facts
+
+
+# The loss, written once, for the section and for the docstring above it.
+LOSS_FORMULA = ("JSD_beta(P || Q) = beta * KL(P || M) + (1 - beta) * KL(Q || M),"
+                "   M = beta * P + (1 - beta) * Q")
+
+
+def loss_note(beta):
+    """The sentence under the formula, with the ceiling for THIS run's beta.
+
+    Generalised JSD is bounded by the binary entropy of beta - ln 2 = 0.693 at
+    0.5, 0.325 at 0.9 - which is the number that tells a reader whether a loss
+    curve is high, since the same 0.4 is ordinary at one beta and impossible at
+    another.
+    """
+    b = _number(beta, 0.5)
+    if 0 < b < 1:
+        bound = -(b * math.log(b) + (1 - b) * math.log(1 - b))
+        ceiling = (f"At beta {b:g} one token's loss is at most "
+                   f"{bound:.3f} (the binary entropy of beta), so a running "
+                   f"loss near that is a student that has learned nothing yet.")
+    else:
+        ceiling = (f"At beta {b:g} the loss is a plain KL, which is unbounded.")
+    return ("P is the teacher's next-token distribution, Q the student's, both "
+            "after temperature scaling; averaged over completion tokens only. "
+            + ceiling)
+
+
 # What the four columns mean unless a section says otherwise. Most sections
 # compare the three models; the similarity table compares three PAIRS of them,
 # and labelling its columns with model names would misdescribe every cell.
@@ -531,6 +723,18 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:.45rem 1.4rem;
 dt{color:var(--muted)}
 dd{margin:0;word-break:break-word;
   font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.84rem}
+.knob{padding:1rem 0;border-top:1px solid var(--rule)}
+.knob:last-of-type{border-bottom:1px solid var(--rule)}
+.knob-h{display:flex;justify-content:space-between;align-items:baseline;
+  margin-bottom:.35rem}
+.knob-h b{font:500 .95rem/1.3 "IBM Plex Mono",ui-monospace,monospace}
+.knob-h em{font-style:normal;color:var(--accent);
+  font:600 .95rem/1 "IBM Plex Mono",ui-monospace,monospace;
+  font-variant-numeric:tabular-nums}
+.knob p{margin:.3rem 0;font-size:.93rem}
+.knob .now{color:var(--muted)}
+.knob .now span{color:var(--ink);font-weight:500}
+.trained{margin-top:1.25rem}
 .cmd-h{margin:1rem 0 .35rem;font-size:.85rem;color:var(--muted)}
 .cmd{margin:0;padding:.7rem .9rem;background:var(--card);border-radius:8px;
   font:400 .82rem/1.5 "IBM Plex Mono",ui-monospace,monospace;overflow-x:auto;
@@ -638,6 +842,33 @@ def _render_html(payload, facts, sections, summary):
             f'{head_cells}'
             f'</tr></thead><tbody>{cells}</tbody></table></div></section>')
 
+    # How it was trained: the knobs, what each does, and what each meant at the
+    # value this run used. Here rather than in the tables above because the
+    # reader of the numbers is the same person who will ask "so what do I
+    # change", and the answer should be on the same page.
+    block = payload.get("training")
+    if block:
+        gkd = block.get("gkd") or {}
+        knobs = "".join(
+            f'<div class="knob"><div class="knob-h"><b>{esc(name)}</b>'
+            f'<em>{esc(value)}</em></div>'
+            f'<p>{esc(what)}</p><p class="now"><span>At {esc(value)}:</span> {esc(now)}</p></div>'
+            for name, value, what, now in _training_knobs(gkd))
+        trained = _training_facts(block)
+        body.append(
+            '<section><h2>How it was trained</h2>'
+            f'<p>{esc(_training_summary(gkd))}</p>'
+            f'<pre class="cmd">{esc(LOSS_FORMULA)}</pre>'
+            f'<p class="lede">{esc(loss_note(gkd.get("beta")))}</p>'
+            + knobs
+            + ('<dl class="trained">'
+               + "".join(f"<dt>{esc(k)}</dt><dd>{esc(v)}</dd>" for k, v in trained)
+               + '</dl>' if trained else '')
+            + '<p class="lede">Change any of these for one run without editing '
+              'the profile: <code>--set gkd.beta=0.9</code>, or the short form '
+              '<code>--lmbda 0.25</code>.</p>'
+            + '</section>')
+
     adapter_facts, commands = _adapter_facts(payload)
     if adapter_facts:
         body.append(
@@ -708,6 +939,21 @@ def write_report(payload, path):
                 else "Scored on a held-out answer key")
         out = ["# Distillation evaluation", "", lede, "", "## Summary", ""]
         out += [f"{line}\n" for line in summary]
+        block = payload.get("training")
+        if block:
+            gkd = block.get("gkd") or {}
+            out += ["", "## How it was trained", "", _training_summary(gkd), "",
+                    "```", LOSS_FORMULA, "```", "", loss_note(gkd.get("beta")), "",
+                    "| Setting | Value | What it does | At this value |",
+                    "|---|---|---|---|"]
+            out += [f"| `{name}` | **{value}** | {what} | {now} |"
+                    for name, value, what, now in _training_knobs(gkd)]
+            trained = _training_facts(block)
+            if trained:
+                out += ["", "| | |", "|---|---|"]
+                out += [f"| {k} | {v} |" for k, v in trained]
+            out += ["", "Change any of these for one run without editing the "
+                    "profile: `--set gkd.beta=0.9`, or the short form `--lmbda 0.25`."]
         adapter_facts, commands = _adapter_facts(payload)
         if adapter_facts:
             out += ["", "## The adapter", "", "| | |", "|---|---|"]

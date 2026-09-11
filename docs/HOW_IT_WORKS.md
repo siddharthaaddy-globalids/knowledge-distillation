@@ -189,7 +189,8 @@ L = β · KL(p_T ‖ M)  +  (1 − β) · KL(p_S ‖ M)
 | `beta` | Loss | Character |
 |---|---|---|
 | `0.0` | `KL(p_T ‖ p_S)` — forward KL | **Mode-covering.** The student must put mass wherever the teacher does. Classic KD. |
-| `0.5` | symmetric JSD | Balanced. This repo's default. |
+| `0.5` | symmetric JSD | Balanced. The baseline every paper measures against. |
+| `0.9` | reverse-leaning JSD | **This repo's default.** Mode-seeking, but bounded: what GKD recommends when the student should stay close to a reference, and the nearest TRL offers to DistiLLM's skew KL. See `docs/papers/README.md`. |
 | `1.0` | `KL(p_S ‖ p_T)` — reverse KL | **Mode-seeking.** The student may cover one mode sharply and ignore the rest. |
 
 Implementation notes that matter if you read the TRL source:
@@ -306,8 +307,8 @@ student = get_peft_model(student, lora_config)
 
 Each targeted `Linear` of shape `(out, in)` gains `A ∈ R^{r×in}` and
 `B ∈ R^{out×r}`, and its output becomes `Wx + (α/r)·BAx`. Only `A` and `B` carry
-gradients. At r=32 across all attention and MLP projections this is on the order of
-1% of the model's parameters; the run prints the exact count via
+gradients. At r=64 across all attention and MLP projections this is on the order of
+2% of the model's parameters; the run prints the exact count via
 `print_trainable_parameters()`.
 
 `target_modules` accepts a **regex string** as well as a suffix list. That matters
@@ -479,8 +480,8 @@ distillation metric separately, because they are not the same question:
   `argmax(student_logits) == argmax(teacher_logits)`, teacher-forced on held-out
   text. The standard predictive-agreement metric.
 * **KL(p_T ‖ p_S)** per token — the distribution-level version, and the `beta = 0`
-  case of the training loss. Note that the training objective at `beta = 0.5` is
-  JSD, not KL, so this is a related but distinct measurement.
+  case of the training loss. Note that the training objective at `beta = 0.9` is
+  a reverse-leaning JSD, not KL, so this is a related but distinct measurement.
 
 **Capability — is the student better at the task?**
 

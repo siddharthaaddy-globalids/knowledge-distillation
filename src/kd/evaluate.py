@@ -45,7 +45,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import load_config, resolve_device
-from .report import write_report
+from .report import training_settings, write_report
 from .runlog import discover_adapters, is_adapter
 
 BAR = "=" * 78
@@ -806,6 +806,7 @@ def main(args=None):
         # recomputes both with what it additionally knows about the run.
         "adapter_locations": paths.adapter_locations(adapter_dir, config),
         "profile": config["_meta"].get("source"),
+        "training": training_settings(config),
         "device": device,
         "dtype": dtype_name,
         "samples": len(samples) - skipped,

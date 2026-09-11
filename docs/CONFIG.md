@@ -204,10 +204,14 @@ suppresses all three, for a `--limit` smoke check.
 | Key | Default | Meaning |
 |---|---|---|
 | `lmbda` | `0.5` | **The dominant cost.** The fraction of batches where the student generates its own completion before the teacher scores it — that is `max_new_tokens` sequential forward passes versus one. `0.0` is plain off-policy KD: several times faster, but it loses the on-policy correction that makes GKD better. |
-| `beta` | `0.5` | Generalized JSD interpolation. |
-| `temperature` | `0.7` | |
-| `max_new_tokens` | `40` | Second-biggest lever: generation cost is linear in this. |
-| `seq_kd` | `false` | |
+| `beta` | `0.9` | Generalized JSD interpolation: `0` is forward KL (cover everything the teacher considers possible), `1` is reverse KL (commit to the teacher's modes). The papers favour reverse-leaning values (`0.9`) for a student much smaller than its teacher and for instruction-shaped data. |
+| `temperature` | `1.0` | Sampling temperature for the student's own completions; inert at `lmbda: 0`. The on-policy recipes all use `1.0`. |
+| `max_new_tokens` | `40` | Second-biggest lever: generation cost is linear in this. Inert at `lmbda: 0`. |
+| `seq_kd` | `false` | `true` has the teacher rewrite each completion before the student trains on it. Never beats on-policy data in the literature and costs a teacher generation per sample. |
+
+What each value does, and what the papers found: [papers/README.md](papers/README.md).
+The report's **How it was trained** section (`evaluation.report_training`) repeats
+the explanation next to the values a run actually used.
 
 ## `benchmark_prompts`
 
@@ -229,6 +233,7 @@ chit-chat has not transferred what it was meant to.
 | `gen_similarity` | `0` | Free-running BERTScore prompts. Unlike agreement and KL, this is not teacher-forced, so it sees the student's own drift. Slow. |
 | `similarity_model` | `roberta-large` | BERTScore encoder (~1.4 GB on first use). |
 | `report_format` | `html` | `html` or `md`. |
+| `report_training` | `true` | Include **How it was trained** in the report: each `gkd` knob with its value, what it does, and what it meant at that value, plus the loss formula, steps, batch, LR and LoRA shape. `false` hides the section. |
 
 ## `pipeline`
 

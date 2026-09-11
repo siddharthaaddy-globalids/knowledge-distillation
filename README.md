@@ -343,6 +343,7 @@ scripts/          distill.{sh,ps1}.template - bootstrappers, rendered by CI
 docker/           Dockerfile.cuda - the image a rented GPU runs
 tests/            plain asserts, no framework, no downloads
 docs/             CONFIG.md, RUNPOD.md, HOW_IT_WORKS.md, DEMO_PROMPTS.md
+  papers/         the GKD, DistiLLM and MiniLLM papers, and what they say about the gkd knobs
 ```
 
 ## Tests

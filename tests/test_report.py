@@ -225,6 +225,67 @@ def test_the_adapter_section_says_why_there_is_no_s3_copy():
     assert "--from evaluate --adapter runs/r1/final_adapter" in html
 
 
+TRAINING = {"gkd": {"beta": 0.5, "lmbda": 0.0, "temperature": 0.7,
+                    "max_new_tokens": 8192, "seq_kd": False},
+            "training": {"max_steps": 300, "batch_size": 1,
+                         "gradient_accumulation_steps": 4, "learning_rate": 0.0003,
+                         "lr_scheduler_type": "cosine", "warmup": 0.05},
+            "lora": {"r": 32, "alpha": 64, "dropout": 0.05,
+                     "target_modules": ["q_proj", "v_proj"]}}
+
+
+def test_how_it_was_trained_names_every_knob_with_its_value():
+    payload = dict(ARENA_ONLY, training=TRAINING)
+    html = render(payload, ".html", scratch())
+    assert "How it was trained" in html
+    for knob in ("beta", "lmbda", "temperature", "max_new_tokens", "seq_kd"):
+        assert f"<b>{knob}</b>" in html, f"{knob} missing"
+    assert "<em>0.5</em>" in html and "<em>0.0</em>" in html and "<em>false</em>" in html
+    assert "KL(P || M)" in html, "no loss formula"
+    assert "1 x 4 = 4" in html and "r=32, alpha=64" in html
+    md = render(payload, ".md", scratch())
+    assert "## How it was trained" in md and "| `beta` | **0.5** |" in md
+
+
+def test_the_explanation_is_about_this_runs_values():
+    """lmbda 0 is plain distillation and makes two knobs inert; the page says so."""
+    from kd.report import _training_knobs, _training_summary
+
+    off = _training_summary(TRAINING["gkd"])
+    assert "nothing the student wrote itself was used" in off, off
+    assert "balanced penalty" in off, off
+    knobs = {name: now for name, _v, _what, now in _training_knobs(TRAINING["gkd"])}
+    assert knobs["lmbda"].startswith("Fully off-policy"), knobs["lmbda"]
+    assert "Inert" in knobs["temperature"] and "Inert" in knobs["max_new_tokens"]
+
+    on = dict(TRAINING["gkd"], lmbda=0.5, beta=0.9)
+    summary = _training_summary(on)
+    assert "50% of batches" in summary and "reverse KL" in summary, summary
+    knobs = {name: now for name, _v, _what, now in _training_knobs(on)}
+    assert "Inert" not in knobs["temperature"], knobs["temperature"]
+    assert knobs["beta"].startswith("Mostly reverse KL"), knobs["beta"]
+
+
+def test_the_loss_ceiling_follows_beta():
+    from kd.report import loss_note
+
+    assert "0.693" in loss_note(0.5)
+    assert "0.325" in loss_note(0.9)
+    assert "unbounded" in loss_note(1.0) and "unbounded" in loss_note(0)
+
+
+def test_training_section_is_read_from_the_config_and_can_be_turned_off():
+    from kd.report import training_settings
+
+    config = {"gkd": TRAINING["gkd"], "training": TRAINING["training"],
+              "lora": TRAINING["lora"], "evaluation": {}}
+    block = training_settings(config)
+    assert block["gkd"]["beta"] == 0.5 and block["lora"]["r"] == 32, block
+    assert training_settings(dict(config, evaluation={"report_training": False})) is None
+    html = render(dict(ARENA_ONLY, training=None), ".html", scratch())
+    assert "How it was trained" not in html
+
+
 def test_the_adapter_section_survives_an_older_payload():
     """Only `adapter`, no locations block: still a section, never a crash."""
     payload = {k: v for k, v in ARENA_ONLY.items()

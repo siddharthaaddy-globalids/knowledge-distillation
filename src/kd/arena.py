@@ -1126,7 +1126,7 @@ def main(args=None):
         report = f"{stem}-report.html"
     if report:
         try:
-            from .report import write_report
+            from .report import training_settings, write_report
 
             written = write_report({
                 "arena": payload,
@@ -1137,6 +1137,7 @@ def main(args=None):
                 "adapter_locations": paths.adapter_locations(
                     adapter, config, source=args.adapter) if adapter else None,
                 "profile": config["_meta"].get("source"),
+                "training": training_settings(config),
                 "device": hardware["device"],
                 "dtype": hardware.get("dtype_name"),
             }, report)

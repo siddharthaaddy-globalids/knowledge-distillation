@@ -55,7 +55,7 @@ def test_profiles_resolve():
     for name in PROFILES:
         cfg = profile(name)
         # A key no profile sets: it can only be here by inheritance.
-        assert cfg["gkd"]["beta"] == 0.5, f"{name} lost gkd.beta"
+        assert cfg["gkd"]["beta"] == 0.9, f"{name} lost gkd.beta"
         assert cfg["project"]["runs_dir"] == "./runs", f"{name} lost project.runs_dir"
         assert "configs/_base.yaml" in " ".join(cfg["_meta"]["chain"]).replace("\\", "/"), \
             f"{name} did not record _base.yaml in its chain"
@@ -254,7 +254,7 @@ def test_extends_finds_the_shipped_base_from_anywhere():
             handle.write("extends: _base.yaml\ntraining:\n  max_steps: 42\n")
         cfg = kdc.load_config(path, use_env=False)
         assert cfg["training"]["max_steps"] == 42
-        assert cfg["gkd"]["beta"] == 0.5, "the base layer was not inherited"
+        assert cfg["gkd"]["beta"] == 0.9, "the base layer was not inherited"
     finally:
         shutil.rmtree(outside, ignore_errors=True)
 

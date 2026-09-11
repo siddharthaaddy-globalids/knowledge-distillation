@@ -484,7 +484,7 @@ def stage_report(ctx):
     """Turn the measurements into something a person can read."""
     import json
 
-    from .report import write_report
+    from .report import training_settings, write_report
 
     payload_path = ctx.resolve_evaluation()
     if payload_path:
@@ -526,6 +526,10 @@ def stage_report(ctx):
         adapter, ctx.config, source=ctx.options.get("adapter_source"),
         run_id=ctx.run.run_id, run_dir=ctx.run.dir) if adapter else None
     payload["profile"] = ctx.config["_meta"].get("source")
+    # From the config this stage runs with, not from evaluation.json: `--only
+    # report` may be re-rendering an old run, and the section explains the
+    # settings as they stand, honouring evaluation.report_training either way.
+    payload["training"] = training_settings(ctx.config)
 
     suffix = str((ctx.config.get("evaluation") or {}).get("report_format", "html"))
     written = write_report(payload, ctx.run.path(f"report.{suffix.lstrip('.')}"))
