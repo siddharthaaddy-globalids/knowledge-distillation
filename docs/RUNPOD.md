@@ -299,6 +299,19 @@ metrics.json           report.html     final_adapter/
 `manifest.json` and `config.resolved.yaml` always ship, whatever `s3.upload`
 says — without them the bundle cannot say what produced it.
 
+If the upload stage failed — most often because temporary AWS credentials
+expired during a long training run — export fresh credentials and ship the
+finished bundle by hand. This does not open a new run:
+
+```bash
+./run.sh --config configs/X.yaml upload                 # the latest run
+./run.sh --config configs/X.yaml upload <run-id>        # a named run
+./run.sh --config configs/X.yaml upload --with-checkpoints
+```
+
+It uses the same bucket, prefix and `s3.upload` selection as the pipeline, so
+pass `--set s3.bucket=<bucket>` if the config does not name one.
+
 Feeding results back into a later run is symmetrical: any of `models.teacher`,
 `models.student`, `models.teacher_adapter` and `dataset.source` may be an `s3://`
 URI, fetched in `preflight` and cached locally.

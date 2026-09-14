@@ -199,6 +199,66 @@ def cmd_pipeline(args):
         )
 
 
+def cmd_upload(args):
+    """Ship an existing run bundle to S3, outside the pipeline.
+
+    The pipeline's own upload stage runs last, and on a long run that is hours
+    after the credentials were exported - long enough for a session token to
+    expire, so the training succeeds and the upload does not. This is the
+    retry: same bucket layout, same file selection, against a run that already
+    finished. It does not open a new run directory, which is what
+    `pipeline --only upload` would do.
+    """
+    import logging
+
+    from .remote import s3
+    from .runlog import append_event, find_run
+
+    config = load(args)
+    runs_dir = (config.get("project") or {}).get("runs_dir") or "./runs"
+    try:
+        run_id, run_dir = find_run(args.run, runs_dir)
+    except FileNotFoundError as exc:
+        print(f" !! {exc}")
+        return 1
+
+    groups = list((config.get("s3") or {}).get("upload") or [])
+    if args.with_checkpoints and "checkpoints" not in groups:
+        groups.append("checkpoints")
+
+    log = logging.getLogger("kd.upload")
+    if not log.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+    log.info(f"  run        : {run_id}")
+    log.info(f"  directory  : {run_dir}")
+    log.info(f"  groups     : {', '.join(groups)}")
+    try:
+        summary = s3.upload_bundle(config, run_dir, run_id, groups=groups, log=log)
+    except Exception as exc:  # noqa: BLE001 - botocore raises many shapes here
+        text = str(exc)
+        print(f" !! upload failed: {type(exc).__name__}: {text[:400]}")
+        if "ExpiredToken" in text or "InvalidToken" in text:
+            print("    the credentials have expired - export fresh ones and run "
+                  "this command again")
+        elif "AccessDenied" in text:
+            print("    this identity lacks s3:PutObject on that prefix; new keys "
+                  "for the same user will fail identically")
+        elif "NoCredentialProviders" in text or "Unable to locate credentials" in text:
+            print("    no AWS credentials in the environment: export "
+                  "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and "
+                  "AWS_SESSION_TOKEN for temporary ones)")
+        return 1
+    # Recorded where the pipeline would have recorded it, so recorded_upload
+    # and the report say where the bundle went whichever path put it there.
+    append_event(run_dir, "upload", "bundle", **summary)
+    return 0
+
+
 def cmd_runpod(args):
     """Rent a GPU, run the pipeline on it, and release it."""
     import logging
@@ -408,6 +468,17 @@ def build_parser():
                         help="Leave the pod running for MIN minutes after a "
                              "successful run, for inspection. It bills until then.")
     runpod.set_defaults(func=cmd_runpod)
+
+    upload = sub.add_parser(
+        "upload",
+        help="Ship an existing run bundle to S3 (a retry, when the pipeline's "
+             "own upload failed or credentials had expired)")
+    add_config_args(upload)
+    upload.add_argument("run", nargs="?", default=None, metavar="RUN",
+                        help="Run id or run directory. Default: the latest run.")
+    upload.add_argument("--with-checkpoints", action="store_true",
+                        help="Also ship checkpoints/ (optimizer state, large)")
+    upload.set_defaults(func=cmd_upload)
 
     doctor = sub.add_parser("doctor", help="Report environment and credentials")
     add_config_args(doctor)

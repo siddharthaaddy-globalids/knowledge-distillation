@@ -173,6 +173,68 @@ def recorded_upload(run_dir):
     return found
 
 
+def find_run(spec, runs_dir="./runs"):
+    """The run directory `spec` names, or the latest run when `spec` is empty.
+
+    Accepts a run id (`20260910T1416Z-finance-3a8402e`), a path to the run
+    directory, or nothing. Nothing means the run `latest` points at, and when
+    there is no pointer, the newest directory under runs_dir - the run ids sort
+    by time, so the largest name is the most recent run.
+
+    Returns (run_id, run_dir). Raises FileNotFoundError with the candidates it
+    tried, because "no such run" without the list is a hunt through ls output.
+    """
+    runs_dir = os.path.abspath(os.path.expanduser(runs_dir or "./runs"))
+
+    if spec:
+        for candidate in (spec, os.path.join(runs_dir, spec)):
+            candidate = os.path.abspath(os.path.expanduser(candidate))
+            if os.path.isdir(candidate):
+                return os.path.basename(candidate.rstrip("/\\")), candidate
+        raise FileNotFoundError(
+            f"no run named {spec!r}: not a directory, and not under {runs_dir}")
+
+    # The pointer a finished run leaves behind - see point_latest_here. A
+    # symlink where the platform allows one, a text file where it does not.
+    link = os.path.join(runs_dir, "latest")
+    if os.path.islink(link) and os.path.isdir(link):
+        target = os.path.realpath(link)
+        return os.path.basename(target), target
+    pointer = os.path.join(runs_dir, "latest.txt")
+    if os.path.isfile(pointer):
+        with open(pointer, encoding="utf-8") as handle:
+            target = handle.read().strip()
+        if target and os.path.isdir(target):
+            return os.path.basename(target), os.path.abspath(target)
+
+    # No pointer, so the newest directory. A run that crashed before finishing
+    # never wrote the pointer, and it is exactly the run whose logs you want.
+    found = sorted(
+        name for name in os.listdir(runs_dir) if name != "latest"
+        and os.path.isdir(os.path.join(runs_dir, name))
+    ) if os.path.isdir(runs_dir) else []
+    if not found:
+        raise FileNotFoundError(f"no runs under {runs_dir}")
+    return found[-1], os.path.join(runs_dir, found[-1])
+
+
+def append_event(run_dir, stage, kind, **fields):
+    """One record onto an existing run's events.jsonl, from outside the Run.
+
+    For work done on a finished bundle after the fact - an upload repeated once
+    credentials are fresh, most often. Same shape as Run.event so that whatever
+    reads the stream (recorded_upload, the report) sees no difference.
+    """
+    record = {"ts": round(time.time(), 3), "elapsed_s": None,
+              "stage": stage, "event": kind}
+    record.update(fields)
+    try:
+        with open(os.path.join(run_dir, EVENTS), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, default=str) + "\n")
+    except OSError:
+        pass
+
+
 def is_latest_alias(path, runs_dir):
     """True when `path` sits under the `latest` pointer rather than a real run."""
     relative = os.path.relpath(path, runs_dir)

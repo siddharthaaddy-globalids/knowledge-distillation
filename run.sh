@@ -42,6 +42,8 @@
 #      ./run.sh --config configs/X.yaml doctor          machine + credentials
 #      ./run.sh --config configs/X.yaml check           resolve, run nothing
 #      ./run.sh --config configs/X.yaml train           training stage only
+#      ./run.sh --config configs/X.yaml upload          re-upload the latest run to S3
+#      ./run.sh --config configs/X.yaml upload <run-id> ... or a named run
 #      ./run.sh --config configs/X.yaml ask "why ...?"
 #      ./run.sh --config configs/X.yaml --set training.max_steps=50
 #      ./run.sh setup                                   install only
