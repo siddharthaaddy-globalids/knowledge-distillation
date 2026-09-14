@@ -1,0 +1,54 @@
+# ===========================================================================
+#  enLibra space curriculum - Qwen2.5-3B (SFT) -> Qwen2.5-1.5B   [SFT rows only]
+#
+#    ./run.sh --config configs/enlibraQ25-3B-sftonly.yaml
+#
+#  The same run as configs/enlibraQ25-3B.yaml with one thing changed: the
+#  curriculum-rl domain (rl-1to2hop.jsonl, 143 rows) is left out, so the
+#  student trains on the SFT stage's 1-3 hop questions and the persona rows
+#  alone. Same teacher, same student, same LoRA, same token budgets, same
+#  held-out set, same S3 destination.
+#
+#  WHY
+#  ---
+#  The teacher is the SFT-stage checkpoint. It never saw the rl export, so
+#  distilling it on those rows asks it to score questions from a stage it was
+#  not trained through. Matching the corpus to the teacher's own stage makes
+#  this run the cleaner comparison against enlibraQ25-3B.yaml, which trains
+#  on both - the difference between the two arena scores is what the rl rows
+#  are worth to a 1.5B student.
+#
+#  Everything not listed below is inherited, deliberately. Restating a value
+#  here would let it drift from the run this is meant to be compared against.
+# ===========================================================================
+extends: enlibraQ25-3B.yaml
+
+project:
+  name: enlibra-q3-sft-only-to-1.5b
+
+dataset:
+  # 952 rows: the full sft export plus the fifteen persona exchanges. This
+  # block replaces the parent's rather than merging into it, which is what
+  # removes curriculum-rl - there is no way to delete a single domain from a
+  # child profile, only to restate the list without it. Keep the domain NAMES
+  # matching the parent so the two runs' per-domain pass rates line up.
+  #
+  # eval-1to5hop.jsonl stays absent for the same reason as in the parent: it
+  # is the score.
+  domains:
+    - name: curriculum-sft
+      data_files: sft-1to3hop.jsonl
+      quota: 937
+      pool: 1000
+    - name: identity
+      data_files: identity.jsonl
+      quota: 15
+      pool: 20
+
+training:
+  # 904 training rows (952 minus the 48 held for validation) at an effective
+  # batch of 8 is ~113 steps per epoch, so this is the same ~2.3 passes the
+  # parent takes over its larger corpus. Leaving it at the parent's 300 would
+  # be 2.65 passes - more of the memorising the parent's comment warns about,
+  # and a run that is no longer the same recipe on a smaller corpus.
+  max_steps: 260
