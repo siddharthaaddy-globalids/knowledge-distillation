@@ -279,7 +279,8 @@ def training_settings(config):
     lora = config.get("lora") or {}
     return {
         "gkd": {key: gkd.get(key) for key in
-                ("beta", "lmbda", "temperature", "max_new_tokens", "seq_kd")},
+                ("beta", "ce_alpha", "lmbda", "temperature", "max_new_tokens",
+                 "seq_kd")},
         "training": {key: training.get(key) for key in
                      ("max_steps", "batch_size", "gradient_accumulation_steps",
                       "learning_rate", "lr_scheduler_type", "warmup")},
@@ -302,6 +303,7 @@ def _training_summary(gkd):
     run rather than of GKD in general.
     """
     beta, lmbda = _number(gkd.get("beta"), 0.5), _number(gkd.get("lmbda"), 0.0)
+    ce_alpha = _number(gkd.get("ce_alpha"), 0.0)
     if lmbda <= 0:
         data = ("The student read the curriculum's own answers; nothing the "
                 "student wrote itself was used in training.")
@@ -321,9 +323,22 @@ def _training_summary(gkd):
     else:
         pull = ("was pulled toward the teacher's token probabilities with a "
                 "balanced penalty (symmetric JSD)")
-    return (f"{data} At every token the student {pull}. The loss is the "
-            f"generalised Jensen-Shannon divergence and nothing else - no "
-            f"cross-entropy on gold labels, no separate entropy term.")
+    if ce_alpha <= 0:
+        loss = ("The loss is the generalised Jensen-Shannon divergence and "
+                "nothing else - no cross-entropy on gold labels, no separate "
+                "entropy term.")
+    elif ce_alpha >= 1:
+        loss = ("The loss is plain cross-entropy on the gold tokens - the "
+                "teacher's distribution was computed but carried no weight, "
+                "so this run is supervised fine-tuning, not distillation.")
+    else:
+        loss = (f"The loss is {1 - ce_alpha:.0%} that generalised "
+                f"Jensen-Shannon divergence and {ce_alpha:.0%} cross-entropy on "
+                f"the gold token, so the curriculum's own answer keeps a pull "
+                f"of its own even where the teacher is unsure or wrong. The "
+                f"cross-entropy applies only to gold text, never to the "
+                f"student's own rollouts.")
+    return f"{data} At every token the student {pull}. {loss}"
 
 
 def _training_knobs(gkd):
@@ -375,12 +390,33 @@ def _training_knobs(gkd):
                "The curriculum's own completions are used as written - the right "
                "call while the curriculum is good.")
 
+    ce_alpha = _number(gkd.get("ce_alpha"), 0.0)
+    if ce_alpha <= 0:
+        ce_now = ("Pure distillation: the gold token matters only through the "
+                  "weight the teacher gives it.")
+    elif ce_alpha >= 1:
+        ce_now = ("Pure supervised fine-tuning: the teacher's distribution is "
+                  "computed and ignored.")
+    elif ce_alpha <= 0.35:
+        ce_now = ("Teacher-led, gold-anchored: the divergence does most of the "
+                  "work and the gold token keeps the student from following a "
+                  "teacher that is soft or wrong on a row.")
+    else:
+        ce_now = ("Closer to SFT with the teacher as a regulariser than to "
+                  "distillation; the teacher's dark knowledge is a minority "
+                  "of the signal.")
+
     return [
         ("beta", show(gkd.get("beta")),
          "Which way the student is pulled toward the teacher. 0 = forward KL "
          "(cover everything the teacher considers possible), 1 = reverse KL "
          "(commit to what the teacher finds most likely), 0.5 = balanced.",
          beta_now),
+        ("ce_alpha", show(gkd.get("ce_alpha", 0.0)),
+         "How much of the loss is plain cross-entropy on the gold token "
+         "(the SFT loss) rather than the divergence from the teacher. 0 = "
+         "the teacher alone, 1 = the gold labels alone.",
+         ce_now),
         ("lmbda", show(gkd.get("lmbda")),
          "Whose text the lesson is taught on: the fraction of batches where the "
          "student writes its own answer and the teacher corrects THAT. This is "
@@ -428,26 +464,34 @@ def _training_facts(block):
 
 
 # The loss, written once, for the section and for the docstring above it.
-LOSS_FORMULA = ("JSD_beta(P || Q) = beta * KL(P || M) + (1 - beta) * KL(Q || M),"
-                "   M = beta * P + (1 - beta) * Q")
+LOSS_FORMULA = ("L = (1 - ce_alpha) * JSD_beta(P || Q) + ce_alpha * CE\n"
+                "JSD_beta(P || Q) = beta * KL(P || M) + (1 - beta) * KL(Q || M),"
+                "   M = beta * P + (1 - beta) * Q\n"
+                "CE = -log Q(y)   (y = the gold token)")
 
 
-def loss_note(beta):
+def loss_note(beta, ce_alpha=0.0):
     """The sentence under the formula, with the ceiling for THIS run's beta.
 
     Generalised JSD is bounded by the binary entropy of beta - ln 2 = 0.693 at
     0.5, 0.325 at 0.9 - which is the number that tells a reader whether a loss
     curve is high, since the same 0.4 is ordinary at one beta and impossible at
-    another.
+    another. The cross-entropy term is unbounded, so with ce_alpha > 0 the
+    ceiling applies to the JSD component alone, which the log prints as jsd=.
     """
     b = _number(beta, 0.5)
+    a = _number(ce_alpha, 0.0)
+    which = "the JSD part of one token's loss" if a > 0 else "one token's loss"
     if 0 < b < 1:
         bound = -(b * math.log(b) + (1 - b) * math.log(1 - b))
-        ceiling = (f"At beta {b:g} one token's loss is at most "
+        ceiling = (f"At beta {b:g} {which} is at most "
                    f"{bound:.3f} (the binary entropy of beta), so a running "
-                   f"loss near that is a student that has learned nothing yet.")
+                   f"jsd near that is a student that has learned nothing yet.")
     else:
-        ceiling = (f"At beta {b:g} the loss is a plain KL, which is unbounded.")
+        ceiling = (f"At beta {b:g} the divergence is a plain KL, which is unbounded.")
+    if a > 0:
+        ceiling += (" The cross-entropy term has no ceiling; it is the student's "
+                    "perplexity on the gold text, in nats.")
     return ("P is the teacher's next-token distribution, Q the student's, both "
             "after temperature scaling; averaged over completion tokens only. "
             + ceiling)
@@ -859,7 +903,7 @@ def _render_html(payload, facts, sections, summary):
             '<section><h2>How it was trained</h2>'
             f'<p>{esc(_training_summary(gkd))}</p>'
             f'<pre class="cmd">{esc(LOSS_FORMULA)}</pre>'
-            f'<p class="lede">{esc(loss_note(gkd.get("beta")))}</p>'
+            f'<p class="lede">{esc(loss_note(gkd.get("beta"), gkd.get("ce_alpha")))}</p>'
             + knobs
             + ('<dl class="trained">'
                + "".join(f"<dt>{esc(k)}</dt><dd>{esc(v)}</dd>" for k, v in trained)
@@ -943,7 +987,7 @@ def write_report(payload, path):
         if block:
             gkd = block.get("gkd") or {}
             out += ["", "## How it was trained", "", _training_summary(gkd), "",
-                    "```", LOSS_FORMULA, "```", "", loss_note(gkd.get("beta")), "",
+                    "```", LOSS_FORMULA, "```", "", loss_note(gkd.get("beta"), gkd.get("ce_alpha")), "",
                     "| Setting | Value | What it does | At this value |",
                     "|---|---|---|---|"]
             out += [f"| `{name}` | **{value}** | {what} | {now} |"

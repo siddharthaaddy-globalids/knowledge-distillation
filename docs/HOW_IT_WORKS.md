@@ -168,7 +168,7 @@ distill.sh / distill.ps1      bootstrapper: install uv, fetch pinned source, han
               └── GKDTrainer   the on-policy training step and the JSD loss
 ```
 
-## The loss: generalized Jensen–Shannon divergence
+## The loss: generalized Jensen–Shannon divergence plus cross-entropy
 
 Let `p_T` be the teacher's next-token distribution and `p_S` the student's, both
 after temperature scaling by `τ` (`gkd.temperature`, default 0.7). Define the
@@ -207,6 +207,27 @@ Temperature is applied to both sets of logits before the softmax. Below 1.0 it
 sharpens both distributions, concentrating the gradient signal on the tokens the
 teacher is actually confident about.
 
+### The cross-entropy term
+
+The divergence above is combined with the ordinary supervised loss on the gold
+token, `y_t`, weighted by `gkd.ce_alpha` (default 0.2):
+
+```
+L = (1 − α) · JSD_β(p_T ‖ p_S)  +  α · CE,        CE = −log p_S(y_t)
+```
+
+Both terms are averaged over the same completion positions and, under gradient
+accumulation, over the same global token count, so `α` is a real mixing weight:
+`0` is the pure divergence the papers train with, `1` is plain SFT with the
+teacher ignored. The CE is applied only where the labels are worth matching — the
+curriculum's own completions, or the teacher's under `seq_kd`. On an on-policy
+batch the labels are the student's own sample, and cross-entropy on those would
+teach the student whatever it already said, so that batch is scored by the JSD
+alone. The two components are logged separately as `jsd` and `ce`.
+
+This lives in `kd.train.HybridGKDTrainer`, a thin subclass of TRL's `GKDTrainer`
+that adds the CE on top of the parent's `compute_loss`.
+
 ## The training step
 
 Per optimizer step, `GKDTrainer.training_step` does:
@@ -222,7 +243,9 @@ elif seq_kd:                            # SEQUENCE-KD branch
 
 student forward   -> student_logits     (with grad)
 teacher forward   -> teacher_logits     (no grad, frozen, eval mode)
-loss = generalized_jsd(student_logits, teacher_logits, labels, beta, temperature)
+jsd  = generalized_jsd(student_logits, teacher_logits, labels, beta, temperature)
+ce   = cross_entropy(student_logits, labels)      # skipped on the ON-POLICY branch
+loss = (1 - ce_alpha) * jsd + ce_alpha * ce
 backward -> LoRA parameters only
 ```
 
@@ -423,11 +446,12 @@ weights' dtype instead of by the Trainer. `dataloader_pin_memory` is CUDA-only.
 `ScaledDistillationCallback` prints one line per optimizer step:
 
 ```
- [step  142/300] jsd=1.8241 run20=1.9033 grad=0.4417 lr=2.31e-04  12.4s/step  eta=32m18s
+ [step  142/300] loss=1.8241 jsd=0.2911 ce=7.9561 run20=1.9033 grad=0.4417 lr=2.31e-04  12.4s/step  eta=32m18s
 ```
 
-* `jsd` — this step's loss; `run20` — mean over the last 20 steps, which is what to
-  watch, since single-step JSD is noisy under on-policy sampling.
+* `loss` — this step's loss; `jsd` and `ce` — its two components, printed when
+  `gkd.ce_alpha` is above 0; `run20` — mean of `loss` over the last 20 steps, which
+  is what to watch, since a single step is noisy under on-policy sampling.
 * `grad` — gradient norm before clipping at `max_grad_norm`.
 * Held-out loss is printed at every eval (`eval_steps = save_steps`); it is the
   generalization signal, as training loss alone can improve while the model

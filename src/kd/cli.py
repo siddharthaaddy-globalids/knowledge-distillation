@@ -49,6 +49,8 @@ SUGAR = [
     ("--lora-r", "lora.r", int, "LoRA rank"),
     ("--lora-alpha", "lora.alpha", int, "LoRA alpha"),
     ("--lmbda", "gkd.lmbda", float, "On-policy fraction, 0.0-1.0"),
+    ("--ce-alpha", "gkd.ce_alpha", float,
+     "Cross-entropy weight in the loss, 0.0-1.0 (0 = pure JSD)"),
     ("--seed", "project.seed", int, "Random seed"),
     ("--output", "project.output_dir", str,
      "Pin the run directory instead of generating one under project.runs_dir"),

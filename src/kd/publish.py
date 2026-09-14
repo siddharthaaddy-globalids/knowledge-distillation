@@ -74,7 +74,7 @@ print(tok.decode(model.generate(inputs, max_new_tokens=128)[0]))
 | Student (base) | `{base}` |
 | Teacher | `{teacher}` |
 | Dataset | `{dataset}` |
-| Method | GKD (on-policy, JSD loss) |
+| Method | GKD (on-policy, JSD + cross-entropy loss) |
 | LoRA rank / alpha | {r} / {alpha} |
 | Target modules | {targets} |
 {extra_rows}
@@ -120,7 +120,7 @@ print(tok.decode(model.generate(inputs, max_new_tokens=128)[0]))
 | Student (base) | `{base}` |
 | Teacher | `{teacher}` |
 | Dataset | `{dataset}` |
-| Method | GKD (on-policy, JSD loss) |
+| Method | GKD (on-policy, JSD + cross-entropy loss) |
 | LoRA rank / alpha | {r} / {alpha} |
 | Target modules | {targets} |
 {extra_rows}
@@ -196,6 +196,7 @@ def load_provenance(config_path, adapter_dir):
                                      * t.get("gradient_accumulation_steps", 1))),
                 ("Learning rate", t.get("learning_rate")),
                 ("GKD lmbda / beta", f"{g.get('lmbda')} / {g.get('beta')}"),
+                ("CE weight (ce_alpha)", g.get("ce_alpha", 0.0)),
             ]
         except Exception as exc:
             print(f" !! could not read {config_path}: {exc}")

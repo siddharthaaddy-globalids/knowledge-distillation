@@ -135,7 +135,7 @@ dataset:
       pool: 20
 
 lora:
-  # r and alpha are inherited from _base.yaml (64 / 128).
+  # r and alpha are inherited from _base.yaml (128 / 256).
   # Qwen2.5 is a standard dense transformer, so the plain Llama-style list
   # reaches every layer.
   target_modules:

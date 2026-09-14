@@ -50,7 +50,7 @@ actually type: `--set training.learning_rate=1e-5` works, even though YAML 1.1
 itself requires `1.0e-05`.
 
 Short flags exist for the common ones — `--teacher`, `--student`, `--steps`,
-`--device`, `--dtype`, `--lr`, `--lora-r`, `--lora-alpha`, `--lmbda`, `--dataset`,
+`--device`, `--dtype`, `--lr`, `--lora-r`, `--lora-alpha`, `--lmbda`, `--ce-alpha`, `--dataset`,
 `--seed`, `--output` — and beat `--set`.
 
 ## Typos are errors
@@ -176,8 +176,8 @@ suppresses all three, for a `--limit` smoke check.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `r` | `32` | Rank. Lower is faster and smaller, at some cost in capacity. |
-| `alpha` | `64` | Scaling, conventionally `2 * r`. |
+| `r` | `128` | Rank. The one LoRA-specific distillation recipe (Thinking Machines, 2025) used 128. Lower is faster and smaller, at some cost in capacity. |
+| `alpha` | `256` | Scaling, conventionally `2 * r`. |
 | `dropout` | `0.05` | |
 | `target_modules` | 7 Llama-style projections | A list of suffixes, or a single regex string. **Check this against your architecture** — Qwen3.5 is hybrid, and a Llama-style list misses the attention in 18 of its 24 layers. |
 | `exclude_modules` | *(unset)* | Optional; same forms. |
@@ -205,6 +205,7 @@ suppresses all three, for a `--limit` smoke check.
 |---|---|---|
 | `lmbda` | `0.5` | **The dominant cost.** The fraction of batches where the student generates its own completion before the teacher scores it — that is `max_new_tokens` sequential forward passes versus one. `0.0` is plain off-policy KD: several times faster, but it loses the on-policy correction that makes GKD better. |
 | `beta` | `0.9` | Generalized JSD interpolation: `0` is forward KL (cover everything the teacher considers possible), `1` is reverse KL (commit to the teacher's modes). The papers favour reverse-leaning values (`0.9`) for a student much smaller than its teacher and for instruction-shaped data. |
+| `ce_alpha` | `0.2` | Cross-entropy weight: the loss is `(1 - ce_alpha) * JSD + ce_alpha * CE`, with CE the ordinary SFT term on the gold token. `0` is the pure divergence the papers train with; `1` is SFT with the teacher ignored. Applied only to gold text (curriculum or `seq_kd` teacher completions), never to the student's own on-policy rollouts. |
 | `temperature` | `1.0` | Sampling temperature for the student's own completions; inert at `lmbda: 0`. The on-policy recipes all use `1.0`. |
 | `max_new_tokens` | `40` | Second-biggest lever: generation cost is linear in this. Inert at `lmbda: 0`. |
 | `seq_kd` | `false` | `true` has the teacher rewrite each completion before the student trains on it. Never beats on-policy data in the literature and costs a teacher generation per sample. |

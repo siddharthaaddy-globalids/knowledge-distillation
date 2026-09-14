@@ -70,6 +70,7 @@ ENV_OVERRIDES = {
     "KD_LORA_ALPHA": ("lora.alpha", int),
     "KD_LMBDA": ("gkd.lmbda", float),
     "KD_BETA": ("gkd.beta", float),
+    "KD_CE_ALPHA": ("gkd.ce_alpha", float),
     "KD_MAX_NEW_TOKENS": ("gkd.max_new_tokens", int),
     "KD_SEED": ("project.seed", int),
     "KD_EVAL_TASKS": ("evaluation.tasks", str),

@@ -27,6 +27,7 @@ import os
 import time
 
 import torch
+import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 
@@ -35,6 +36,77 @@ from .teacher import load_teacher, verify_teacher
 
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 from trl.experimental.gkd import GKDConfig, GKDTrainer  # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# The loss: generalized JSD plus cross-entropy on the gold tokens
+# --------------------------------------------------------------------------- #
+class HybridGKDTrainer(GKDTrainer):
+    """GKDTrainer whose loss is (1 - a) * JSD_beta + a * CE, a = gkd.ce_alpha.
+
+    JSD_beta is TRL's generalized Jensen-Shannon divergence between the teacher's
+    and the student's next-token distributions. CE is the ordinary supervised
+    term, -log p_S(y_t) on the label tokens - the SFT loss. Both are averaged over
+    the same completion positions (labels != -100) and, under gradient
+    accumulation, over the same global token count, so the two terms are on one
+    scale and `ce_alpha` is a genuine mixing weight.
+
+    The CE term is applied only where the labels are worth matching: the
+    curriculum's own completions, or the teacher's when seq_kd is on. On an
+    on-policy batch the labels are the student's own sample, and cross-entropy on
+    those would teach the student whatever it already said - so there the batch
+    is scored by the JSD alone. At ce_alpha 0 this class is GKDTrainer exactly.
+    """
+
+    def __init__(self, *args, ce_alpha=0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ce_alpha = float(ce_alpha)
+        if not 0.0 <= self.ce_alpha <= 1.0:
+            raise ValueError(f"gkd.ce_alpha must be in [0, 1], got {self.ce_alpha}")
+        if self.ce_alpha > 0 and self.use_liger_gkd_loss:
+            # The fused Liger path never materialises the logits the CE needs.
+            raise ValueError("gkd.ce_alpha > 0 is not supported with use_liger_kernel")
+        self._student_wrote_batch = False
+
+    def generate_on_policy_outputs(self, model, inputs, generation_config):
+        # TRL calls this for both rollout kinds: the student's (on-policy) and the
+        # teacher's (seq_kd). Only the former disqualifies the batch from the CE.
+        teacher = self.teacher_model
+        self._student_wrote_batch = not (
+            model is teacher or model is self.accelerator.unwrap_model(teacher))
+        return super().generate_on_policy_outputs(model, inputs, generation_config)
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        self._student_wrote_batch = False
+        return super().training_step(model, inputs, num_items_in_batch)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        jsd, outputs = super().compute_loss(model, inputs, return_outputs=True,
+                                            num_items_in_batch=num_items_in_batch)
+        if self.ce_alpha <= 0 or self._student_wrote_batch:
+            return (jsd, outputs) if return_outputs else jsd
+
+        # Same causal shift and the same mask as generalized_jsd_loss: the logit at
+        # position i predicts token i + 1, and only completion tokens count.
+        logits = outputs.logits[:, :-1, :]
+        labels = inputs["labels"][:, 1:]
+        ce_sum = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1),
+                                 ignore_index=-100, reduction="sum")
+        if num_items_in_batch is not None:
+            denom = num_items_in_batch
+            if isinstance(denom, torch.Tensor):
+                denom = denom.to(ce_sum.device)
+        else:
+            denom = (labels != -100).sum().clamp_min(1)
+        ce = ce_sum / denom
+
+        loss = (1.0 - self.ce_alpha) * jsd + self.ce_alpha * ce
+        # Logged alongside `loss` so the two components can be watched separately;
+        # the training loop prints them as jsd= and ce=.
+        mode = "train" if self.model.training else "eval"
+        self._metrics[mode]["jsd"].append(float(jsd.detach()))
+        self._metrics[mode]["ce"].append(float(ce.detach()))
+        return (loss, outputs) if return_outputs else loss
 
 
 def resolve_tokenizer_source(config):
@@ -153,9 +225,12 @@ class TelemetryCallback(TrainerCallback):
         avg_step = (sum(self.step_times) / len(self.step_times)) if self.step_times else 0.0
         remaining = max(0, args.max_steps - state.global_step) * avg_step
 
+        # Present only when the loss has a cross-entropy term (gkd.ce_alpha > 0).
+        parts = "".join(f" {key}={_fmt(logs[key])}" for key in ("jsd", "ce") if key in logs)
+
         print(
             f" [step {state.global_step:>4}/{args.max_steps}] "
-            f"jsd={_fmt(loss)} run{self.window}={_fmt(running)} "
+            f"loss={_fmt(loss)}{parts} run{self.window}={_fmt(running)} "
             f"grad={_fmt(grad_norm)} lr={_fmt(lr, '.2e')} "
             f"{step_time:5.1f}s/step  eta={_fmt_eta(remaining)}"
         )
@@ -383,7 +458,8 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
     telemetry = TelemetryCallback(student_model, tokenizer, device, benchmark_prompts,
                                   eval_every=eval_every, run=run,
                                   sample_tokens=sample_tokens)
-    trainer = GKDTrainer(
+    trainer = HybridGKDTrainer(
+        ce_alpha=float(gkd_cfg.get("ce_alpha", 0.0)),
         model=student_model,
         teacher_model=teacher_model,
         args=training_args,
@@ -396,7 +472,8 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
 
     print(f"\n[Phase 5] Starting GKD training for {max_steps} steps "
           f"(cosine schedule, warmup {training_args.warmup_steps}, "
-          f"lr {training_args.learning_rate})...")
+          f"lr {training_args.learning_rate}, "
+          f"loss = {1 - trainer.ce_alpha:g}*JSD + {trainer.ce_alpha:g}*CE)...")
     started = time.time()
     result = trainer.train()
     elapsed = time.time() - started

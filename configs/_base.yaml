@@ -85,12 +85,12 @@ dataset:
       pool: 1500
 
 lora:
-  # Rank 64 with alpha at twice the rank. The one LoRA-specific on-policy
+  # Rank 128 with alpha at twice the rank: the one LoRA-specific on-policy
   # distillation recipe (Thinking Machines, 2025) used 128 and found LoRA then
-  # trails full fine-tuning by only 6%; 32 was on the small side. See
-  # docs/papers/README.md.
-  r: 64
-  alpha: 128
+  # trails full fine-tuning by only 6%. Halve both if a profile runs out of
+  # memory; 32 was on the small side. See docs/papers/README.md.
+  r: 128
+  alpha: 256
   dropout: 0.05
   target_modules:
     - q_proj
@@ -154,6 +154,16 @@ gkd:
   # is the reverse-leaning value GKD recommends when the student should stay
   # close to a reference, and the closest TRL offers to DistiLLM's skew KL.
   beta: 0.9
+  # Cross-entropy weight. The loss is (1 - ce_alpha) * JSD_beta + ce_alpha * CE,
+  # where CE is the ordinary SFT term, -log p_student(gold token). 0 is the
+  # pure divergence the GKD/DistiLLM papers train with; 1 is plain SFT with
+  # the teacher ignored. The CE only applies where the labels are gold - the
+  # curriculum's completions, or the teacher's under seq_kd - never to a
+  # student rollout, which would only reinforce whatever it already wrote.
+  # 0.2 keeps the teacher's distribution as the main signal and uses the
+  # gold tokens as an anchor, so a teacher that is soft or wrong on a row
+  # cannot pull the student off the curriculum's answer.
+  ce_alpha: 0.2
   # Sampling temperature for the student's own completions. 1.0 is the model's
   # own distribution, which is what every on-policy recipe trains at: lower
   # values only visit the student's confident paths, the ones least in need of

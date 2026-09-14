@@ -152,7 +152,7 @@ dataset:
       pool: 20
 
 lora:
-  # r and alpha are inherited from _base.yaml (64 / 128).
+  # r and alpha are inherited from _base.yaml (128 / 256).
   # Qwen3 is a standard dense transformer - no hybrid attention, no vision tower,
   # no MTP head - so the plain Llama-style projection list reaches every layer.
   target_modules:

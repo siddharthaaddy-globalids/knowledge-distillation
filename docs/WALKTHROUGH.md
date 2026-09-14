@@ -260,7 +260,7 @@ That runs all eight stages. While it goes you get a step line roughly once a
 second:
 
 ```
- [step  147/300] jsd=1.8342 run20=1.9011 grad=0.4127 lr=2.31e-04  15.2s/step  eta=38m
+ [step  147/300] loss=1.8342 jsd=0.2934 ce=7.9974 run20=1.9011 grad=0.4127 lr=2.31e-04  15.2s/step  eta=38m
 ```
 
 and benchmark generations every `training.benchmark_every` steps, so quality
