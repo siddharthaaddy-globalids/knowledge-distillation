@@ -370,10 +370,12 @@ def train(config, hardware, run, dry_run=False, allow_bad_teacher=False,
     ).to(device)
 
     # Before LoRA, because resizing after injection would leave the adapter
-    # attached to an lm_head of the wrong width.
+    # attached to an lm_head of the wrong width. Matched against the teacher
+    # as loaded rather than its config.json: a teacher assembled from base +
+    # adapter is as wide as the adapter made it.
     from . import paths
     paths.fit_vocab(student_model,
-                    paths.vocab_target(student_id, teacher_id, len(tokenizer)),
+                    paths.matched_width(student_model, teacher_model, len(tokenizer)),
                     label="student")
 
     # target_modules may be a list of suffixes (Llama-style models) or a single regex

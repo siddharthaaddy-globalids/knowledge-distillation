@@ -262,7 +262,7 @@ def score_teacher_base(base_id, teacher, teacher_id, tokenizer, samples, device,
     model = AutoModelForCausalLM.from_pretrained(
         base_id, dtype=dtype, low_cpu_mem_usage=True)
     try:
-        paths.fit_vocab(model, paths.vocab_target(base_id, teacher_id, len(tokenizer)),
+        paths.fit_vocab(model, paths.matched_width(model, teacher, len(tokenizer)),
                         label="teacher base")
     except ValueError as exc:
         print(f" !! {exc}")
@@ -699,13 +699,13 @@ def main(args=None):
     # distributions for the same position at the same time.
     phases = 5 if teacher_base_id else 4
     print(f"\n[1/{phases}] Loading teacher ({teacher_id})...")
-    teacher = AutoModelForCausalLM.from_pretrained(
-        teacher_id, dtype=dtype, low_cpu_mem_usage=True)
-    if teacher_adapter:
-        from peft import PeftModel as _Peft
-        print(f" -> merging teacher adapter: {teacher_adapter}")
-        teacher = _Peft.from_pretrained(teacher, teacher_adapter).merge_and_unload()
-    teacher = teacher.to(device).eval()
+    from .teacher import load_teacher
+
+    # The same loader training used, so an adapter that carries resized
+    # embeddings is attached to a base trimmed to match, here as there.
+    teacher, _info = load_teacher(teacher_id, teacher_adapter, dtype=dtype,
+                                  device=device)
+    teacher = teacher.eval()
 
     # One student instance serves as both columns: PEFT's disable_adapter() context
     # turns the LoRA branches off, which is the base student exactly. Loading a
@@ -714,13 +714,14 @@ def main(args=None):
     from peft import PeftModel
     student = AutoModelForCausalLM.from_pretrained(
         student_id, dtype=dtype, low_cpu_mem_usage=True)
-    # The same trim training applied, reproduced from the two configs. Without
-    # it PEFT meets an lm_head 271 rows wider than the adapter was built against
-    # and refuses the state dict on a shape mismatch.
+    # The same trim training applied: what the adapter recorded, else the
+    # teacher's width as loaded. Without it PEFT meets an lm_head 271 rows
+    # wider than the adapter was built against and refuses the state dict on
+    # a shape mismatch.
     from . import paths
-    paths.fit_vocab(student,
-                    paths.vocab_target(student_id, teacher_id, len(tokenizer)),
-                    label="student")
+    target = paths.adapter_meta(adapter_dir).get("vocab_size") or \
+        paths.matched_width(student, teacher, len(tokenizer))
+    paths.fit_vocab(student, target, label="student")
     student = PeftModel.from_pretrained(student, adapter_dir).to(device).eval()
 
     teacher_params = sum(p.numel() for p in teacher.parameters())

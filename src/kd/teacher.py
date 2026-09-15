@@ -112,6 +112,17 @@ def load_teacher(teacher_id, adapter=None, dtype=None, device="cpu", verbose=Tru
         teacher_id, dtype=dtype, low_cpu_mem_usage=True, output_loading_info=True)
     if adapter:
         from peft import PeftModel
+
+        from .paths import adapter_vocab_size, fit_vocab
+
+        # An adapter that carries resized embeddings only fits a base of the
+        # same width. Stock Qwen pads its vocabulary for alignment and a
+        # fine-tune that trimmed it saved the trimmed embeddings, so the base
+        # is trimmed to match first - lossless, since the rows removed are
+        # padding no token id indexes.
+        width = adapter_vocab_size(adapter)
+        if width:
+            fit_vocab(model, width, label="teacher")
         if verbose:
             print(f" -> merging teacher LoRA adapter: {adapter}")
         model = PeftModel.from_pretrained(model, adapter).merge_and_unload()

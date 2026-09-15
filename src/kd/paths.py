@@ -223,6 +223,55 @@ def vocab_target(student_id, teacher_id, tokenizer_length):
     return target
 
 
+def adapter_vocab_size(adapter_dir):
+    """Rows in the embedding an adapter saved with itself, or None if it saved none.
+
+    A fine-tune that resized its embeddings to the tokenizer's real size
+    (151665 for Qwen2.5, against the 151936 stock checkpoints pad to) has
+    PEFT save those embeddings inside the adapter. Attaching that adapter to
+    the stock base then fails on a shape mismatch - unless the base is first
+    trimmed to the same width, which this reads from the safetensors header
+    without loading a single tensor.
+    """
+    path = os.path.join(str(adapter_dir or ""), "adapter_model.safetensors")
+    if not os.path.isfile(path):
+        return None
+    try:
+        from safetensors import safe_open
+
+        with safe_open(path, "pt") as handle:
+            for key in handle.keys():
+                if key.endswith(("embed_tokens.weight", "lm_head.weight")):
+                    return int(handle.get_slice(key).get_shape()[0])
+    except Exception:
+        return None
+    return None
+
+
+def matched_width(model, reference, tokenizer_length):
+    """The width `model` must be trimmed to so its logits line up with `reference`'s.
+
+    The loaded-model counterpart of vocab_target, for the case config.json
+    cannot answer: a teacher assembled from base + adapter is as wide as the
+    adapter made it, whatever the base's config says. None when they already
+    agree; the narrower width when they differ by alignment padding; an error
+    when the narrower is below the tokenizer's real tokens, which is a genuine
+    vocabulary difference that no trim can bridge.
+    """
+    mine, theirs = int(model.config.vocab_size), int(reference.config.vocab_size)
+    if mine == theirs:
+        return None
+    target = min(mine, theirs)
+    if target < int(tokenizer_length):
+        raise ValueError(
+            f"the models have vocab_size {mine} and {theirs}, and the narrower is "
+            f"below the tokenizer's {tokenizer_length} real tokens.\n"
+            f"  That is a genuine vocabulary difference, not alignment padding, "
+            f"and standard GKD cannot bridge it.\n"
+            f"  Use a teacher and student from the same model family.")
+    return target
+
+
 def adapter_base(adapter_dir):
     """The base model an adapter was trained against, from its own config.
 

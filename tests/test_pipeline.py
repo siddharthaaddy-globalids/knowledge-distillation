@@ -951,6 +951,45 @@ def test_a_directory_of_checkpoints_resolves_to_the_newest(workspace):
     assert config["models"]["teacher"] == "Qwen/Qwen2.5-3B-Instruct"
 
 
+def test_an_adapter_says_how_wide_its_base_must_be(workspace):
+    """An adapter that saved resized embeddings names the width; one that did not, None."""
+    import torch
+    from safetensors.torch import save_file
+
+    from kd import paths
+
+    trimmed = _lora_at(os.path.join(workspace, "trimmed"))
+    save_file({"base_model.model.model.embed_tokens.weight": torch.zeros(151665, 4),
+               "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight":
+                   torch.zeros(8, 4)},
+              os.path.join(trimmed, "adapter_model.safetensors"))
+    assert paths.adapter_vocab_size(trimmed) == 151665
+
+    plain = _lora_at(os.path.join(workspace, "plain"))
+    save_file({"base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight":
+                   torch.zeros(8, 4)},
+              os.path.join(plain, "adapter_model.safetensors"))
+    assert paths.adapter_vocab_size(plain) is None
+    assert paths.adapter_vocab_size(os.path.join(workspace, "nowhere")) is None
+
+
+def test_matched_width_follows_the_loaded_models(workspace):
+    from types import SimpleNamespace
+
+    from kd import paths
+
+    model = lambda width: SimpleNamespace(config=SimpleNamespace(vocab_size=width))
+    assert paths.matched_width(model(151936), model(151665), 151665) == 151665
+    assert paths.matched_width(model(151665), model(151936), 151665) == 151665
+    assert paths.matched_width(model(151936), model(151936), 151665) is None
+    try:
+        paths.matched_width(model(151936), model(120000), 151665)
+    except ValueError as exc:
+        assert "genuine vocabulary difference" in str(exc), exc
+    else:
+        raise AssertionError("a real vocabulary mismatch was accepted")
+
+
 def test_a_named_teacher_base_beats_what_the_adapter_records(workspace):
     from kd import paths
 
