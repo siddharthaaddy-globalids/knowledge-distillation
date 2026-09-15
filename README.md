@@ -198,6 +198,7 @@ Full key-by-key reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 | `configs/enlibra/enlibraQ25-3B.yaml` | The SFT teacher (Qwen2.5-3B) → Qwen2.5-1.5B. ~8.6 GB of weights, so a 16 GB GPU is enough. Start here. |
 | `configs/enlibra/enlibraQ25-3B-sftonly.yaml` | The same run without the rl rows: what those rows are worth is the difference between the two scores. |
 | `configs/enlibra/enlibraQ25-3B-smoke.yaml` | The same **real** pair on a laptop, training on a small slice of the corpus, evaluation included. |
+| `configs/enlibra/enlibraQ25-3B-lora-smoke.yaml` | The smoke run again, with the teacher named as the SFT run's **LoRA adapter** in S3 rather than a merged checkpoint. Proves the adapter-as-teacher route: fetch, find the base, merge, check, train, score four players. |
 | `configs/enlibra/enlibraQ25-flow.yaml` | Qwen2.5-1.5B → 0.5B, both from the Hub. 3.8 GB, minutes, no S3 download — proves every stage, evaluation included. |
 | `configs/enlibra/enlibraQ3-8B.yaml` | An RL-tuned Qwen3-8B → Qwen3-1.7B on the enLibra space curriculum. Needs a 48 GB GPU. |
 | `configs/enlibra/enlibraQ3-8B-smoke.yaml` | The same run with stand-in models, small enough for a 16 GB laptop. Two steps — proves the plumbing. |

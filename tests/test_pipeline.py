@@ -933,6 +933,24 @@ def test_a_teacher_that_is_an_adapter_is_split_into_base_and_adapter(workspace):
     assert paths.normalise_teacher(config) is None
 
 
+def test_a_directory_of_checkpoints_resolves_to_the_newest(workspace):
+    """sft_checkpoints/ holding checkpoint-N/ means the finished fine-tune."""
+    from kd import paths
+
+    config = make_config(workspace)
+    root = os.path.join(workspace, "sft_checkpoints")
+    for step in (100, 300, 200):
+        _lora_at(os.path.join(root, f"checkpoint-{step}"))
+    os.makedirs(os.path.join(root, "checkpoint-999"))          # no adapter inside
+    with open(os.path.join(root, "trainer_state.json"), "w") as fh:
+        fh.write("{}")
+    config["models"].update(teacher=root, teacher_adapter=None, teacher_base=None)
+    split = paths.normalise_teacher(config)
+    assert split["adapter"].endswith("checkpoint-300"), split
+    assert config["models"]["teacher_adapter"].endswith("checkpoint-300")
+    assert config["models"]["teacher"] == "Qwen/Qwen2.5-3B-Instruct"
+
+
 def test_a_named_teacher_base_beats_what_the_adapter_records(workspace):
     from kd import paths
 

@@ -291,6 +291,28 @@ def is_adapter_dir(where):
     return bool(where) and os.path.isfile(os.path.join(str(where), "adapter_config.json"))
 
 
+def newest_checkpoint(where):
+    """The latest adapter inside a directory of trainer checkpoints, or None.
+
+    A fine-tune's output prefix often holds checkpoint-100/, checkpoint-200/,
+    ... rather than the adapter itself, each one a complete PEFT adapter plus
+    optimizer state. Pointing models.teacher at that prefix means "the
+    finished fine-tune", which is the highest-numbered checkpoint; naming a
+    specific checkpoint-N/ instead is always allowed and downloads less.
+    """
+    import glob
+    import re
+
+    found = []
+    for path in glob.glob(os.path.join(str(where), "checkpoint-*")):
+        match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(path))
+        if match and is_adapter_dir(path):
+            found.append((int(match.group(1)), path))
+    if not found:
+        return None
+    return max(found)[1]
+
+
 def hub_adapter_base(repo_id):
     """The base a Hub-hosted PEFT adapter names, or None if it is not one.
 
@@ -367,11 +389,18 @@ def normalise_teacher(config, log=None):
     recorded = None
     if os.path.isdir(str(teacher)):
         if not is_adapter_dir(teacher):
-            # An MLX/unsloth adapter directory has no adapter_config.json in
-            # the PEFT sense but does hold adapters.safetensors; it is still an
-            # adapter and ensure_peft_adapter converts it once it is named as
-            # one. A directory with neither is a model directory.
-            if not os.path.isfile(os.path.join(str(teacher), "adapters.safetensors")):
+            # A directory of trainer checkpoints: the newest one is the
+            # fine-tune. Then MLX/unsloth, which has no adapter_config.json in
+            # the PEFT sense but does hold adapters.safetensors - still an
+            # adapter, converted once it is named as one. A directory with
+            # none of these is a model directory.
+            checkpoint = newest_checkpoint(teacher)
+            if checkpoint:
+                if log:
+                    log.info(f"      models.teacher holds trainer checkpoints; "
+                             f"using the newest, {os.path.basename(checkpoint)}")
+                teacher = checkpoint
+            elif not os.path.isfile(os.path.join(str(teacher), "adapters.safetensors")):
                 return None
         recorded = adapter_base(teacher)
     else:

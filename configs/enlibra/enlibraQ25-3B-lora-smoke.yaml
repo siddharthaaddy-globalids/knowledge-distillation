@@ -1,0 +1,63 @@
+# ===========================================================================
+#  enLibra: the SFT teacher AS A LORA ADAPTER -> Qwen2.5-1.5B, on a Mac mini
+#
+#    ./run.sh --config configs/enlibra/enlibraQ25-3B-lora-smoke.yaml
+#
+#  The same rehearsal as configs/enlibra/enlibraQ25-3B-smoke.yaml - a small
+#  slice of the corpus, four steps, four held-out questions, everything else
+#  inherited - with one thing changed: the teacher is named as the adapter the
+#  SFT run wrote, not as a merged checkpoint. What this profile proves is that
+#  route: fetch the adapter from S3, work out its base, merge, check, train,
+#  score four players, upload.
+#
+#  HOW THE TEACHER IS PUT TOGETHER
+#  -------------------------------
+#  models.teacher below points at the SFT run's checkpoint prefix. Preflight
+#  fetches it, and then:
+#
+#    * if the prefix holds checkpoint-N/ directories, the highest-numbered one
+#      is the fine-tune and is used (the log says which);
+#    * the adapter's own adapter_config.json records the base it was trained
+#      on, and models.teacher_base below says the same thing in a form that
+#      exists on this machine - a training box usually records a local path;
+#    * the config is rewritten to base + adapter, the adapter is merged into
+#      Qwen2.5-3B-Instruct at load time, and the teacher-check stage verifies
+#      the result before anything is spent.
+#
+#  Because the teacher is base + adapter, the evaluation knows the base and
+#  scores it as the fourth player, `teacher-base`: how far the SFT moved the
+#  stock model is the most there was to distil.
+#
+#  MEMORY
+#  ------
+#  Same as the merged-teacher smoke: a 3B teacher and a 1.5B student, ~8.6 GB
+#  of bfloat16 weights resident together, over the comfortable budget of a
+#  16 GB Mac. Expect swapping; it is a shape test. The teacher-base column adds
+#  a second pass holding two 3B models (~12 GB) - drop it on 16 GB:
+#
+#      ./run.sh --config configs/enlibra/enlibraQ25-3B-lora-smoke.yaml \
+#          --set 'evaluation.players=[base, distilled, teacher]'
+#
+#  WHAT IS DOWNLOADED
+#  ------------------
+#  The whole prefix, once, into s3.cache_dir. If it holds several checkpoints
+#  with optimizer state, that is more than the adapter alone; point
+#  models.teacher at one checkpoint-N/ to fetch just that one.
+# ===========================================================================
+extends: enlibraQ25-3B-smoke.yaml
+
+project:
+  name: enlibra-q25-sft-lora-smoke
+
+models:
+  # The SFT run's adapter, not its merged export. Fetched by preflight, which
+  # then recognises it as a LoRA adapter and splits it into base + adapter.
+  teacher: s3://enlibra/dss/dev/runs/9eb5db9e-efe4-4c8d-9f6d-3adf665a44b9/outputs/sft_checkpoints/
+  # Not needed, and must stay null: naming it here would make preflight treat
+  # `teacher` above as the base rather than as the adapter it is.
+  teacher_adapter: null
+  # The base the SFT started from. This wins over whatever path the adapter
+  # recorded on the machine that trained it, and it is also the `teacher-base`
+  # player. It must be the checkpoint the adapter was actually trained on -
+  # the instruct model, not the base - or the merge is silently wrong.
+  teacher_base: Qwen/Qwen2.5-3B-Instruct
