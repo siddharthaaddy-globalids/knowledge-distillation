@@ -3,7 +3,7 @@
 # minutes. Tiny pools, 2 steps, no real convergence. Used by CI and by anyone
 # checking that a machine can run this at all before committing a real budget.
 #
-#   kd pipeline --config configs/smoke.yaml
+#   kd pipeline --config configs/smollm/smoke.yaml
 #
 # The teacher-check stage still runs, because a smoke test that skips the one
 # check that catches a broken teacher is not testing the thing most likely to
@@ -44,6 +44,9 @@ gkd:
   max_new_tokens: 16
 
 evaluation:
+  # Scored inside the run: a smoke test that skips the evaluation is not
+  # testing the stages most likely to break.
+  after_training: true
   samples: 8
 
 limits:

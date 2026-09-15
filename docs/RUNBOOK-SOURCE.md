@@ -41,32 +41,38 @@ uv sync
 uv run kd doctor
 
 # 3. Resolve the config and hardware without running anything
-uv run kd check --config configs/smoke.yaml
+uv run kd check --config configs/smollm/smoke.yaml
 
 # 4. The whole pipeline, end to end (~2 minutes)
-uv run kd pipeline --config configs/smoke.yaml
+uv run kd pipeline --config configs/smollm/smoke.yaml
 ```
 
-`configs/smoke.yaml` distils SmolLM2-360M into SmolLM2-135M for two steps. It is
+`configs/smollm/smoke.yaml` distils SmolLM2-360M into SmolLM2-135M for two steps. It is
 deliberately too short to learn anything — its job is to prove every stage runs
 on your hardware.
 
 A successful run looks like this:
 
 ```
-[1/8] preflight            OK       0s
-[2/8] teacher-check        OK      22s
-[3/8] smoke                OK      51s
+[1/7] preflight            OK       0s
+[2/7] teacher-check        OK      22s
+[3/7] smoke                OK      51s
       5.13 s/step measured -> 2 steps is about 10s
-[4/8] train                OK      36s
-[5/8] evaluate             OK      22s
-[6/8] report               OK       0s
-[7/8] publish              skipped - publish.enabled is false
-[8/8] upload               skipped - s3.enabled is false
+[4/7] train                OK      36s
+[5/7] evaluation           ...
+      evaluation smoke-2026-09-08-1523 -> runs/smoke-2026-09-08-1522/evaluation/smoke-2026-09-08-1523
+      [1/4] preflight      OK       0s
+      [2/4] evaluate       OK      22s
+      [3/4] arena          skipped - evaluation.arena_file is not set
+      [4/4] report         OK       0s
+[5/7] evaluation           OK      23s
+[6/7] publish              skipped - publish.enabled is false
+[7/7] upload               skipped - s3.enabled is false
 
   run bundle : runs/smoke-2026-09-08-1522
   adapter    : runs/smoke-2026-09-08-1522/final_adapter
-  report     : runs/smoke-2026-09-08-1522/report.html
+  evaluation : runs/smoke-2026-09-08-1522/evaluation/smoke-2026-09-08-1523
+  report     : runs/smoke-2026-09-08-1522/evaluation/smoke-2026-09-08-1523/report.html
 ```
 
 Open that `report.html` in a browser. It leads with one number — **how close
@@ -84,7 +90,8 @@ S3, and gives the one command that re-runs just the evaluation against it.
 | `kd check` | Resolve config and hardware, print, run nothing. Instant. |
 | `kd doctor` | Device, package versions, which optional features and credentials are present. |
 | `kd train` | Just training, no gates. |
-| `kd evaluate` | Score an adapter against the teacher. |
+| `kd eval` | Score an adapter: evaluate, arena, report, upload, into the adapter's own bundle. |
+| `kd evaluate` | The fidelity measurement alone, standalone. |
 | `kd check-teacher` | Is this teacher fit to distil from? Loads only the teacher. |
 | `kd fix-teacher` | Repair a checkpoint whose tensor names do not match its architecture. |
 | `kd convert-adapter` | MLX / unsloth LoRA into PEFT format. |
@@ -104,17 +111,34 @@ failed gate.
 
 | # | Stage | Gate | |
 |---|---|---|---|
-| 01 | `preflight` | ✓ | Resolve config and hardware; fetch any `s3://` inputs. Seconds, so a bad bucket or a typo fails immediately. |
+| 01 | `preflight` | ✓ | Resolve config and hardware; fetch any `s3://` inputs; split a teacher given as a LoRA adapter into base + adapter. Seconds, so a bad bucket or a typo fails immediately. |
 | 02 | `teacher-check` | ✓ | Loads *only* the teacher: randomly-initialised weights, NaN scan, is the output actually language. |
 | 03 | `smoke` | ✓ | Two real steps. Measures seconds-per-step and projects the full run against your limits. |
 | 04 | `train` | ✓ | The run itself, under the time and cost ceilings. |
-| 05 | `evaluate` | | Fidelity and capability, measured against the untrained base student. |
-| 06 | `report` | | A readable `report.html` in the run bundle. |
-| 07 | `publish` | | To the Hugging Face Hub. Skipped unless switched on. |
-| 08 | `upload` | | To S3. Skipped unless switched on — and runs even after a failure, so the logs survive. |
+| 05 | `evaluation` | | The whole evaluation pipeline, inside the run. **Off by default** — `evaluation.after_training: true` turns it on; the smoke profile has it on. |
+| 06 | `publish` | | To the Hugging Face Hub. Skipped unless switched on. |
+| 07 | `upload` | | To S3. Skipped unless switched on — and runs even after a failure, so the logs survive. |
 
 A **gate** stage that fails aborts the run. A non-gate stage that fails is
 reported and the run continues, so a broken report never destroys a good adapter.
+
+Evaluation is a pipeline of its own, `kd eval`, run against an adapter that
+already exists — this checkout's newest, or one named with `--adapter` by path
+or `s3://` URI. It walks `preflight → evaluate → arena → report → upload` and
+writes into the adapter's bundle under `evaluation/<name>-<date>-<time>/`, on
+disk and in the bucket, so one adapter can be scored any number of times:
+
+| Stage | Gate | |
+|---|---|---|
+| `preflight` | ✓ | Fetch the teacher and the adapter; check the players; say where the results go. |
+| `evaluate` | | Fidelity and capability, token by token, against the teacher. |
+| `arena` | | Accuracy and Elo on the answer key. Skipped unless `evaluation.arena_file`. |
+| `report` | | A readable `report.html` in the evaluation directory. |
+| `upload` | | To `<bundle>/evaluation/<id>/` in the bucket. Skipped unless `s3.enabled`. |
+
+Four players: the **base** student, the **distilled** student, the
+**teacher-base** (the stock model the teacher was fine-tuned from) and the
+**teacher**.
 
 ### Why the first two gates exist
 
@@ -128,13 +152,17 @@ mistake.
 ### Running part of it
 
 ```bash
-uv run kd pipeline --config configs/finance.yaml --only train
-uv run kd pipeline --config configs/finance.yaml --from evaluate
-uv run kd pipeline --config configs/finance.yaml --skip smoke
+uv run kd pipeline --config configs/qwen/finance.yaml --only train
+uv run kd pipeline --config configs/qwen/finance.yaml --skip smoke
+uv run kd eval --config configs/qwen/finance.yaml                 # score the newest adapter
+uv run kd eval --config configs/qwen/finance.yaml --from report   # re-render the last scoring
 ```
 
-`--from` and `--only` open a new run directory but pick up the newest previous
-run's adapter or evaluation, so you can re-report without retraining.
+Training and evaluation are separate pipelines. `kd pipeline` ends with the
+adapter (and, with `s3.enabled`, its upload); `kd eval` scores an adapter into
+that adapter's own bundle under `evaluation/<name>-<date>/`. `--from` and
+`--only` on either pick up the newest previous output, so you can re-report
+without retraining or rescoring.
 
 ### Exit codes
 
@@ -159,7 +187,7 @@ run's adapter or evaluation, so you can re-report without retraining.
 | `qwen-poc` | Qwen3.5-2B → 0.8B | Stock models. A known-good pairing for proving the pipeline. |
 
 ```bash
-uv run kd pipeline --config configs/finance.yaml
+uv run kd pipeline --config configs/qwen/finance.yaml
 ```
 
 ### Overriding without editing anything
@@ -167,7 +195,7 @@ uv run kd pipeline --config configs/finance.yaml
 `--set` reaches *any* key by dotted path and is repeatable:
 
 ```bash
-uv run kd pipeline --config configs/finance.yaml \
+uv run kd pipeline --config configs/qwen/finance.yaml \
   --set training.max_steps=500 \
   --set hardware.dtype=bfloat16 \
   --set gkd.lmbda=0.25 \
@@ -248,11 +276,11 @@ Two settings, and they do different things:
 ```bash
 # A parent directory. Each run still gets its own <timestamp>-<profile>-<sha>
 # subdirectory inside it, so runs never overwrite each other.
-uv run kd pipeline --config configs/finance.yaml   --set project.runs_dir=/data/kd-runs
+uv run kd pipeline --config configs/qwen/finance.yaml   --set project.runs_dir=/data/kd-runs
 
 # The run directory itself, pinned. The adapter lands at
 # /data/finance-adapter/final_adapter, at a path you can predict and script.
-uv run kd pipeline --config configs/finance.yaml --output /data/finance-adapter
+uv run kd pipeline --config configs/qwen/finance.yaml --output /data/finance-adapter
 ```
 
 `--output` is shorthand for `--set project.output_dir`. Because it pins the exact
@@ -299,12 +327,12 @@ free-running generations with BERTScore.
 ```bash
 uv sync --extra eval
 
-uv run kd evaluate --config configs/finance.yaml \
+uv run kd evaluate --config configs/qwen/finance.yaml \
   --tasks ifeval --limit 100 \
   --gen-similarity 20
 ```
 
-Slow — it scores three models. Start with `--limit`.
+Slow — it scores every player. Start with `--limit`.
 
 ### Hugging Face Hub — *off: `publish.enabled: false`*
 
@@ -314,7 +342,7 @@ Publishes the adapter to `<repo>-lora` and a merged, ready-to-run model to
 ```bash
 export HF_TOKEN=...
 
-uv run kd pipeline --config configs/finance.yaml \
+uv run kd pipeline --config configs/qwen/finance.yaml \
   --set publish.enabled=true \
   --set publish.repo=my-org/qwen-finance
 ```
@@ -331,7 +359,7 @@ uv sync --extra remote
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 
-uv run kd pipeline --config configs/finance.yaml \
+uv run kd pipeline --config configs/qwen/finance.yaml \
   --set s3.enabled=true \
   --set s3.bucket=my-bucket
 ```
@@ -348,7 +376,7 @@ uv sync --extra remote
 export RUNPOD_API_KEY=...
 
 # rents nothing - just checks auth and reads the catalogue
-uv run kd runpod gpus --config configs/finance.yaml \
+uv run kd runpod gpus --config configs/qwen/finance.yaml \
   --set runpod.enabled=true
 ```
 
@@ -378,7 +406,7 @@ Rather than repeating `--set` flags, write a profile that extends your training
 config:
 
 ```yaml
-# configs/finance-pod.yaml
+# configs/qwen/finance-pod.yaml
 extends: finance.yaml
 
 runpod:
@@ -395,7 +423,7 @@ limits:
 ```
 
 ```bash
-uv run kd runpod launch --config configs/finance-pod.yaml
+uv run kd runpod launch --config configs/qwen/finance-pod.yaml
 ```
 
 > **Secrets never go in a config file.** The YAML names the *variable* —
@@ -430,7 +458,7 @@ four to six minutes of *paid* GPU time on every run, and pins the exact
 environment a result came from.
 
 ```bash
-uv run kd runpod launch --config configs/finance.yaml   --set runpod.enabled=true   --set runpod.image=ghcr.io/<org>/kd:abc1234   --set s3.enabled=true --set s3.bucket=my-bucket   --set limits.max_cost_usd=2.00
+uv run kd runpod launch --config configs/qwen/finance.yaml   --set runpod.enabled=true   --set runpod.image=ghcr.io/<org>/kd:abc1234   --set s3.enabled=true --set s3.bucket=my-bucket   --set limits.max_cost_usd=2.00
 ```
 
 ### What happens when a GPU is unavailable
@@ -520,7 +548,7 @@ transformers built for it — common in merged exports from MLX or unsloth.
 `from_pretrained` does not raise; it randomly initialises what it could not map.
 
 ```bash
-uv run kd fix-teacher --config configs/finance.yaml   # rename, no retraining
+uv run kd fix-teacher --config configs/qwen/finance.yaml   # rename, no retraining
 uv run kd check-teacher --teacher ./teacher-fixed
 ```
 

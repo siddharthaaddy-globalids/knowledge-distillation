@@ -26,6 +26,7 @@ failed = []
 def check(name, fn):
     workspace = tempfile.mkdtemp(prefix="kd-test-")
     saved = dict(pipeline.STAGES)
+    saved_eval = dict(pipeline.EVAL_STAGES)
     try:
         fn(workspace)
     except AssertionError as exc:
@@ -37,17 +38,19 @@ def check(name, fn):
     finally:
         pipeline.STAGES.clear()
         pipeline.STAGES.update(saved)
+        pipeline.EVAL_STAGES.clear()
+        pipeline.EVAL_STAGES.update(saved_eval)
         shutil.rmtree(workspace, ignore_errors=True)
 
 
 def make_config(workspace, **overrides):
-    config = kdc.load_config(os.path.join(CONFIGS, "smoke.yaml"), use_env=False,
+    config = kdc.load_config(os.path.join(CONFIGS, "smollm", "smoke.yaml"), use_env=False,
                              set_overrides=overrides or None)
     config["project"]["runs_dir"] = os.path.join(workspace, "runs")
     return config
 
 
-def fake_stages(record, failing=None, raising=None):
+def fake_stages(record, failing=None, raising=None, table=None, names=None):
     """Replace every stage with one that records that it ran."""
     def make(name):
         def stage(ctx):
@@ -58,10 +61,17 @@ def fake_stages(record, failing=None, raising=None):
                 raise pipeline.StageFailed(f"{name} was told to fail")
             return {}
         return stage
-    pipeline.STAGES.clear()
-    pipeline.STAGES.update({name: make(name) for name in
-                            ["preflight", "teacher-check", "smoke", "train",
-                             "evaluate", "report", "publish", "upload"]})
+    table = pipeline.STAGES if table is None else table
+    names = names or ["preflight", "teacher-check", "smoke", "train",
+                      "evaluation", "publish", "upload"]
+    table.clear()
+    table.update({name: make(name) for name in names})
+
+
+def fake_eval_stages(record, **kwargs):
+    """The evaluation table, faked the same way."""
+    fake_stages(record, table=pipeline.EVAL_STAGES,
+                names=["preflight", "evaluate", "arena", "report", "upload"], **kwargs)
 
 
 def run_with(workspace, record, **kwargs):
@@ -83,20 +93,35 @@ def stages_in_manifest(run_dir):
 def test_default_plan_is_the_config_order(workspace):
     plan = [name for name, _ in pipeline.planned_stages(make_config(workspace))]
     assert plan == ["preflight", "teacher-check", "smoke", "train",
-                    "evaluate", "arena", "report", "publish", "upload"], plan
+                    "evaluation", "publish", "upload"], plan
+
+
+def test_evaluation_has_its_own_plan(workspace):
+    """evaluate, arena and report moved out of the training pipeline."""
+    config = make_config(workspace)
+    train = [n for n, _ in pipeline.planned_stages(config)]
+    assert "evaluate" not in train and "arena" not in train and "report" not in train
+    plan = [n for n, _ in pipeline.planned_stages(config, section="evaluation")]
+    assert plan == ["preflight", "evaluate", "arena", "report", "upload"], plan
+    assert [n for n, _ in pipeline.planned_stages(
+        config, start_from="arena", section="evaluation")] == ["arena", "report", "upload"]
+    # The two tables agree with the two lists, so neither can drift.
+    assert set(train) == set(pipeline.STAGES), set(pipeline.STAGES) ^ set(train)
+    assert set(plan) == set(pipeline.EVAL_STAGES)
 
 
 def test_only_from_skip(workspace):
     config = make_config(workspace)
     assert [n for n, _ in pipeline.planned_stages(config, only="train")] == ["train"]
-    assert [n for n, _ in pipeline.planned_stages(config, start_from="evaluate")] == \
-        ["evaluate", "arena", "report", "publish", "upload"]
+    assert [n for n, _ in pipeline.planned_stages(config, start_from="evaluation")] == \
+        ["evaluation", "publish", "upload"]
     assert "smoke" not in [n for n, _ in pipeline.planned_stages(config, skip=["smoke"])]
 
 
 def test_unknown_stage_name_is_rejected(workspace):
     config = make_config(workspace)
-    for kwargs in ({"only": "trian"}, {"start_from": "evaluat"}, {"skip": ["smock"]}):
+    for kwargs in ({"only": "trian"}, {"start_from": "evaluat"}, {"skip": ["smock"]},
+                   {"start_from": "evaluate"}):
         try:
             pipeline.planned_stages(config, **kwargs)
         except ValueError as exc:
@@ -108,7 +133,7 @@ def test_unknown_stage_name_is_rejected(workspace):
 def test_gates_come_from_the_config(workspace):
     plan = dict(pipeline.planned_stages(make_config(workspace)))
     assert plan["train"] is True, "train should be a gate"
-    assert plan["report"] is False, "report should not be a gate"
+    assert plan["evaluation"] is False, "evaluation should not be a gate"
 
 
 # --------------------------------------------------------------------------- #
@@ -120,8 +145,22 @@ def test_all_stages_run_when_nothing_fails(workspace):
     code, _ = run_with(workspace, record)
     assert code == 0, code
     # publish and upload are disabled in the config, so they never execute.
+    # The smoke profile turns evaluation.after_training on; most do not.
     assert record == ["preflight", "teacher-check", "smoke", "train",
-                      "evaluate", "report"], record
+                      "evaluation"], record
+
+
+def test_evaluation_is_left_out_unless_asked_for(workspace):
+    """The default: training ends with the adapter, and scoring is `kd eval`."""
+    record = []
+    fake_stages(record)
+    config = make_config(workspace, **{"evaluation.after_training": False})
+    code, run_dir = run_with(workspace, record, config=config)
+    assert code == 0, code
+    assert record == ["preflight", "teacher-check", "smoke", "train"], record
+    stages = stages_in_manifest(run_dir)
+    assert stages["evaluation"]["status"] == "skipped"
+    assert "kd eval" in stages["evaluation"]["reason"], stages["evaluation"]
 
 
 def test_failed_gate_stops_everything_after_it(workspace):
@@ -137,11 +176,11 @@ def test_failed_gate_stops_everything_after_it(workspace):
 
 def test_non_gate_failure_does_not_stop_the_run(workspace):
     record = []
-    fake_stages(record, failing={"report"})
+    fake_stages(record, failing={"evaluation"})
     code, run_dir = run_with(workspace, record)
     assert code == 0, f"a non-gate failure should not fail the run, got {code}"
-    assert "report" in record
-    assert stages_in_manifest(run_dir)["report"]["status"] == "failed"
+    assert "evaluation" in record
+    assert stages_in_manifest(run_dir)["evaluation"]["status"] == "failed"
 
 
 def test_disabled_stages_are_skipped_with_a_reason(workspace):
@@ -162,7 +201,7 @@ def test_enabled_upload_runs_even_after_a_failure(workspace):
     code, _ = run_with(workspace, record, config=config)
     assert code == 1, code
     assert "upload" in record, "upload should still run so the logs survive"
-    assert "evaluate" not in record, "evaluate should not run after a failed gate"
+    assert "evaluation" not in record, "evaluation should not run after a failed gate"
 
 
 # --------------------------------------------------------------------------- #
@@ -639,6 +678,334 @@ def test_the_report_stage_says_where_the_adapter_is(workspace):
         assert captured["profile"].endswith("smoke.yaml"), captured["profile"]
     finally:
         report_module.write_report = saved
+        run.close()
+
+
+# --------------------------------------------------------------------------- #
+# Evaluating an adapter: a directory of its own inside the adapter's bundle
+# --------------------------------------------------------------------------- #
+def _trained_bundle(workspace, config, run_id="trained"):
+    """A finished training run with an adapter in it, as `kd pipeline` leaves one."""
+    with runlog.Run(config, quiet=True, run_id=run_id) as run:
+        _adapter_at(run.adapter_dir)
+        bundle, adapter = run.dir, run.adapter_dir
+    return bundle, adapter
+
+
+def test_an_evaluation_lives_inside_the_adapters_bundle(workspace):
+    record = []
+    fake_eval_stages(record)
+    config = make_config(workspace, **{"evaluation.name": "quick",
+                                       "evaluation.after_training": False})
+    bundle, adapter = _trained_bundle(workspace, config)
+
+    code, outcome = pipeline.run_evaluation(config, adapter=adapter, quiet=True)
+    assert code == 0, code
+    # preflight, evaluate, report ran; arena is off (no arena_file), upload is off.
+    assert record == ["preflight", "evaluate", "report"], record
+    where = outcome["dir"]
+    assert os.path.dirname(os.path.dirname(where)) == bundle, where
+    assert os.path.basename(os.path.dirname(where)) == runlog.EVALUATION_DIR, where
+    assert os.path.basename(where).startswith("quick-"), where
+    # A run of its own: config, manifest, log - and no checkpoints/ to upload.
+    for name in (runlog.MANIFEST, runlog.RESOLVED_CONFIG, runlog.RUN_LOG, runlog.EVENTS):
+        assert os.path.isfile(os.path.join(where, name)), name
+    assert not os.path.isdir(os.path.join(where, runlog.CHECKPOINT_DIR))
+    # It must not become `latest`: that pointer is for training runs.
+    for pointer in ("latest", "latest.txt"):
+        assert not os.path.exists(os.path.join(bundle, runlog.EVALUATION_DIR, pointer))
+
+
+def test_two_evaluations_of_one_adapter_never_share_a_directory(workspace):
+    fake_eval_stages([])
+    config = make_config(workspace, **{"evaluation.name": "full"})
+    _bundle, adapter = _trained_bundle(workspace, config)
+    _, first = pipeline.run_evaluation(config, adapter=adapter, quiet=True)
+    _, second = pipeline.run_evaluation(config, adapter=adapter, quiet=True)
+    assert first["dir"] != second["dir"], (first, second)
+    assert os.path.isdir(first["dir"]) and os.path.isdir(second["dir"])
+    assert len(runlog.discover_evaluations(_bundle)) == 2
+
+
+def test_the_name_says_what_the_evaluation_was_for(workspace):
+    fake_eval_stages([])
+    config = make_config(workspace)
+    _bundle, adapter = _trained_bundle(workspace, config)
+    config["evaluation"]["name"] = None
+    _, unnamed = pipeline.run_evaluation(config, adapter=adapter, quiet=True)
+    assert unnamed["id"].startswith("smoke-"), unnamed["id"]   # the profile
+    config["evaluation"]["name"] = "after-parser-fix"
+    _, named = pipeline.run_evaluation(config, adapter=adapter, quiet=True)
+    assert named["id"].startswith("after-parser-fix-"), named["id"]
+
+
+def test_the_config_can_name_the_adapter(workspace):
+    """evaluation.adapter is the config's way of saying --adapter."""
+    record = []
+    fake_eval_stages(record)
+    config = make_config(workspace)
+    bundle, adapter = _trained_bundle(workspace, config)
+    # A decoy that is newer, so discovery would pick the wrong one.
+    _trained_bundle(workspace, config, run_id="newer")
+    config["evaluation"]["adapter"] = os.path.join(adapter, "adapter_config.json")
+    _, outcome = pipeline.run_evaluation(config, quiet=True)
+    assert os.path.dirname(os.path.dirname(outcome["dir"])) == bundle, outcome["dir"]
+
+
+def test_no_adapter_anywhere_is_said_plainly(workspace):
+    fake_eval_stages([])
+    config = make_config(workspace)
+    try:
+        pipeline.run_evaluation(config, quiet=True)
+    except pipeline.StageFailed as exc:
+        assert "--adapter" in str(exc) and "evaluation.adapter" in str(exc), exc
+    else:
+        raise AssertionError("an evaluation with nothing to evaluate started anyway")
+
+
+def test_a_fetched_adapter_is_scored_under_runs_dir_and_uploaded_beside_itself(workspace):
+    """An adapter from the bucket: its cache directory is not where results go.
+
+    The evaluation is written under runs_dir in a directory named after the
+    bundle in the bucket, and uploaded to that bundle's evaluation/ - so the
+    bucket ends up with runs/<train-run>/{final_adapter, evaluation/<id>}.
+    """
+    from kd import paths
+    from kd.remote import s3 as s3mod
+
+    fake_eval_stages([])
+    config = make_config(workspace, **{"s3.enabled": True, "s3.bucket": "b",
+                                       "s3.prefix": "kd"})
+    cached = _adapter_at(os.path.join(workspace, "cache", "b", "elsewhere", "runs",
+                                      "trained-2026-09-10-1416", "final_adapter"))
+    paths.mark_complete(cached, "s3://b/elsewhere/runs/trained-2026-09-10-1416/final_adapter\n3 objects")
+
+    _, outcome = pipeline.run_evaluation(config, adapter=cached, quiet=True)
+    runs_dir = config["project"]["runs_dir"]
+    expected = os.path.join(runs_dir, "trained-2026-09-10-1416", runlog.EVALUATION_DIR)
+    assert os.path.normpath(os.path.dirname(outcome["dir"])) == os.path.normpath(expected), \
+        outcome["dir"]
+
+    # Where the real upload stage would send it, without sending anything.
+    sent = {}
+    original = s3mod.upload_bundle
+    s3mod.upload_bundle = lambda config, run_dir, run_id, groups=None, log=None, destination=None: (
+        sent.update({"destination": destination, "run_dir": run_dir}) or
+        {"uri": f"s3://{destination[0]}/{destination[1]}", "files": 1, "bytes": 1, "groups": []})
+    try:
+        pipeline.EVAL_STAGES["upload"] = pipeline.stage_eval_upload
+        _, outcome = pipeline.run_evaluation(config, adapter=cached, quiet=True)
+    finally:
+        s3mod.upload_bundle = original
+    bucket, key = sent["destination"]
+    assert bucket == "b", sent
+    assert key == f"elsewhere/runs/trained-2026-09-10-1416/evaluation/{outcome['id']}", key
+    assert outcome["uploaded"].startswith("s3://b/elsewhere/runs/trained-2026-09-10-1416/evaluation/")
+
+
+def test_a_local_bundle_with_no_upload_record_goes_where_its_run_would_have(workspace):
+    from kd.remote import s3 as s3mod
+
+    fake_eval_stages([])
+    config = make_config(workspace, **{"s3.enabled": True, "s3.bucket": "b",
+                                       "s3.prefix": "kd"})
+    _bundle, adapter = _trained_bundle(workspace, config, run_id="local-run")
+    sent = {}
+    original = s3mod.upload_bundle
+    s3mod.upload_bundle = lambda config, run_dir, run_id, groups=None, log=None, destination=None: (
+        sent.update({"destination": destination}) or
+        {"uri": "s3://x", "files": 1, "bytes": 1, "groups": []})
+    try:
+        pipeline.EVAL_STAGES["upload"] = pipeline.stage_eval_upload
+        _, outcome = pipeline.run_evaluation(config, adapter=adapter, quiet=True)
+    finally:
+        s3mod.upload_bundle = original
+    assert sent["destination"] == ("b", f"kd/runs/local-run/evaluation/{outcome['id']}"), sent
+
+
+def test_evaluation_inside_the_training_run_uses_the_same_layout(workspace):
+    """evaluation.after_training: the stage writes <run>/evaluation/<id>/ too."""
+    record = []
+    fake_eval_stages(record)
+    fake_stages(record)
+    pipeline.STAGES["evaluation"] = pipeline.stage_evaluation
+    pipeline.STAGES["train"] = lambda ctx: (
+        _adapter_at(ctx.run.adapter_dir) and {"adapter": ctx.run.adapter_dir})
+    config = make_config(workspace, **{"evaluation.after_training": True,
+                                       "evaluation.name": "inline", "s3.enabled": True})
+    code, run_dir = run_with(workspace, record, config=config)
+    assert code == 0, code
+    # The inner upload is left to the training run's own upload stage.
+    assert record == ["preflight", "teacher-check", "smoke", "preflight", "evaluate",
+                      "report", "upload"], record
+    found = runlog.discover_evaluations(run_dir)
+    assert len(found) == 1 and os.path.basename(found[0]).startswith("inline-"), found
+    stages = stages_in_manifest(run_dir)
+    assert stages["evaluation"]["status"] == "ok", stages["evaluation"]
+    with open(os.path.join(found[0], runlog.MANIFEST), encoding="utf-8") as handle:
+        inner = {e["name"]: e for e in json.load(handle)["stages"]}
+    assert inner["evaluate"]["status"] == "ok" and "upload" not in inner, inner
+
+
+def test_a_failed_evaluation_gate_does_not_fail_the_training(workspace):
+    """The adapter is the thing that cost money; a scoring problem must not lose it."""
+    record = []
+    fake_eval_stages(record, failing={"preflight"})
+    fake_stages(record)
+    pipeline.STAGES["evaluation"] = pipeline.stage_evaluation
+    pipeline.STAGES["train"] = lambda ctx: (
+        _adapter_at(ctx.run.adapter_dir) and {"adapter": ctx.run.adapter_dir})
+    config = make_config(workspace, **{"evaluation.after_training": True})
+    code, run_dir = run_with(workspace, record, config=config)
+    assert code == 0, code
+    assert stages_in_manifest(run_dir)["evaluation"]["status"] == "failed"
+
+
+def test_later_evaluation_stages_find_the_bundles_earlier_output(workspace):
+    """`kd eval --from report` reads the evaluation.json a previous scoring wrote."""
+    config = make_config(workspace)
+    bundle, adapter = _trained_bundle(workspace, config)
+    earlier = os.path.join(bundle, runlog.EVALUATION_DIR, "full-2026-09-15-1000")
+    os.makedirs(earlier)
+    with open(os.path.join(earlier, "evaluation.json"), "w") as fh:
+        json.dump({"fidelity": {}}, fh)
+    run = runlog.Run(config, quiet=True, run_id="full-2026-09-15-1100",
+                     parent=os.path.join(bundle, runlog.EVALUATION_DIR),
+                     checkpoints=False, latest=False)
+    ctx = pipeline.Context(config, {"device": "cpu", "dtype_name": "float32",
+                                    "notes": []}, run, Budget(config),
+                           bundle=bundle, evaluation=True)
+    try:
+        found = ctx.resolve_evaluation()
+        assert found and os.path.normpath(found) == os.path.normpath(
+            os.path.join(earlier, "evaluation.json")), found
+    finally:
+        run.close()
+
+
+def test_kd_upload_knows_where_an_evaluation_directory_belongs(workspace):
+    """`kd upload runs/<id>/evaluation/<eid>` ships to the bundle's evaluation/."""
+    from kd import cli
+
+    config = make_config(workspace, **{"s3.enabled": True, "s3.bucket": "b",
+                                       "s3.prefix": "kd"})
+    bundle, _adapter = _trained_bundle(workspace, config, run_id="local-run")
+    eval_dir = os.path.join(bundle, runlog.EVALUATION_DIR, "full-2026-09-15-1030")
+    os.makedirs(eval_dir)
+    assert cli._evaluation_destination(config, eval_dir) ==         ("b", "kd/runs/local-run/evaluation/full-2026-09-15-1030")
+    # A bundle that recorded its upload elsewhere is followed there instead.
+    runlog.append_event(bundle, "upload", "bundle", uri="s3://other/x/runs/local-run")
+    assert cli._evaluation_destination(config, eval_dir) ==         ("other", "x/runs/local-run/evaluation/full-2026-09-15-1030")
+
+
+def test_upload_groups_include_evaluations(workspace):
+    from kd.remote import s3 as s3mod
+
+    assert "evaluation" in s3mod.UPLOAD_GROUPS
+    assert "evaluation" in make_config(workspace)["s3"]["upload"]
+
+
+# --------------------------------------------------------------------------- #
+# A teacher that is a LoRA adapter
+# --------------------------------------------------------------------------- #
+def _lora_at(where, base="Qwen/Qwen2.5-3B-Instruct"):
+    os.makedirs(where, exist_ok=True)
+    with open(os.path.join(where, "adapter_config.json"), "w") as fh:
+        json.dump({"base_model_name_or_path": base, "peft_type": "LORA"}, fh)
+    with open(os.path.join(where, "adapter_model.safetensors"), "w") as fh:
+        fh.write("weights")
+    return where
+
+
+def test_a_teacher_that_is_an_adapter_is_split_into_base_and_adapter(workspace):
+    from kd import paths
+
+    config = make_config(workspace)
+    lora = _lora_at(os.path.join(workspace, "sft-lora"))
+    config["models"].update(teacher=lora, teacher_adapter=None, teacher_base=None)
+    split = paths.normalise_teacher(config)
+    assert split == {"adapter": lora, "base": "Qwen/Qwen2.5-3B-Instruct",
+                     "recorded": "Qwen/Qwen2.5-3B-Instruct"}, split
+    assert config["models"]["teacher"] == "Qwen/Qwen2.5-3B-Instruct"
+    assert config["models"]["teacher_adapter"] == lora
+    assert paths.teacher_base_of(config) == "Qwen/Qwen2.5-3B-Instruct"
+    # Idempotent: a second pass sees base + adapter and leaves it alone.
+    assert paths.normalise_teacher(config) is None
+
+
+def test_a_named_teacher_base_beats_what_the_adapter_records(workspace):
+    from kd import paths
+
+    config = make_config(workspace)
+    lora = _lora_at(os.path.join(workspace, "sft-lora"), base="/somewhere/on/another/box")
+    config["models"].update(teacher=lora, teacher_adapter=None,
+                            teacher_base="Qwen/Qwen2.5-3B-Instruct")
+    paths.normalise_teacher(config)
+    assert config["models"]["teacher"] == "Qwen/Qwen2.5-3B-Instruct"
+
+
+def test_an_adapter_teacher_with_no_known_base_is_refused_with_the_fix(workspace):
+    from kd import paths
+
+    config = make_config(workspace)
+    mlx = os.path.join(workspace, "mlx-lora")
+    os.makedirs(mlx)
+    with open(os.path.join(mlx, "adapters.safetensors"), "w") as fh:
+        fh.write("weights")
+    config["models"].update(teacher=mlx, teacher_adapter=None, teacher_base=None)
+    try:
+        paths.normalise_teacher(config)
+    except RuntimeError as exc:
+        assert "models.teacher_base" in str(exc), exc
+    else:
+        raise AssertionError("an adapter with no base was accepted as a teacher")
+
+
+def test_a_whole_model_teacher_is_left_alone(workspace):
+    from kd import paths
+
+    config = make_config(workspace)
+    model_dir = os.path.join(workspace, "merged")
+    os.makedirs(model_dir)
+    with open(os.path.join(model_dir, "config.json"), "w") as fh:
+        fh.write("{}")
+    config["models"].update(teacher=model_dir, teacher_adapter=None, teacher_base=None)
+    assert paths.normalise_teacher(config) is None
+    assert config["models"]["teacher"] == model_dir
+    assert paths.teacher_base_of(config) is None, "a merged teacher has no known base"
+    config["models"]["teacher_base"] = "Qwen/Qwen2.5-3B-Instruct"
+    assert paths.teacher_base_of(config) == "Qwen/Qwen2.5-3B-Instruct"
+
+
+def test_teacher_base_is_implied_by_base_plus_adapter(workspace):
+    from kd import paths
+
+    config = make_config(workspace)
+    config["models"].update(teacher="Qwen/Qwen3.5-2B", teacher_adapter="org/lora",
+                            teacher_base=None)
+    assert paths.teacher_base_of(config) == "Qwen/Qwen3.5-2B"
+
+
+def test_preflight_splits_the_teacher_and_records_it(workspace):
+    """The pipeline's preflight does the split, and events.jsonl says so."""
+    from kd import paths
+
+    config = make_config(workspace)
+    lora = _lora_at(os.path.join(workspace, "sft-lora"))
+    config["models"].update(teacher=lora, teacher_adapter=None, teacher_base=None)
+    saved = paths.memory_estimate
+    paths.memory_estimate = lambda *a, **k: None
+    ctx, run = _fresh_context(workspace, config)
+    try:
+        pipeline.stage_preflight(ctx)
+        assert config["models"]["teacher_adapter"] == lora
+        assert config["models"]["teacher_base"] == "Qwen/Qwen2.5-3B-Instruct"
+        run.finish("ok")
+        with open(run.path(runlog.EVENTS), encoding="utf-8") as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+        assert any(e["event"] == "teacher_split" for e in events), events
+    finally:
+        paths.memory_estimate = saved
         run.close()
 
 

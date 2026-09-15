@@ -36,6 +36,7 @@ COMPLETE_MARKER = ".kd-complete"
 # stay a name, and a typo elsewhere should not silently start a download.
 RESOLVABLE = [
     "models.teacher",
+    "models.teacher_base",
     "models.student",
     "models.teacher_adapter",
     "dataset.source",
@@ -283,6 +284,117 @@ def adapter_meta(adapter_dir):
             return json.load(handle) or {}
     except Exception:
         return {}
+
+
+def is_adapter_dir(where):
+    """True when `where` is a local directory PEFT can load an adapter from."""
+    return bool(where) and os.path.isfile(os.path.join(str(where), "adapter_config.json"))
+
+
+def hub_adapter_base(repo_id):
+    """The base a Hub-hosted PEFT adapter names, or None if it is not one.
+
+    One file listing and, when adapter_config.json is there, one small download
+    of it. Nothing else is fetched: the point is to learn what `repo_id` IS
+    before several gigabytes are committed to loading it as a whole model.
+    Returns None for a private repo, an offline machine, or a repo that is a
+    model - not knowing is left for the loader to report properly.
+    """
+    from .teacher import _looks_like_hub_id
+
+    if not _looks_like_hub_id(str(repo_id or "")):
+        return None
+    try:
+        from huggingface_hub import hf_hub_download, list_repo_files
+        files = set(list_repo_files(repo_id))
+        if "adapter_config.json" not in files:
+            return None
+        import json
+        with open(hf_hub_download(repo_id, "adapter_config.json"),
+                  encoding="utf-8") as handle:
+            return json.load(handle).get("base_model_name_or_path") or ""
+    except Exception:
+        return None
+
+
+def teacher_base_of(config):
+    """The stock model the teacher was fine-tuned from, or None if unknown.
+
+    The `teacher-base` player in an evaluation. Three ways it can be known:
+    named outright in models.teacher_base; implied, because the teacher is
+    base + teacher_adapter and the base IS models.teacher; or recorded by the
+    adapter models.teacher pointed at, which normalise_teacher copies into
+    models.teacher_base. A merged checkpoint with no teacher_base named has no
+    way of saying what it was built from, and the player is skipped.
+    """
+    models = config.get("models") or {}
+    if models.get("teacher_base"):
+        return models["teacher_base"]
+    if models.get("teacher_adapter"):
+        return models.get("teacher")
+    return None
+
+
+def normalise_teacher(config, log=None):
+    """Split models.teacher into base + adapter when it points at a LoRA adapter.
+
+    A teacher fine-tuned as a LoRA is often stored as just the adapter - a few
+    hundred megabytes under an outputs/ prefix - and the config is allowed to
+    point `models.teacher` straight at it. Loading that with from_pretrained
+    would fail on a directory with no config.json, so it is recognised here,
+    before anything loads, and rewritten into the form the rest of the code
+    understands:
+
+        models.teacher          the base the adapter records (or teacher_base)
+        models.teacher_adapter  what models.teacher used to say
+        models.teacher_base     the same base, so the evaluation can score it
+
+    The adapter says which base it was trained on (PEFT writes
+    base_model_name_or_path), and models.teacher_base overrides that when set -
+    an adapter converted from another framework may record a local path that
+    exists nowhere else. An MLX adapter records no base at all, and needs
+    teacher_base named; that is reported rather than guessed.
+
+    Mutates `config`, like resolve_inputs, and for the same reason: everything
+    downstream then sees an ordinary base + adapter pair. Returns what changed,
+    or None when models.teacher is a whole model.
+    """
+    models = config.get("models") or {}
+    teacher = models.get("teacher")
+    if not teacher or models.get("teacher_adapter"):
+        return None
+
+    recorded = None
+    if os.path.isdir(str(teacher)):
+        if not is_adapter_dir(teacher):
+            # An MLX/unsloth adapter directory has no adapter_config.json in
+            # the PEFT sense but does hold adapters.safetensors; it is still an
+            # adapter and ensure_peft_adapter converts it once it is named as
+            # one. A directory with neither is a model directory.
+            if not os.path.isfile(os.path.join(str(teacher), "adapters.safetensors")):
+                return None
+        recorded = adapter_base(teacher)
+    else:
+        recorded = hub_adapter_base(teacher)
+        if recorded is None:
+            return None
+
+    named = models.get("teacher_base")
+    base = named or recorded
+    if not base:
+        raise RuntimeError(
+            f"models.teacher points at a LoRA adapter ({teacher}) that does not "
+            f"record the base model it was trained on.\n"
+            f"  Name it:  --set models.teacher_base=<base model id or path>")
+
+    models["teacher_adapter"] = teacher
+    models["teacher"] = base
+    models["teacher_base"] = base
+    if log:
+        log.info(f"      models.teacher is a LoRA adapter; merging it into {base}")
+        if named and recorded and named != recorded:
+            log.info(f"      (the adapter records {recorded}; models.teacher_base wins)")
+    return {"adapter": teacher, "base": base, "recorded": recorded}
 
 
 def base_for_adapter(adapter_dir, configured, log=None):
@@ -585,6 +697,36 @@ def localise(where, config=None, log=None, label="input"):
             reason = detail.splitlines()[0]
         raise RuntimeError(f"cannot read {where}\n    {reason}") from exc
     return local
+
+
+TEACHER_KEYS = ("models.teacher", "models.teacher_adapter", "models.teacher_base")
+
+
+def resolve_teacher(config, log=None):
+    """Make the teacher loadable: fetch its s3:// parts, split an adapter-as-teacher.
+
+    The one call a tool makes before loading the teacher on its own - kd arena,
+    kd evaluate - so that all three ways of naming a fine-tuned teacher (a
+    merged checkpoint, a base plus an adapter, or an adapter alone, any of them
+    in object storage) work identically everywhere. The pipeline's preflight
+    does the same through resolve_inputs, which also fetches the student and
+    the dataset.
+
+    Only the teacher's keys are fetched. `kd arena --skip teacher` must not
+    pull eight gigabytes it will never load, and the dataset is not this
+    call's business.
+    """
+    pending = [(path, value) for path, value in remote_values(config)
+               if path in TEACHER_KEYS]
+    if pending and not (config.get("s3") or {}).get("enabled"):
+        raise RuntimeError(
+            "the config names s3:// inputs but s3.enabled is false:\n  "
+            + "\n  ".join(f"{path} = {uri}" for path, uri in pending)
+            + "\nSet --set s3.enabled=true, or use local paths.")
+    for path, uri in pending:
+        section, _, key = path.partition(".")
+        config[section][key] = localise(uri, config, log=log, label=key)
+    return normalise_teacher(config, log=log)
 
 
 def remote_values(config):

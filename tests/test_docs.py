@@ -154,12 +154,31 @@ def test_repository_map_matches_the_tree():
 
 
 def test_shipped_profiles_are_all_listed():
+    """Every configs/<group>/<profile>.yaml is named in the README, by path."""
+    import glob
+
     text = read(os.path.join(ROOT, "README.md"))
-    profiles = {os.path.splitext(name)[0]
-                for name in os.listdir(os.path.join(ROOT, "configs"))
-                if name.endswith(".yaml") and not name.startswith("_")}
+    profiles = {relative(path)
+                for path in glob.glob(os.path.join(ROOT, "configs", "*", "*.yaml"))}
     missing = [name for name in profiles if f"`{name}`" not in text]
     assert not missing, f"profiles absent from the README: {sorted(missing)}"
+
+
+def test_documented_config_paths_exist():
+    """Every configs/<x>.yaml a doc names is a real file, now that they are grouped."""
+    offences = []
+    for path in DOCS + [os.path.join(ROOT, "run.sh")]:
+        for match in re.finditer(r"configs/([A-Za-z0-9_./-]+\.yaml)", read(path)):
+            name = match.group(1)
+            # Placeholders and the reader's own file are not this test's business.
+            # finance-pod.yaml is the profile the RunPod docs tell the reader to write.
+            if (name in ("X.yaml", "mine.yaml", "x.yaml") or "<" in name
+                    or "..." in name or name.endswith("finance-pod.yaml")):
+                continue
+            if not os.path.isfile(os.path.join(ROOT, "configs", name)):
+                offences.append(f"{relative(path)}: configs/{name}")
+    assert not offences, "docs name configs that do not exist:\n    " + \
+        "\n    ".join(sorted(set(offences)))
 
 
 for _name, _fn in sorted(list(globals().items())):

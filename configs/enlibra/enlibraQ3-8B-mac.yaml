@@ -1,7 +1,7 @@
 # ===========================================================================
 # The real run, at a size a Mac can hold. Full training, full evaluation.
 #
-#     ./run.sh full
+#     ./run.sh --config configs/enlibra/enlibraQ3-8B-mac.yaml
 #
 # This is NOT the smoke test. enlibraQ3-8B-smoke.yaml proves the plumbing in a
 # few minutes and trains on four samples; this trains on all 1087 rows for the
@@ -40,6 +40,8 @@ models:
   teacher: Qwen/Qwen3-1.7B
   student: Qwen/Qwen3-0.6B
   teacher_adapter: null
+  # Stock stand-in: no fine-tune, no `teacher-base` player.
+  teacher_base: null
 
 hardware:
   device: mps
@@ -68,8 +70,11 @@ training:
   benchmark_every: 50
 
 evaluation:
-  # The full held-out set, all three players, nothing capped. This is the
-  # number you came for.
+  # Scored inside the run, straight after training: "does distillation work on
+  # this data" is one question, and the answer should come out of one command.
+  after_training: true
+  # The full held-out set, every player, nothing capped. This is the number
+  # you came for.
   arena_limit: null
   samples: 48
 

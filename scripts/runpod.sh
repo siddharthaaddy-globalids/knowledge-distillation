@@ -3,7 +3,7 @@
 #  Set up and run the pipeline on a rented GPU, over SSH.
 #
 #    git clone <repo> && cd knowledge-distillation
-#    ./scripts/runpod.sh --config configs/finance.yaml
+#    ./scripts/runpod.sh --config configs/qwen/finance.yaml
 #
 #  This is the hand-driven counterpart to `kd runpod launch`. That path bakes
 #  everything into docker/Dockerfile.cuda and rents the GPU for you; this one
@@ -21,15 +21,15 @@
 #
 #  Anything it does not recognise is passed straight through to the pipeline:
 #
-#    ./scripts/runpod.sh --config configs/finance.yaml --set training.max_steps=500
-#    ./scripts/runpod.sh evaluate --config configs/finance.yaml
+#    ./scripts/runpod.sh --config configs/qwen/finance.yaml --set training.max_steps=500
+#    ./scripts/runpod.sh evaluate --config configs/qwen/finance.yaml
 #    ./scripts/runpod.sh --setup-only
 #
 #  --rehearse runs the whole thing on a machine that is not a GPU pod - a laptop,
 #  a Mac - so that everything except the GPU is proven before anything is rented:
 #
 #    ./scripts/runpod.sh --rehearse doctor
-#    ./scripts/runpod.sh --rehearse --config configs/enlibraQ3-8B-smoke.yaml
+#    ./scripts/runpod.sh --rehearse --config configs/enlibra/enlibraQ3-8B-smoke.yaml
 #
 #  It answers "does this script work, are the dependencies right, does the config
 #  resolve, can it reach S3". It cannot answer "does it fit" or "how fast is a
@@ -295,7 +295,7 @@ log "HF_HOME=$HF_HOME"
 log "KD_RUNS_DIR=$KD_RUNS_DIR"
 
 if [ "$SETUP_ONLY" = "1" ]; then
-  log "Setup complete. Run:  python -m kd pipeline --config configs/finance.yaml"
+  log "Setup complete. Run:  python -m kd pipeline --config configs/qwen/finance.yaml"
   exit 0
 fi
 

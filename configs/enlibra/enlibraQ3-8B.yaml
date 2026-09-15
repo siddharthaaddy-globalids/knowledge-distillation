@@ -1,11 +1,11 @@
 # ===========================================================================
 #  enLibra space curriculum - Qwen3-8B (RL-tuned) -> Qwen3-1.7B
 #
-#    ./scripts/runpod.sh --config configs/enlibraQ3-8B.yaml
+#    ./scripts/runpod.sh --config configs/enlibra/enlibraQ3-8B.yaml
 #
 #  A rented-GPU profile. It will not run on a laptop: see the memory note under
 #  `hardware` below. For a local dry run of the same shape use
-#  configs/enlibraQ3-8B-smoke.yaml, which swaps in stand-in models and changes
+#  configs/enlibra/enlibraQ3-8B-smoke.yaml, which swaps in stand-in models and changes
 #  nothing else.
 #
 #  THE CORPUS IS COMMITTED
@@ -46,6 +46,10 @@ models:
   # transformers does not raise on keys it cannot map - it randomly initialises
   # them and warns. The teacher-check stage below exists to catch exactly that.
   teacher: s3://enlibra/dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/models/rl/
+  # The stock model the RL run started from, scored by the evaluation as the
+  # `teacher-base` player. Needed because the teacher is a merged checkpoint;
+  # were the prefix above an adapter, preflight would read it from there.
+  teacher_base: Qwen/Qwen3-8B
   student: Qwen/Qwen3-1.7B
 
   # Verified against the Hub before writing this file: Qwen3-8B and Qwen3-1.7B
@@ -214,19 +218,23 @@ gkd:
   seq_kd: false
 
 evaluation:
+  # NOT run by the training pipeline: the run ends with the adapter in the
+  # bucket, and scoring it is `kd eval` against this same profile:
+  #     ./run.sh --config configs/enlibra/enlibraQ3-8B.yaml eval --adapter s3://.../final_adapter
+  # Flip this to score on the pod straight after training, where 8B of teacher
+  # weights are already resident and paid for rather than downloaded again:
+  #     --set evaluation.after_training=true
+  after_training: false
   samples: 48
   report_format: html
 
   # The 137 rows from curriculum_verified.json carrying `split: eval`. Scored by
-  # the `arena` stage, which runs on the pod right after training - the teacher
-  # is resident and already paid for there, and doing this later on another
-  # machine means downloading 8B of weights again to answer a question this one
-  # could answer in minutes.
+  # the `arena` stage.
   #
-  # Three players: the stock student, the distilled student, and the teacher.
-  # Accuracy says how often each is right; Elo says how often each is right
-  # WHERE THE OTHERS ARE NOT, which is the part accuracy cannot show when three
-  # models agree on most of the set.
+  # Four players: the stock student, the distilled student, the stock Qwen3-8B
+  # the teacher was tuned from, and the teacher. Accuracy says how often each
+  # is right; Elo says how often each is right WHERE THE OTHERS ARE NOT, which
+  # is the part accuracy cannot show when the models agree on most of the set.
   #
   # Expect a lower number than the training distribution would give. These
   # questions run to 5 hops where training stops at 3, so 54 of the 137 ask for
@@ -286,7 +294,7 @@ runpod:
   # entirely and takes its cost ceiling from KD_PRICE_PER_HOUR instead.
   enabled: true
   # 19.0 GB of weights plus activations does not fit the base profile's A4000.
-  # `kd runpod gpus --config configs/enlibraQ3-8B.yaml` prints the exact names
+  # `kd runpod gpus --config configs/enlibra/enlibraQ3-8B.yaml` prints the exact names
   # this account can see; the launcher rents the one named here and no other.
   gpu_type: L40S
   max_price_per_hour: 1.50

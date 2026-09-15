@@ -153,9 +153,9 @@ def parse_args():
                     help="Override the adapter repo name (default: <repo>-lora)")
     ap.add_argument("-a", "--adapter", default=None,
                     help="Adapter directory to publish (default: read from --config)")
-    ap.add_argument("-c", "--config", default="configs/finance.yaml",
+    ap.add_argument("-c", "--config", default="configs/qwen/finance.yaml",
                     help="Training config, for provenance metadata and the adapter "
-                         "path (default: configs/finance.yaml)")
+                         "path (default: configs/qwen/finance.yaml)")
     ap.add_argument("--adapter-only", action="store_true",
                     help="Publish only the adapter; skip the merged model")
     ap.add_argument("--merged-only", action="store_true",

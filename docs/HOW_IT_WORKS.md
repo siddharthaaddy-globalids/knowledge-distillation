@@ -272,7 +272,7 @@ off-policy one. Expected cost per step is therefore approximately
 (1 − lmbda) · C_fwd   +   lmbda · (max_new_tokens · C_gen + C_fwd)
 ```
 
-which is why `configs/qwen-poc.yaml` sets `lmbda: 0.25` and `max_new_tokens: 24`:
+which is why `configs/qwen/qwen-poc.yaml` sets `lmbda: 0.25` and `max_new_tokens: 24`:
 those two numbers, not the model size and not the dataset size, dominate the
 runtime of a small run.
 
@@ -426,7 +426,7 @@ crashing.
 instead of raising) and `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0` (lifts the
 allocator's working-set ceiling so a large graph can use the whole unified memory
 pool). Unified memory is why a Mac can host a much larger teacher than a discrete
-GPU of nominally equivalent size, and why `configs/mac.yaml` prefers real batching
+GPU of nominally equivalent size, and why `configs/smollm/mac.yaml` prefers real batching
 (`batch_size: 4`) over gradient accumulation — batching is nearly free in transfer
 terms there, accumulation always costs wall clock.
 
@@ -552,7 +552,7 @@ dependency* side of reproducibility, which is the part that usually causes troub
 
 ## Reading order for the source
 
-1. `configs/qwen-poc.yaml` — every number is commented with the measurement behind
+1. `configs/qwen/qwen-poc.yaml` — every number is commented with the measurement behind
    it. The fastest way to understand the knobs.
 2. `kd/config.py` — precedence chain, validation and hardware resolution.
 3. `kd/pipeline.py` — the gated stages, and what each is guarding against.

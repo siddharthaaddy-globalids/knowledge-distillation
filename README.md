@@ -8,41 +8,66 @@ limits — comes from that file. Retargeting to a different teacher, student or
 dataset never requires a code edit.
 
 ```bash
-./distill.sh --config configs/finance.yaml          # Linux, macOS, containers
-.\distill.ps1 -Config configs\finance.yaml          # Windows
+./distill.sh --config configs/qwen/finance.yaml          # Linux, macOS, containers
+.\distill.ps1 -Config configs\qwen\finance.yaml          # Windows
 ```
 
 ```
-  run   20260908T1412Z-finance-bb0c874        device cuda (bfloat16)
-  cfg   configs/finance.yaml  <- _base.yaml   overrides: training.max_steps=500 (--set)
+  run   finance-2026-09-08-1412               device cuda (bfloat16)
+  cfg   configs/qwen/finance.yaml  <- _base.yaml   overrides: training.max_steps=500 (--set)
 
-[1/9] preflight            OK       2s
-[2/9] teacher-check        OK    1m48s
-[3/9] smoke                OK    1m12s
+[1/7] preflight            OK       2s
+[2/7] teacher-check        OK    1m48s
+[3/7] smoke                OK    1m12s
       3.40 s/step measured -> 500 steps is about 28m
-[4/9] train                ...
+[4/7] train                ...
 ```
 
 ---
 
 ## What it does
 
-One command runs every level of verification, gated, stopping at the first
-failure:
+Two pipelines, because training and evaluation have different lives.
+
+**Training** — `kd pipeline` — runs every level of verification, gated,
+stopping at the first failure, and ends with the adapter in the bucket:
 
 | Stage | Gate | |
 |---|---|---|
-| `preflight` | ✓ | Resolve config and hardware, fetch remote inputs. Seconds. |
+| `preflight` | ✓ | Resolve config and hardware, fetch remote inputs, split a teacher that is a LoRA adapter into base + adapter. Seconds. |
 | `teacher-check` | ✓ | Load **only** the teacher: missing weights, NaN scan, coherence. |
 | `smoke` | ✓ | Two real steps. Measures s/step and projects the full run against your limits. |
 | `train` | ✓ | |
-| `evaluate` | | Fidelity and capability, against the untrained base student. |
-| `arena` | | Accuracy and Elo on a held-out answer key. Off unless `evaluation.arena_file` is set. |
-| `report` | | A readable `report.html`, led by how close the distilled student is to the teacher. |
+| `evaluation` | | The whole evaluation pipeline below, inside the run. **Off by default**; `evaluation.after_training: true` turns it on. |
 | `publish` | | To the Hugging Face Hub. Off by default. |
 | `upload` | | To S3. Off by default; also runs after a failure, so logs survive. |
 
-Narrow a run with `--only train`, `--from evaluate`, `--skip smoke`.
+**Evaluation** — `kd eval` — scores an adapter that already exists: this
+checkout's newest, or one named by path or `s3://` URI. Run it as many times
+as there are questions to ask of one adapter, on whatever machine is to hand:
+
+| Stage | Gate | |
+|---|---|---|
+| `preflight` | ✓ | Fetch the teacher and the adapter; say what will be scored and where it goes. |
+| `evaluate` | | Fidelity and capability, token by token, against the teacher. |
+| `arena` | | Accuracy and Elo on a held-out answer key. Off unless `evaluation.arena_file` is set. |
+| `report` | | A readable `report.html`, led by how close the distilled student is to the teacher. |
+| `upload` | | To S3, **beside the adapter it scored**. Off unless `s3.enabled`. |
+
+Four players: the **base** student, the **distilled** student, the
+**teacher-base** (the stock model the teacher was fine-tuned from) and the
+**teacher**. Every evaluation is a directory of its own inside the adapter's
+bundle, so a bucket listing shows every time an adapter was scored:
+
+```
+runs/enlibraQ25-3B-2026-09-10-1416/
+  final_adapter/
+  evaluation/
+    quick-2026-09-15-1030/     evaluation.json  arena.json  report.html  ...
+    full-2026-09-15-1412/
+```
+
+Narrow either with `--only train`, `--from arena`, `--skip smoke`.
 
 The `teacher-check` and `smoke` gates exist because of how this fails in
 practice. GKD trains the student to match the teacher's *output distribution*, so
@@ -59,7 +84,14 @@ it:
 
 ```bash
 git clone <this repo> && cd knowledge-distillation
-./run.sh --config configs/enlibraQ3-8B-smoke.yaml
+./run.sh --config configs/enlibra/enlibraQ3-8B-smoke.yaml
+```
+
+Then, once a real run has put an adapter in the bucket, score it:
+
+```bash
+./run.sh --config configs/enlibra/enlibraQ25-3B.yaml eval \
+    --adapter s3://enlibra/.../runs/enlibraQ25-3B-2026-09-10-1416/final_adapter
 ```
 
 Walkthrough: **[docs/START-HERE.md](docs/START-HERE.md)**. The rest of this page
@@ -74,20 +106,20 @@ uv sync
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
 
 kd doctor                                    # what can this machine do?
-kd check --config configs/smoke.yaml         # resolve everything, run nothing
-kd pipeline --config configs/smoke.yaml      # ~2 min end to end
+kd check --config configs/smollm/smoke.yaml         # resolve everything, run nothing
+kd pipeline --config configs/smollm/smoke.yaml      # ~2 min end to end
 ```
 
 `uv sync` installs a real `kd` executable into `.venv`. Without activating, prefix
 with `uv run`; `python -m kd` works too and needs nothing on `PATH`.
 
-`configs/smoke.yaml` trains SmolLM2-360M into SmolLM2-135M for two steps. It
+`configs/smollm/smoke.yaml` trains SmolLM2-360M into SmolLM2-135M for two steps. It
 proves the machine works before you commit a real budget.
 
 Then pick a real profile, or write one:
 
 ```bash
-kd pipeline --config configs/finance.yaml
+kd pipeline --config configs/qwen/finance.yaml
 ```
 
 ### Or download a runner
@@ -100,16 +132,17 @@ put it on someone else's machine.
 
 ```bash
 chmod +x distill.sh
-./distill.sh --config configs/finance.yaml
+./distill.sh --config configs/qwen/finance.yaml
 ```
 
 ## Commands
 
 ```
-kd pipeline    Every stage, gated                    kd check       Resolve and print, run nothing
-kd train       Just training                         kd doctor      Environment and credentials
-kd evaluate    Score an adapter vs the teacher       kd ui          Browser control panel
-kd arena       Accuracy + Elo on an answer key        kd runpod      Rent a GPU (optional)
+kd pipeline    Train: every stage, gated             kd check       Resolve and print, run nothing
+kd eval        Score an adapter, into its bundle     kd doctor      Environment and credentials
+kd train       Just training                         kd ui          Browser control panel
+kd evaluate    Fidelity vs the teacher, standalone   kd runpod      Rent a GPU (optional)
+kd arena       Accuracy + Elo on an answer key       kd upload      Re-ship a run or an evaluation to S3
 kd publish     To the Hugging Face Hub
 
 kd check-teacher      Is this teacher fit to distil from?
@@ -123,7 +156,10 @@ nothing on PATH.
 ## Configuring a run
 
 Profiles inherit from [`configs/_base.yaml`](configs/_base.yaml), which holds
-every default, and list only what they change:
+every default, and list only what they change. They are grouped by what they
+distil — `configs/enlibra/`, `configs/smollm/`, `configs/qwen/`. One profile
+describes both the training and the evaluation of a pair: `kd pipeline` reads
+the training half, `kd eval` the `evaluation:` section.
 
 ```yaml
 extends: _base.yaml
@@ -138,7 +174,7 @@ training:
 Override anything from the command line without editing a file:
 
 ```bash
-kd pipeline --config configs/finance.yaml \
+kd pipeline --config configs/qwen/finance.yaml \
   --set training.max_steps=500 \
   --set hardware.dtype=bfloat16 \
   --set limits.max_cost_usd=2.0
@@ -154,24 +190,30 @@ Full key-by-key reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 
 | | |
 |---|---|
-| `default` | SmolLM2 360M → 135M. Runs anywhere. |
-| `mac` | Same pair, Apple Silicon (MPS) with real batching. |
-| `smoke` | Two steps, tiny pools. CI and first-run validation. |
-| `finance` | A finance-tuned Qwen3.5-2B → Qwen3.5-0.8B. |
-| `qwen-poc` | Stock Qwen3.5-2B → 0.8B. A known-good pairing for proving the pipeline. |
-| `enlibraQ25-3B` | The SFT teacher (Qwen2.5-3B) → Qwen2.5-1.5B. ~8.6 GB of weights, so a 16 GB GPU is enough. Start here. |
-| `enlibraQ25-3B-smoke` | The same **real** pair on a laptop, training on a small slice of the corpus. |
-| `enlibraQ25-flow` | Qwen2.5-1.5B → 0.5B, both from the Hub. 3.8 GB, minutes, no S3 download — proves the pipeline runs end to end. |
-| `enlibraQ3-8B` | An RL-tuned Qwen3-8B → Qwen3-1.7B on the enLibra space curriculum. Needs a 48 GB GPU. |
-| `enlibraQ3-8B-smoke` | The same run with stand-in models, small enough for a 16 GB laptop. Two steps — proves the plumbing. |
-| `enlibraQ3-8B-mac` | Stand-in models again, but the **full** schedule and the whole evaluation. Hours, free, and it answers whether distillation works on this data. |
+| `configs/smollm/default.yaml` | SmolLM2 360M → 135M. Runs anywhere. |
+| `configs/smollm/mac.yaml` | Same pair, Apple Silicon (MPS) with real batching. |
+| `configs/smollm/smoke.yaml` | Two steps, tiny pools, evaluation included. CI and first-run validation. |
+| `configs/qwen/finance.yaml` | A finance-tuned Qwen3.5-2B (base + LoRA) → Qwen3.5-0.8B. |
+| `configs/qwen/qwen-poc.yaml` | Stock Qwen3.5-2B → 0.8B. A known-good pairing for proving the pipeline. |
+| `configs/enlibra/enlibraQ25-3B.yaml` | The SFT teacher (Qwen2.5-3B) → Qwen2.5-1.5B. ~8.6 GB of weights, so a 16 GB GPU is enough. Start here. |
+| `configs/enlibra/enlibraQ25-3B-sftonly.yaml` | The same run without the rl rows: what those rows are worth is the difference between the two scores. |
+| `configs/enlibra/enlibraQ25-3B-smoke.yaml` | The same **real** pair on a laptop, training on a small slice of the corpus, evaluation included. |
+| `configs/enlibra/enlibraQ25-flow.yaml` | Qwen2.5-1.5B → 0.5B, both from the Hub. 3.8 GB, minutes, no S3 download — proves every stage, evaluation included. |
+| `configs/enlibra/enlibraQ3-8B.yaml` | An RL-tuned Qwen3-8B → Qwen3-1.7B on the enLibra space curriculum. Needs a 48 GB GPU. |
+| `configs/enlibra/enlibraQ3-8B-smoke.yaml` | The same run with stand-in models, small enough for a 16 GB laptop. Two steps — proves the plumbing. |
+| `configs/enlibra/enlibraQ3-8B-mac.yaml` | Stand-in models again, but the **full** schedule and the whole evaluation. Hours, free, and it answers whether distillation works on this data. |
+
+The training profiles end with the adapter in the bucket and do not evaluate;
+the smoke, flow and mac profiles set `evaluation.after_training: true` because
+proving every stage is what they are for. Any profile can be flipped the same
+way with `--set evaluation.after_training=true`.
 
 Both models are resident at once, so their **sum** is what has to fit: Qwen3-8B
 plus Qwen3-1.7B is 19.0 GB of bf16 weights before activations, which is why the
 pod profile asks for a 48 GB card and why the laptop profiles shrink both halves.
 [docs/START-HERE.md](docs/START-HERE.md) has the table.
 
-Those five read `data/enlibra-curriculum/`, which **is committed** — 3.4 MB, so
+The enlibra profiles read `data/enlibra-curriculum/`, which **is committed** — 3.4 MB, so
 a fresh clone on a rented pod has the corpus already and needs no credentials for
 it. Regenerate it when the curriculum exports change:
 
@@ -217,19 +259,24 @@ out of S3 or sent by someone else. Full guide: **[docs/INFERENCE.md](docs/INFERE
 ## What a run leaves behind
 
 ```
-runs/20260908T1412Z-finance-bb0c874/
+runs/finance-2026-09-08-1412/
   config.resolved.yaml   every value after every override - re-runnable as-is
   manifest.json          git sha, package versions, per-stage timings, exit code
   run.log                everything the terminal showed, including library output
   events.jsonl           {stage, step, loss, elapsed, spend_usd} - one per line
   metrics.json           the final numbers
-  report.html
   final_adapter/
   checkpoints/
+  evaluation/            one directory per scoring of the adapter, by `kd eval`
+    full-2026-09-15-1412/  or by the run itself (evaluation.after_training)
+      config.resolved.yaml  manifest.json  run.log  events.jsonl
+      evaluation.json  arena.json  arena-transcript.jsonl  report.html
 ```
 
 One directory per run, never overwritten, and the same unit that gets uploaded to
-S3 — so a run is either entirely recoverable or entirely absent.
+S3 — so a run is either entirely recoverable or entirely absent. An evaluation
+run elsewhere uploads its own directory to the same place in the bucket, so the
+bundle there always holds every evaluation whichever machine produced it.
 
 ## Spend and time limits
 
@@ -261,8 +308,24 @@ so tighten `training.save_steps` when limits are tight.
 ## Measuring what you got
 
 ```bash
-kd evaluate --config configs/finance.yaml
+kd eval --config configs/enlibra/enlibraQ25-3B.yaml --adapter s3://.../final_adapter
+kd eval --config configs/qwen/finance.yaml            # this checkout's newest adapter
+kd eval --config configs/qwen/finance.yaml --name after-parser-fix --from arena
+kd eval --config configs/enlibra/enlibraQ25-3B.yaml --name quick \
+    --set evaluation.arena_limit=8 --set evaluation.samples=8   # a look, in minutes
 ```
+
+The same profile that trained the pair evaluates it: `kd eval` reads its
+`evaluation:` section (players, samples, the held-out file, the ceilings) and
+the models, tokenizer and bucket from the rest.
+
+`kd eval` is the evaluation pipeline: fidelity, the arena, the report and the
+upload, written into `<bundle>/evaluation/<name>-<date>-<time>/` beside the
+adapter — here and in the bucket. `--adapter` names what to score (a
+directory, a file inside one, or an `s3://` URI); `evaluation.adapter` in the
+config does the same; with neither, it scores the newest adapter under `runs/`.
+`--name` (or `evaluation.name`) says what the scoring was for and leads the
+directory name, so a bundle's `evaluation/` listing reads as a history.
 
 Two questions, measured separately, because the literature is explicit that they
 do not track each other:
@@ -272,11 +335,30 @@ do not track each other:
 - **Capability** — is the student actually better at the task? Held-out
   perplexity, optionally lm-eval benchmarks.
 
-Both are reported for the **base** student as well as the distilled one. That
-column is what separates "distillation worked" from "the small model could
-already do this" — read the change, not the absolute value.
+Four models are scored, each answering a question the others cannot:
 
-`--tasks ifeval` and `--gen-similarity 20` need `uv sync --extra eval`.
+| Player | | What it tells you |
+|---|---|---|
+| `base` | the stock student, no adapter | The control. "The small model could already do this" lives here. |
+| `distilled` | the student plus the adapter | The result. |
+| `teacher-base` | the stock model the teacher was fine-tuned from | What the fine-tune bought the **teacher** — the most there was to distil. Needs `models.teacher_base`, or a teacher given as base + adapter. |
+| `teacher` | the fine-tuned teacher | The ceiling, and the reference every closeness figure is measured against. |
+
+`evaluation.players` picks the set; drop `teacher` and `teacher-base` to compare
+base against distilled without loading eight gigabytes of weights.
+
+`kd evaluate` and `kd arena` remain as standalone tools for one measurement at
+a time. `--tasks ifeval` and `--gen-similarity 20` need `uv sync --extra eval`.
+
+### The teacher can be a LoRA adapter
+
+`models.teacher` may point at a merged checkpoint, at a base model with
+`models.teacher_adapter` beside it, or straight at a **LoRA adapter** — a
+directory, an `s3://` prefix or a Hub repo holding `adapter_config.json`.
+Preflight notices, reads the base the adapter records (or `models.teacher_base`
+when set), and rewrites the config into the base + adapter form before anything
+loads. The merge happens once, from the canonical base, which sidesteps the
+key-layout problems of merged exports written by other frameworks.
 
 ### Multiple-choice accuracy, and asking the student directly
 
@@ -286,10 +368,10 @@ that mirrors a mediocre teacher perfectly scores well above and badly here.
 
 ```bash
 # score the held-out split: the rows training never saw
-python scripts/ask.py --config configs/enlibraQ3-8B.yaml --accuracy
+python scripts/ask.py --config configs/enlibra/enlibraQ3-8B.yaml --accuracy
 
 # ask it one thing
-python scripts/ask.py --config configs/enlibraQ3-8B.yaml \
+python scripts/ask.py --config configs/enlibra/enlibraQ3-8B.yaml \
     --question "What are stars formed from?" \
     --option "A. Iron cores" --option "B. Molecular clouds" \
     --option "C. Accretion disks" --option "D. Supernova shockwaves"
@@ -310,7 +392,7 @@ Any path in a config may be an `s3://` URI — teacher, student, adapter, datase
 fetched in `preflight` and cached. Run bundles sync back up.
 
 ```bash
-kd runpod launch --config configs/finance-pod.yaml
+kd runpod launch --config configs/qwen/finance-pod.yaml
 ```
 
 Rents the GPU you named and **no other**, enforces your spend cap from your own
@@ -321,14 +403,18 @@ machine, and always terminates the pod. See
 
 ```
 configs/          _base.yaml holds every default; profiles extend it
+  enlibra/        the enLibra space curriculum (Qwen2.5 and Qwen3 pairs)
+  smollm/         SmolLM2 - the starter pair that runs anywhere
+  qwen/           stock Qwen3.5 pairs, finance
+  eval/           evaluation-only profiles, for `kd eval`
 src/kd/
-  arena.py       accuracy and Elo on a held-out multiple-choice set
+  arena.py        accuracy and Elo on a held-out multiple-choice set
   cli.py          the `kd` command
   config.py       extends, merge, strict validation, device resolution
   runlog.py       run directories, logs, events, manifest
-  pipeline.py     the gated stages
+  pipeline.py     the gated stages: training, and evaluation
   limits.py       time / step / cost ceilings
-  paths.py        s3:// -> local, cached
+  paths.py        s3:// -> local, cached; a teacher that is an adapter
   data.py         dataset assembly
   train.py        GKD training
   evaluate.py     fidelity and capability

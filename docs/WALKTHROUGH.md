@@ -166,29 +166,34 @@ of problem the next would waste more time discovering.
 ./distill.sh doctor
 
 # 2. Does the config resolve, and onto what hardware? Seconds.
-./distill.sh check --config configs/smoke.yaml
+./distill.sh check --config configs/smollm/smoke.yaml
 
 # 3. Does the whole pipeline run end to end? A few minutes.
-./distill.sh --config configs/smoke.yaml
+./distill.sh --config configs/smollm/smoke.yaml
 ```
 
 The first invocation installs uv, clones the pinned source into
 `~/.cache/kd-runner`, and downloads torch. Expect a few minutes once; everything
 after it is fast.
 
-`configs/smoke.yaml` trains SmolLM2-360M into SmolLM2-135M for two steps. Too
+`configs/smollm/smoke.yaml` trains SmolLM2-360M into SmolLM2-135M for two steps. Too
 short to learn anything — its job is to prove every stage runs here. You are
-looking for eight green stages:
+looking for every stage green, the evaluation (which the smoke profile keeps
+inside the run) included:
 
 ```
-[1/8] preflight            OK       0s
-[2/8] teacher-check        OK      22s
-[3/8] smoke                OK      51s
-[4/8] train                OK      36s
-[5/8] evaluate             OK      22s
-[6/8] report               OK       0s
-[7/8] publish              skipped - publish.enabled is false
-[8/8] upload               skipped - s3.enabled is false
+[1/7] preflight            OK       0s
+[2/7] teacher-check        OK      22s
+[3/7] smoke                OK      51s
+[4/7] train                OK      36s
+[5/7] evaluation           ...
+      [1/4] preflight      OK       0s
+      [2/4] evaluate       OK      22s
+      [3/4] arena          skipped - evaluation.arena_file is not set
+      [4/4] report         OK       0s
+[5/7] evaluation           OK      23s
+[6/7] publish              skipped - publish.enabled is false
+[7/7] upload               skipped - s3.enabled is false
 ```
 
 `doctor` also tells you the device that matters for everything below:
@@ -208,9 +213,9 @@ overnight. It comes down to what `doctor` printed.
 
 | Your device | Sensible first real run | Why |
 |---|---|---|
-| **CPU** | `configs/default.yaml` — SmolLM2 360M → 135M, 300 steps | Roughly one to two hours. Small enough to actually finish. |
-| **CUDA GPU** | `configs/qwen-poc.yaml` — Qwen3.5-2B → 0.8B, 100 steps | A known-good pairing, verified identical tokenizers. Add `--set hardware.dtype=bfloat16`. |
-| **Apple Silicon** | `configs/default.yaml`, or `qwen-poc` on 32 GB+ | Unified memory fits a larger teacher than the nominal size suggests. |
+| **CPU** | `configs/smollm/default.yaml` — SmolLM2 360M → 135M, 300 steps | Roughly one to two hours. Small enough to actually finish. |
+| **CUDA GPU** | `configs/qwen/qwen-poc.yaml` — Qwen3.5-2B → 0.8B, 100 steps | A known-good pairing, verified identical tokenizers. Add `--set hardware.dtype=bfloat16`. |
+| **Apple Silicon** | `configs/smollm/default.yaml`, or `qwen-poc` on 32 GB+ | Unified memory fits a larger teacher than the nominal size suggests. |
 
 **Do not start `qwen-poc` or `finance` on a CPU box.** A 2B teacher plus a 0.8B
 student is about 11 GB of float32 weights before activations, and `bfloat16` is
@@ -245,7 +250,7 @@ inside its own cache directory, which is not where you want a model you care
 about:
 
 ```bash
-./distill.sh --config configs/default.yaml \
+./distill.sh --config configs/smollm/default.yaml \
   --set project.runs_dir="$PWD/runs"
 ```
 
@@ -287,7 +292,7 @@ drift is visible while it happens rather than only at the end.
 You have already passed the gates once, so skip re-running them:
 
 ```bash
-./distill.sh --config configs/default.yaml --only train \
+./distill.sh --config configs/smollm/default.yaml --only train \
   --set project.runs_dir="$PWD/runs"
 ```
 
@@ -313,7 +318,7 @@ know what perplexity is.
 To evaluate again — a different adapter, more samples, or benchmark tasks:
 
 ```bash
-./distill.sh evaluate --config configs/default.yaml \
+./distill.sh evaluate --config configs/smollm/default.yaml \
   --adapter "$PWD/runs/<run-id>/final_adapter" \
   --samples 100 \
   --report "$PWD/report.html"
@@ -344,11 +349,11 @@ distance the training closed.
 Needs the `eval` extra, which the runner installs on request:
 
 ```bash
-./distill.sh --extra eval evaluate --config configs/default.yaml \
+./distill.sh --extra eval evaluate --config configs/smollm/default.yaml \
   --tasks ifeval --limit 100
 ```
 
-It scores three models, so budget accordingly.
+It scores every player, so budget accordingly.
 
 ### Exit codes
 
@@ -517,7 +522,7 @@ survives; raise the limit or shorten the run, both spelled out in the message.
 runner at another revision, and says so loudly every time:
 
 ```bash
-./distill.sh --ref another-branch --config configs/default.yaml
+./distill.sh --ref another-branch --config configs/smollm/default.yaml
 ```
 
 Use a manually built runner instead when you want the result to stay traceable.

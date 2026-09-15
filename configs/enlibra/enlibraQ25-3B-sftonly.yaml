@@ -1,9 +1,9 @@
 # ===========================================================================
 #  enLibra space curriculum - Qwen2.5-3B (SFT) -> Qwen2.5-1.5B   [SFT rows only]
 #
-#    ./run.sh --config configs/enlibraQ25-3B-sftonly.yaml
+#    ./run.sh --config configs/enlibra/enlibraQ25-3B-sftonly.yaml
 #
-#  The same run as configs/enlibraQ25-3B.yaml with one thing changed: the
+#  The same run as configs/enlibra/enlibraQ25-3B.yaml with one thing changed: the
 #  curriculum-rl domain (rl-1to2hop.jsonl, 143 rows) is left out, so the
 #  student trains on the SFT stage's 1-3 hop questions and the persona rows
 #  alone. Same teacher, same student, same LoRA, same token budgets, same

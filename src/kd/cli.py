@@ -1,14 +1,17 @@
 """
 `kd` - the single entry point for the distillation pipeline.
 
-    kd check          --config configs/finance.yaml     resolve and print, run nothing
-    kd train          --config configs/finance.yaml
-    kd evaluate       --config configs/finance.yaml
-    kd arena          --config configs/enlibraQ3-8B.yaml
-    kd check-teacher  --config configs/finance.yaml
-    kd fix-teacher    --config configs/finance.yaml
+    kd pipeline       --config configs/enlibra/enlibraQ25-3B.yaml   train, gated
+    kd eval           --config configs/enlibra/enlibraQ25-3B.yaml      score an adapter
+    kd check          --config configs/qwen/finance.yaml     resolve and print, run nothing
+    kd train          --config configs/qwen/finance.yaml
+    kd evaluate       --config configs/qwen/finance.yaml
+    kd arena          --config configs/enlibra/enlibraQ3-8B.yaml
+    kd check-teacher  --config configs/qwen/finance.yaml
+    kd fix-teacher    --config configs/qwen/finance.yaml
     kd convert-adapter --teacher-adapter <mlx-adapter>
     kd publish        --repo <org>/<name>
+    kd upload         [RUN or evaluation dir]
     kd ui             [--compare]
     kd doctor
 
@@ -38,6 +41,8 @@ SUGAR = [
     ("--student", "models.student", str, "Student model id or local path"),
     ("--teacher-adapter", "models.teacher_adapter", str,
      "LoRA adapter merged into the teacher at load time"),
+    ("--teacher-base", "models.teacher_base", str,
+     "The stock model the teacher was fine-tuned from (the teacher-base player)"),
     ("--dataset", "dataset.source", str, "Training dataset"),
     ("--device", "hardware.device", str, "auto | cpu | mps | cuda"),
     ("--dtype", "hardware.dtype", str, "auto | float32 | bfloat16 | float16"),
@@ -73,7 +78,7 @@ DELEGATED = {
 def add_config_args(parser):
     """The override surface shared by every config-reading command."""
     parser.add_argument("-c", "--config", default=None, metavar="PATH",
-                        help="YAML profile, e.g. configs/finance.yaml "
+                        help="YAML profile, e.g. configs/qwen/finance.yaml "
                              "(default: built-in _base.yaml)")
     parser.add_argument("--set", dest="set_overrides", action="append", default=[],
                         metavar="KEY=VALUE",
@@ -130,7 +135,7 @@ def cmd_check(args):
     With --full, stdout carries nothing but the YAML and the banner goes to
     stderr, so the effective config can be redirected straight into a file:
 
-        kd check --config configs/finance.yaml --full > my-run.yaml
+        kd check --config configs/qwen/finance.yaml --full > my-run.yaml
 
     That is the only way to get an editable config onto a machine that has a
     downloaded runner and no checkout, so it has to produce a clean file.
@@ -201,8 +206,47 @@ def cmd_pipeline(args):
         )
 
 
+def cmd_eval(args):
+    """Score an adapter: the evaluation pipeline, into the adapter's own bundle."""
+    from .pipeline import StageFailed, run_evaluation
+
+    config = load(args)
+    if args.name:
+        config["evaluation"]["name"] = args.name
+    try:
+        code, _outcome = run_evaluation(
+            config, adapter=args.adapter,
+            only=args.only, start_from=getattr(args, "from"), skip=args.skip,
+            argv=sys.argv)
+    except (StageFailed, ValueError) as exc:
+        print(f" !! {exc}")
+        return 1
+    return code
+
+
+def _evaluation_destination(config, eval_dir):
+    """(bucket, key) for re-uploading an evaluation directory, or None.
+
+    An evaluation directory sits at <bundle>/evaluation/<id>; the bundle's
+    adapter says where the bundle is in the bucket, the same way the upload
+    stage worked it out the first time.
+    """
+    from . import paths, runlog
+    from .remote import s3
+
+    bundle = os.path.dirname(os.path.dirname(eval_dir))
+    adapter = os.path.join(bundle, runlog.ADAPTER_DIR)
+    where = paths.adapter_locations(adapter, config)
+    if where.get("s3"):
+        bundle_uri = where["s3"].rstrip("/").rsplit("/", 1)[0]
+    else:
+        bundle_uri = s3.uri_of(s3.bucket_or_die(config),
+                               s3.run_prefix(config, os.path.basename(bundle)))
+    return s3.evaluation_prefix(bundle_uri, os.path.basename(eval_dir))
+
+
 def cmd_upload(args):
-    """Ship an existing run bundle to S3, outside the pipeline.
+    """Ship an existing run bundle, or one evaluation of it, to S3.
 
     The pipeline's own upload stage runs last, and on a long run that is hours
     after the credentials were exported - long enough for a session token to
@@ -210,23 +254,18 @@ def cmd_upload(args):
     retry: same bucket layout, same file selection, against a run that already
     finished. It does not open a new run directory, which is what
     `pipeline --only upload` would do.
+
+    Given an evaluation directory - runs/<id>/evaluation/<eval-id> - it ships
+    just that one, to where `kd eval` would have put it.
     """
     import logging
 
+    from . import runlog
     from .remote import s3
     from .runlog import append_event, find_run
 
     config = load(args)
     runs_dir = (config.get("project") or {}).get("runs_dir") or "./runs"
-    try:
-        run_id, run_dir = find_run(args.run, runs_dir)
-    except FileNotFoundError as exc:
-        print(f" !! {exc}")
-        return 1
-
-    groups = list((config.get("s3") or {}).get("upload") or [])
-    if args.with_checkpoints and "checkpoints" not in groups:
-        groups.append("checkpoints")
 
     log = logging.getLogger("kd.upload")
     if not log.handlers:
@@ -236,11 +275,38 @@ def cmd_upload(args):
     log.setLevel(logging.INFO)
     log.propagate = False
 
-    log.info(f"  run        : {run_id}")
-    log.info(f"  directory  : {run_dir}")
-    log.info(f"  groups     : {', '.join(groups)}")
+    spec = os.path.abspath(os.path.expanduser(args.run)) if args.run else None
+    is_evaluation = bool(
+        spec and os.path.isdir(spec)
+        and os.path.basename(os.path.dirname(spec)) == runlog.EVALUATION_DIR)
+
+    destination = None
+    if is_evaluation:
+        run_id, run_dir = os.path.basename(spec), spec
+        groups = list((config.get("s3") or {}).get("upload") or [])
+        try:
+            destination = _evaluation_destination(config, run_dir)
+        except Exception as exc:  # noqa: BLE001
+            print(f" !! cannot work out where this evaluation belongs: {exc}")
+            return 1
+        log.info(f"  evaluation : {run_id}")
+        log.info(f"  directory  : {run_dir}")
+        log.info(f"  to         : s3://{destination[0]}/{destination[1]}")
+    else:
+        try:
+            run_id, run_dir = find_run(args.run, runs_dir)
+        except FileNotFoundError as exc:
+            print(f" !! {exc}")
+            return 1
+        groups = list((config.get("s3") or {}).get("upload") or [])
+        if args.with_checkpoints and "checkpoints" not in groups:
+            groups.append("checkpoints")
+        log.info(f"  run        : {run_id}")
+        log.info(f"  directory  : {run_dir}")
+        log.info(f"  groups     : {', '.join(groups)}")
     try:
-        summary = s3.upload_bundle(config, run_dir, run_id, groups=groups, log=log)
+        summary = s3.upload_bundle(config, run_dir, run_id, groups=groups, log=log,
+                                   destination=destination)
     except Exception as exc:  # noqa: BLE001 - botocore raises many shapes here
         text = str(exc)
         print(f" !! upload failed: {type(exc).__name__}: {text[:400]}")
@@ -429,14 +495,35 @@ def build_parser():
     pipeline.add_argument("--skip", action="append", default=[], metavar="STAGE",
                           help="Skip this stage, repeatable")
     pipeline.add_argument("--adapter", metavar="PATH_OR_URI",
-                          help="Score this adapter instead of one produced by "
-                               "this run. A directory, or an s3:// URI, which is "
-                               "fetched. Use with --from evaluate to score an "
-                               "adapter trained on another machine.")
+                          help="With --only evaluation: score this adapter instead "
+                               "of one produced by this run. For scoring on its "
+                               "own, see `kd eval`.")
     pipeline.add_argument("--allow-bad-teacher", action="store_true",
                           help="Train even if the teacher fails its pre-flight check "
                                "(not recommended)")
     pipeline.set_defaults(func=cmd_pipeline)
+
+    evaluation = sub.add_parser(
+        "eval",
+        help="Score an adapter: evaluate, arena, report and upload, into the "
+             "adapter's own bundle under evaluation/<name>-<date>/")
+    add_config_args(evaluation)
+    evaluation.add_argument("--adapter", metavar="PATH_OR_URI",
+                            help="The adapter to score: a directory, a file inside "
+                                 "one, or an s3:// URI, which is fetched. Default: "
+                                 "evaluation.adapter, else the newest adapter under "
+                                 "project.runs_dir.")
+    evaluation.add_argument("--name", metavar="NAME",
+                            help="What this evaluation is for (full, quick, ...). "
+                                 "Leads the directory name. Default: evaluation.name, "
+                                 "else the profile.")
+    evaluation.add_argument("--only", metavar="STAGE",
+                            help="Run just this stage")
+    evaluation.add_argument("--from", metavar="STAGE",
+                            help="Start at this stage and run everything after it")
+    evaluation.add_argument("--skip", action="append", default=[], metavar="STAGE",
+                            help="Skip this stage, repeatable")
+    evaluation.set_defaults(func=cmd_eval)
 
     check = sub.add_parser("check", help="Resolve config and hardware, print, exit")
     add_config_args(check)
@@ -477,7 +564,9 @@ def build_parser():
              "own upload failed or credentials had expired)")
     add_config_args(upload)
     upload.add_argument("run", nargs="?", default=None, metavar="RUN",
-                        help="Run id or run directory. Default: the latest run.")
+                        help="Run id or run directory, or an evaluation directory "
+                             "(runs/<id>/evaluation/<eval-id>). Default: the "
+                             "latest run.")
     upload.add_argument("--with-checkpoints", action="store_true",
                         help="Also ship checkpoints/ (optimizer state, large)")
     upload.set_defaults(func=cmd_upload)

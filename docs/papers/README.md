@@ -75,7 +75,7 @@ without stating the rank; Thinking Machines used rank **128** and found LoRA
 trails full fine-tuning by only 6% after on-policy distillation versus 13%
 after SFT.
 
-## What this means for `configs/enlibraQ25-3B.yaml`
+## What this means for `configs/enlibra/enlibraQ25-3B.yaml`
 
 | Knob | Now | Literature | Suggested next |
 |---|---|---|---|

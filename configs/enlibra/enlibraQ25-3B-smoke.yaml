@@ -1,9 +1,9 @@
 # ===========================================================================
 #  enLibra: Qwen2.5-3B (SFT) -> Qwen2.5-1.5B, on a Mac mini     [smoke test]
 #
-#    ./run.sh --config configs/enlibraQ25-3B-smoke.yaml
+#    ./run.sh --config configs/enlibra/enlibraQ25-3B-smoke.yaml
 #
-#  The same run as configs/enlibraQ25-3B.yaml with one thing changed: it trains
+#  The same run as configs/enlibra/enlibraQ25-3B.yaml with one thing changed: it trains
 #  on a small slice of the corpus instead of all of it, so it finishes in
 #  minutes. Same teacher, same student, same LoRA, same token budgets, same
 #  held-out set, same S3 destination.
@@ -23,7 +23,7 @@
 #  slow. It is a shape test, not a speed test.
 #
 #  If it thrashes, drop the student for the run:
-#      ./run.sh --config configs/enlibraQ3-4B-smoke.yaml \
+#      ./run.sh --config configs/enlibra/enlibraQ3-4B-smoke.yaml \
 #          --set models.student=Qwen/Qwen3-0.6B
 #  which brings the pair to about 8.9 GB and inside the budget. It stops being
 #  the real student at that point, so prefer swapping only when you have to.
@@ -82,6 +82,9 @@ training:
   benchmark_every: 4
 
 evaluation:
+  # Scored inside the run: this profile exists to prove every stage, and the
+  # evaluation is one of them. Same layout as `kd eval` would write later.
+  after_training: true
   samples: 8
   # Four questions instead of 137. Enough to prove the stage works end to end -
   # the file parses, three models load one after another without exhausting the

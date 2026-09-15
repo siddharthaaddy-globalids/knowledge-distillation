@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # Proof-of-concept distillation - Qwen3.5-2B -> Qwen3.5-0.8B
 #
-#   kd pipeline --config configs/qwen-poc.yaml --set hardware.dtype=bfloat16
+#   kd pipeline --config configs/qwen/qwen-poc.yaml --set hardware.dtype=bfloat16
 #
 # A deliberately small, known-good pairing to prove the pipeline end to end
 # before committing to a longer run or a custom teacher.
@@ -42,7 +42,7 @@ hardware:
   # on macOS 14+ and on CUDA, so ask for it at the command line when you actually
   # train:
   #
-  #     kd pipeline --config configs/qwen-poc.yaml --set hardware.dtype=bfloat16
+  #     kd pipeline --config configs/qwen/qwen-poc.yaml --set hardware.dtype=bfloat16
   #
   # It is a flag rather than a default here so the memory/precision trade-off is
   # a deliberate choice per run. On CPU it is ignored and float32 is used anyway,

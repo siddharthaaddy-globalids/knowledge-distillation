@@ -1,7 +1,7 @@
 """
 Head-to-head scoring: accuracy on a held-out multiple-choice set, and Elo.
 
-    python -m kd arena --config configs/enlibraQ3-8B.yaml
+    python -m kd arena --config configs/enlibra/enlibraQ3-8B.yaml
 
 `kd evaluate` asks how faithfully the student reproduces the TEACHER - top-1
 agreement, KL divergence, perplexity. That is the right question for
@@ -9,11 +9,12 @@ distillation in the abstract, and it is the wrong one here: these are questions
 with a known correct letter, so a student that mirrors a mediocre teacher
 perfectly scores well there and badly on the only number anyone will ask about.
 
-Three players, because two is not enough to learn anything from:
+Four players, because two is not enough to learn anything from:
 
-    base       the stock student, no adapter. The control.
-    distilled  the same base plus the trained LoRA.
-    teacher    what was distilled from. The ceiling.
+    base          the stock student, no adapter. The control.
+    distilled     the same base plus the trained LoRA.
+    teacher-base  the stock model the teacher was fine-tuned from.
+    teacher       what was distilled from: the fine-tuned teacher. The ceiling.
 
 Reading the result:
   * distilled below base    - training made it worse. Stop and look at the loss.
@@ -21,6 +22,14 @@ Reading the result:
   * distilled between them  - distillation worked; the gap left is the headroom.
   * distilled above teacher - possible on a narrow set, and worth distrusting
                               until it survives a second eval file.
+  * teacher-base vs teacher - what the fine-tune bought the TEACHER. If it is
+                              nothing, there was nothing to distil, and a
+                              student that matches the teacher has learned
+                              only what the stock model already knew.
+
+Which players take part is `evaluation.players` in the config; `teacher-base`
+needs the base to be known (models.teacher_base, or a teacher that is base +
+adapter) and is skipped with a note when it is not.
 
 THE HEADLINE IS CLOSENESS TO THE TEACHER
 ----------------------------------------
@@ -827,8 +836,24 @@ def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log,
     return predictions, formats, unanswered, completions
 
 
+# Every player, in the order the tables print them. A config may name a subset
+# (evaluation.players); a name outside this list is rejected up front rather
+# than silently scoring three models when four were asked for.
+PLAYERS = ("base", "distilled", "teacher-base", "teacher")
+
+
+def chosen_players(config, skip=()):
+    """The players this run scores, in canonical order, from the config."""
+    wanted = list(((config.get("evaluation") or {}).get("players")) or PLAYERS)
+    unknown = [p for p in wanted if p not in PLAYERS]
+    if unknown:
+        raise ValueError(f"unknown evaluation.players entries: {unknown}\n"
+                         f"  valid: {', '.join(PLAYERS)}")
+    return tuple(p for p in PLAYERS if p in wanted and p not in (skip or ()))
+
+
 def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
-         players=("base", "distilled", "teacher"), show=0):
+         players=PLAYERS, show=0):
     """Load each player in turn, answer every question, return what each said.
 
     Returns {player: [letter or None, ...]}, one entry per question in order.
@@ -899,6 +924,19 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
                 model, str(adapter)).merge_and_unload().to(device)
         run("distilled", build_distilled)
 
+    if "teacher-base" in players:
+        # The model the teacher was fine-tuned FROM, with no adapter: what the
+        # fine-tune bought the teacher, next to what distillation bought the
+        # student. Skipped, not failed, when the base is unknown - a merged
+        # checkpoint cannot say what it was built from.
+        teacher_base = paths.teacher_base_of(config)
+        if teacher_base:
+            run("teacher-base", lambda: AutoModelForCausalLM.from_pretrained(
+                teacher_base, dtype=dtype, low_cpu_mem_usage=True).to(device))
+        elif log:
+            log.info("      teacher-base skipped: the teacher is a merged "
+                     "checkpoint and models.teacher_base is not set")
+
     if "teacher" in players:
         def build_teacher():
             from .teacher import load_teacher
@@ -943,11 +981,12 @@ def main(args=None):
                                  "unanswered - it distinguishes a wrong answer "
                                  "from an answer the <Answer> pattern missed.")
         parser.add_argument("--skip", action="append", default=[],
-                            choices=["base", "distilled", "teacher"],
+                            choices=list(PLAYERS),
                             help="Leave a player out, repeatable. --skip teacher "
                                  "is the one worth knowing: it avoids loading "
                                  "8B of weights when you only want base vs "
-                                 "distilled.")
+                                 "distilled. The default set is "
+                                 "evaluation.players in the config.")
         parser.add_argument("--max-new-tokens", type=int, default=None)
         parser.add_argument("--device", default=None,
                             help="auto | cpu | mps | cuda")
@@ -1011,17 +1050,20 @@ def main(args=None):
         log.error(f"xx  {adapter} has no adapter_config.json")
         return 1
 
-    players = tuple(p for p in ("base", "distilled", "teacher")
-                    if p not in (args.skip or []))
+    try:
+        players = chosen_players(config, skip=args.skip or [])
+    except ValueError as exc:
+        log.error(f"xx  {exc}")
+        return 1
 
     # The teacher is the only input that may live in object storage, and the
     # only one worth several gigabytes - so it is fetched when it is a player
     # and left alone when `--skip teacher` means it will never be loaded. Which
-    # is why `players` is decided before this, not after.
-    if "teacher" in players and paths.is_remote(config["models"].get("teacher")):
+    # is why `players` is decided before this, not after. The same call splits
+    # a models.teacher that is really a LoRA adapter into base + adapter.
+    if "teacher" in players or "teacher-base" in players:
         try:
-            config["models"]["teacher"] = paths.localise(
-                config["models"]["teacher"], config, log=log, label="teacher")
+            paths.resolve_teacher(config, log=log)
         except RuntimeError as exc:
             log.error(f"xx  {exc}")
             return 1
@@ -1133,6 +1175,7 @@ def main(args=None):
                 "student": config["models"].get("student"),
                 "teacher": config["models"].get("teacher"),
                 "teacher_adapter": config["models"].get("teacher_adapter"),
+                "teacher_base": paths.teacher_base_of(config),
                 "adapter": str(adapter) if adapter else None,
                 "adapter_locations": paths.adapter_locations(
                     adapter, config, source=args.adapter) if adapter else None,

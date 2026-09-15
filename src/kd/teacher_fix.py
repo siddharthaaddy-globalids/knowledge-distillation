@@ -10,7 +10,7 @@ a student that generates uniform noise too.
 the names the architecture actually asks for and dropping components the text-only
 model does not use (e.g. a vision tower).
 
-    kd fix-teacher --config configs/finance.yaml
+    kd fix-teacher --config configs/qwen/finance.yaml
     kd fix-teacher --teacher org/model --out ./teacher-fixed
     kd fix-teacher --dry-run                   # show the mapping, write nothing
 
@@ -22,7 +22,7 @@ MISSING.
 Afterwards, verify and use the repaired copy:
 
     kd check-teacher --teacher ./teacher-fixed
-    ./distill.sh --config configs/finance.yaml --set models.teacher=./teacher-fixed
+    ./distill.sh --config configs/qwen/finance.yaml --set models.teacher=./teacher-fixed
 """
 
 import argparse
@@ -58,9 +58,9 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("-c", "--config", default="configs/finance.yaml",
+    ap.add_argument("-c", "--config", default="configs/qwen/finance.yaml",
                     help="Config file to read models.teacher from "
-                         "(default: configs/finance.yaml)")
+                         "(default: configs/qwen/finance.yaml)")
     ap.add_argument("-t", "--teacher", default=None,
                     help="Checkpoint to repair, overriding the config file")
     ap.add_argument("-o", "--out", default="./teacher-fixed",
@@ -314,7 +314,7 @@ def main():
     print()
     print("   Verify it, then train against it:")
     print(f"     kd check-teacher --teacher {out}")
-    print(f"     ./distill.sh --config configs/finance.yaml --set models.teacher={out}")
+    print(f"     ./distill.sh --config configs/qwen/finance.yaml --set models.teacher={out}")
     print()
     return 0
 

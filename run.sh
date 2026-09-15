@@ -3,7 +3,7 @@
 #  One script. Clone the repository, name a config, run it.
 #
 #      git clone <repo> && cd knowledge-distillation
-#      ./run.sh --config configs/enlibraQ3-8B.yaml
+#      ./run.sh --config configs/enlibra/enlibraQ3-8B.yaml
 #
 #  THE CONFIG IS THE ONLY SOURCE OF TRUTH
 #  --------------------------------------
@@ -19,9 +19,21 @@
 #
 #  Pick the profile that matches the machine:
 #
-#      configs/enlibraQ3-8B.yaml         a 48 GB GPU. The real run.
-#      configs/enlibraQ3-8B-mac.yaml     a laptop. All the data, small models.
-#      configs/enlibraQ3-8B-smoke.yaml   a laptop. Two steps, proves plumbing.
+#      configs/enlibra/enlibraQ3-8B.yaml         a 48 GB GPU. The real run.
+#      configs/enlibra/enlibraQ3-8B-mac.yaml     a laptop. All the data, small models.
+#      configs/enlibra/enlibraQ3-8B-smoke.yaml   a laptop. Two steps, proves plumbing.
+#
+#  TRAINING AND EVALUATION ARE SEPARATE
+#  ------------------------------------
+#  A training run ends with the adapter in S3. Scoring it is its own command,
+#  run whenever and wherever, against an evaluation profile:
+#
+#      ./run.sh --config configs/enlibra/enlibraQ25-3B.yaml eval \
+#          --adapter s3://enlibra/.../runs/<run-id>/final_adapter
+#
+#  which writes into that adapter's bundle, under evaluation/<name>-<date>/,
+#  here and in the bucket. --set evaluation.after_training=true puts the
+#  scoring back inside the training run.
 #
 #  WHAT THIS SCRIPT STILL DECIDES
 #  ------------------------------
@@ -42,6 +54,7 @@
 #      ./run.sh --config configs/X.yaml doctor          machine + credentials
 #      ./run.sh --config configs/X.yaml check           resolve, run nothing
 #      ./run.sh --config configs/X.yaml train           training stage only
+#      ./run.sh --config configs/X.yaml eval            score an adapter (see below)
 #      ./run.sh --config configs/X.yaml upload          re-upload the latest run to S3
 #      ./run.sh --config configs/X.yaml upload <run-id> ... or a named run
 #      ./run.sh --config configs/X.yaml ask "why ...?"
@@ -69,9 +82,9 @@ warn()  { printf '!! %s\n' "$*" >&2; }
 die()   { printf '\nxx %s\n' "$*" >&2; exit 1; }
 
 profiles() {
-  for found in "$ROOT"/configs/*.yaml; do
-    case "$found" in *_base.yaml) continue ;; esac
-    printf '    configs/%s\n' "$(basename "$found")"
+  # Grouped one directory deep: configs/<group>/<profile>.yaml.
+  for found in "$ROOT"/configs/*/*.yaml; do
+    printf '    configs/%s/%s\n' "$(basename "$(dirname "$found")")" "$(basename "$found")"
   done
 }
 
@@ -196,7 +209,7 @@ require_config() {
   [ -n "$CONFIG" ] || die "Which config? --config is required - this script has
 no default and never picks one for you.
 
-    ./run.sh --config configs/enlibraQ3-8B.yaml
+    ./run.sh --config configs/enlibra/enlibraQ3-8B.yaml
 
 Profiles in this repository:
 $(profiles)"

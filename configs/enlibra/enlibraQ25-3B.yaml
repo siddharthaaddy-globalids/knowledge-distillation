@@ -1,15 +1,15 @@
 # ===========================================================================
 #  enLibra space curriculum - Qwen2.5-3B (SFT) -> Qwen2.5-1.5B  [rented GPU]
 #
-#    ./run.sh --config configs/enlibraQ25-3B.yaml
+#    ./run.sh --config configs/enlibra/enlibraQ25-3B.yaml
 #
-#  The laptop counterpart is configs/enlibraQ25-3B-smoke.yaml, which changes one
+#  The laptop counterpart is configs/enlibra/enlibraQ25-3B-smoke.yaml, which changes one
 #  thing: how much of the corpus it trains on. Same teacher, same student, same
 #  everything else.
 #
 #  WHY A SECOND PAIR OF PROFILES
 #  -----------------------------
-#  configs/enlibraQ3-8B.yaml distils the RL-tuned 8B teacher. This one distils
+#  configs/enlibra/enlibraQ3-8B.yaml distils the RL-tuned 8B teacher. This one distils
 #  the SFT teacher from a different curriculum run, which is roughly half the
 #  size - so it fits a far cheaper GPU, and is the sensible thing to try first.
 #  The two are separate files rather than one file with switches because a run
@@ -61,6 +61,13 @@ models:
   # warns. The teacher-check stage exists to catch exactly that, and it is a
   # gate, so a teacher that fails it stops the run before any budget is spent.
   teacher: s3://enlibra/dss/dev/runs/9eb5db9e-efe4-4c8d-9f6d-3adf665a44b9/outputs/models/sft/
+  # The stock model the SFT above started from, scored by the evaluation as
+  # the `teacher-base` player: how far the SFT moved it is the most there was
+  # to distil. Needed because the teacher is a merged checkpoint, which cannot
+  # say what it was built from; if the prefix above turns out to hold a LoRA
+  # adapter instead, preflight reads the base from the adapter and this line
+  # becomes a cross-check rather than a requirement.
+  teacher_base: Qwen/Qwen2.5-3B-Instruct
   # INSTRUCT, not the base model, and matching the teacher's lineage: the
   # teacher is an SFT of Qwen2.5-3B-Instruct.
   #
@@ -184,12 +191,22 @@ gkd:
   seq_kd: false
 
 evaluation:
+  # NOT run by the training pipeline. The run ends with the adapter in the
+  # bucket; scoring it is `kd eval`, against this same profile, on whichever
+  # machine is to hand:
+  #
+  #     ./run.sh --config configs/enlibra/enlibraQ25-3B.yaml \
+  #         --adapter s3://enlibra/dss/dev/runs/9eb5db9e-.../outputs/gkd/runs/<run-id>/final_adapter
+  #
+  # It writes into <bundle>/evaluation/<name>-<date>/ beside the adapter, on
+  # disk and in the bucket. To score on the pod straight after training
+  # instead - the teacher is resident and paid for there - flip this:
+  #     --set evaluation.after_training=true
+  after_training: false
   samples: 48
   report_format: html
 
-  # The 137 held-out rows, scored by the `arena` stage right after training -
-  # on the pod, where the teacher is already resident and already paid for.
-  # Doing it later elsewhere means downloading the teacher again.
+  # The 137 held-out rows, scored by the `arena` stage.
   #
   # Expect a lower number than the training distribution would give: these
   # questions run to 5 hops where training stops at 3, so 54 of them ask for a

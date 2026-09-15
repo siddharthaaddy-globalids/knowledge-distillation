@@ -5,7 +5,7 @@ Clone the repository, name a config, run it.
 ```bash
 git clone <GIT REPO URL> knowledge-distillation
 cd knowledge-distillation
-./run.sh --config configs/enlibraQ3-8B-smoke.yaml
+./run.sh --config configs/enlibra/enlibraQ3-8B-smoke.yaml
 ```
 
 **`--config` is required and nothing is ever substituted for it.** There is no
@@ -17,9 +17,9 @@ Pick the profile that matches the machine:
 
 | Config | Where | What |
 |---|---|---|
-| `configs/enlibraQ3-8B-smoke.yaml` | laptop | Two steps. Proves the plumbing. Minutes. |
-| `configs/enlibraQ3-8B-mac.yaml` | laptop | All the data, full schedule, whole evaluation. Small models. Hours. |
-| `configs/enlibraQ3-8B.yaml` | 48 GB GPU | The real run. |
+| `configs/enlibra/enlibraQ3-8B-smoke.yaml` | laptop | Two steps. Proves the plumbing. Minutes. |
+| `configs/enlibra/enlibraQ3-8B-mac.yaml` | laptop | All the data, full schedule, whole evaluation. Small models. Hours. |
+| `configs/enlibra/enlibraQ3-8B.yaml` | 48 GB GPU | The real run. |
 
 The script decides exactly one thing on its own: **how to install**, never what
 to run. On your machine it builds a uv environment with the right torch build;
@@ -61,7 +61,7 @@ export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_DEFAULT_REGION=us-east-1
 
-./run.sh --config configs/enlibraQ3-8B-smoke.yaml
+./run.sh --config configs/enlibra/enlibraQ3-8B-smoke.yaml
 ```
 
 The script installs uv, installs the project, reports what your machine can do,
@@ -127,7 +127,7 @@ The smoke adapter is trained for two steps, so expect nonsense. The point is
 that the plumbing works.
 
 ```bash
-./run.sh --config configs/enlibraQ3-8B-smoke.yaml ask "What are stars formed from?"
+./run.sh --config configs/enlibra/enlibraQ3-8B-smoke.yaml ask "What are stars formed from?"
 ```
 
 ---
@@ -140,11 +140,12 @@ distillation works on this data, because it trains on four samples.
 If you want that answer before renting a GPU — and it is a good answer to have:
 
 ```bash
-./run.sh --config configs/enlibraQ3-8B-mac.yaml
+./run.sh --config configs/enlibra/enlibraQ3-8B-mac.yaml
 ```
 
 This trains on **all 1087 rows for the full 300 steps**, then scores **all 137
-held-out questions** with all three players. Everything is inherited from the
+held-out questions** with every player (the stand-in teacher is stock, so there
+is no teacher-base to score). Everything is inherited from the
 real profile — corpus, LoRA shape, schedule, token budgets — except the models,
 which are one size down (Qwen3-1.7B → Qwen3-0.6B) because 19.0 GB does not fit
 16 GB of memory.
@@ -179,7 +180,7 @@ the sum is what has to fit, *before* activations, optimizer state and the OS.
 |---|---|---|
 | Qwen3-8B → Qwen3-1.7B | **19.0 GB** | does not fit — the teacher alone is 15.3 GB |
 | Qwen3-4B → Qwen3-1.7B | 11.3 GB | runs, but swaps hard |
-| Qwen3-1.7B → Qwen3-0.6B | 5.2 GB | comfortable — `configs/enlibraQ3-8B-mac.yaml` |
+| Qwen3-1.7B → Qwen3-0.6B | 5.2 GB | comfortable — `configs/enlibra/enlibraQ3-8B-mac.yaml` |
 
 `kd.paths` treats 60% of RAM (9.6 GB here) as the working budget, because
 activations and the KV cache sit on top of the weights. Past that macOS does not
@@ -247,7 +248,7 @@ export AWS_DEFAULT_REGION=us-east-1
 export KD_PRICE_PER_HOUR=0.89        # the rate from step 4 above
 
 tmux new -s kd
-./run.sh --config configs/enlibraQ3-8B.yaml
+./run.sh --config configs/enlibra/enlibraQ3-8B.yaml
 ```
 
 Same script, and the config says what runs — it is not inferred from the
@@ -263,7 +264,13 @@ has no idea what it is costing you. The script warns if it is missing.
 
 Expect **1–3 hours**. You can close your laptop.
 
-### When it finishes
+The run ends with the adapter in the bucket. It does **not** score it — that
+is a separate command (see *Scoring an adapter* below), so the pod can be
+released the moment training is done. To score on the pod anyway, while the
+8B teacher is still resident and paid for, add
+`--set evaluation.after_training=true` to the command above.
+
+### When the evaluation finishes
 
 ```
   137 held-out questions, random baseline 25%
@@ -271,11 +278,14 @@ Expect **1–3 hours**. You can close your laptop.
   player        accuracy      elo    +/-  unanswered
   teacher          79.6%     1081     20           0
   distilled        57.7%      993     22           0
+  teacher-base     41.2%      944     21           2
   base             35.8%      926     23           4
 ```
 
 `base` is the stock small model with no training — the control. `distilled` is
-what you just made.
+what you just made. `teacher-base` is the stock Qwen3-8B the teacher was tuned
+from: the distance between it and `teacher` is what the fine-tune bought, and
+the most there was to distil.
 
 | | |
 |---|---|
@@ -300,17 +310,17 @@ has finished, after you have closed the terminal. Go and check.
 before the pod goes away:
 
 ```
-[9/9] upload               OK       12s
+[7/7] upload               OK       12s
       6 files, 84.3 MB -> s3://enlibra/dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/gkd/runs/<run-id>
 ```
 
 | | |
 |---|---|
 | `final_adapter/` | **the LoRA adapter** — what you trained, tens of MB |
-| `report.html` | the readable summary — leads with how close the distilled student is to the teacher, and says where the adapter is (here and on S3) |
-| `metrics.json`, `evaluation.json`, `arena.json` | the numbers — closeness to the teacher, accuracy, Elo and the head-to-head record |
+| `metrics.json` | the training numbers |
 | `run.log`, `events.jsonl` | everything the terminal showed |
 | `config.resolved.yaml`, `manifest.json` | exactly what produced it |
+| `evaluation/<name>-<date>/` | every scoring of the adapter — `report.html`, `evaluation.json`, `arena.json` — whether done on the pod (`evaluation.after_training`) or later with `kd eval`, which uploads its own directory to the same place |
 
 This needs **`s3:PutObject`** on `dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/gkd/*` — a *different* permission from
 reading the teacher. If the upload stage fails, that is why, and nothing is lost:
@@ -319,13 +329,13 @@ the run is still on the pod's disk.
 **Send it somewhere else:**
 
 ```bash
-./run.sh --config configs/enlibraQ3-8B.yaml --set s3.prefix=dss/dev/my-experiment
+./run.sh --config configs/enlibra/enlibraQ3-8B.yaml --set s3.prefix=dss/dev/my-experiment
 ```
 
 **Turn it off:**
 
 ```bash
-./run.sh --config configs/enlibraQ3-8B.yaml --set s3.enabled=false
+./run.sh --config configs/enlibra/enlibraQ3-8B.yaml --set s3.enabled=false
 ```
 
 **Upload by hand afterwards**, if the stage failed — on the pod, before you
@@ -348,7 +358,7 @@ scp -P <port> -i ~/.ssh/id_ed25519 -r \
 
 ```bash
 aws s3 cp --recursive s3://enlibra/dss/dev/runs/98141935-12e6-4ccb-80b3-19ab5bbcf472/outputs/gkd/runs/<run-id>/final_adapter ./my-adapter
-./run.sh --config configs/enlibraQ3-8B.yaml ask "What are stars formed from?" \n    --adapter ./my-adapter
+./run.sh --config configs/enlibra/enlibraQ3-8B.yaml ask "What are stars formed from?" \n    --adapter ./my-adapter
 ```
 
 ---
@@ -395,13 +405,33 @@ those commands exist.
 
 ## Scoring an adapter you trained somewhere else
 
-Two ways, depending on how much you want measured.
-
-**The answer key on its own** — who was right, and how alike their explanations
-are. Three models, no training:
+Training ends with the adapter in the bucket. Scoring it is a separate command,
+run whenever and wherever, and it writes into the adapter's own bundle — under
+`evaluation/<name>-<date>-<time>/`, here and in the bucket — so one adapter can
+be scored any number of times and every scoring is kept:
 
 ```bash
-./run.sh --config configs/enlibraQ25-3B.yaml arena \
+./run.sh --config configs/enlibra/enlibraQ25-3B.yaml eval \
+    --adapter s3://enlibra/dss/dev/runs/<run>/outputs/gkd/runs/<run-id>/final_adapter
+```
+
+That runs **preflight → evaluate → arena → report → upload**: fidelity to the
+teacher, the answer key with all four players (the stock student, the distilled
+student, the stock Qwen2.5-3B-Instruct the teacher was tuned from, and the
+teacher), the report, and the upload to
+`.../runs/<run-id>/evaluation/full-<date>-<time>/` beside the adapter. Add
+`--skip upload` to keep it off S3; `--name quick --set evaluation.arena_limit=8
+--set evaluation.samples=8` does eight questions in minutes. To score on the training pod straight after
+training instead, add `--set evaluation.after_training=true` to the training
+command.
+
+For less than that, two standalone tools remain.
+
+**The answer key on its own** — who was right, and how alike their explanations
+are. No training, and no fidelity pass:
+
+```bash
+./run.sh --config configs/enlibra/enlibraQ25-3B.yaml arena \
     --adapter s3://enlibra/dss/dev/runs/<run>/outputs/gkd/runs/<run-id>/final_adapter
 ```
 
@@ -420,20 +450,12 @@ It writes three files beside each other, whether or not you ask:
 `--json some/where/score.json` moves all three; `--report=` skips the HTML;
 `--no-save` writes nothing, which is what you want with `--limit 5`.
 
-**Everything the report can show** — the above *plus* fidelity to the teacher,
-perplexity and tokens/sec, which need the `evaluate` stage:
+**Fidelity on its own** — `kd evaluate`, the token-level measurement without
+the answer key.
 
-```bash
-./run.sh --config configs/enlibraQ25-3B.yaml --from evaluate \
-    --adapter s3://enlibra/dss/dev/runs/<run>/outputs/gkd/runs/<run-id>/final_adapter
-```
-
-That runs **evaluate → arena → report** into a *new* run directory under `runs/`,
-printed at the end. Add `--skip upload` to keep it off S3.
-
-You do not have to assemble either command by hand: every `report.html` ends
-with a section called **The adapter** that names the adapter's local path, its
-S3 copy, and these two commands with the paths filled in.
+You do not have to assemble the `kd eval` command by hand: every `report.html`
+ends with a section called **The adapter** that names the adapter's local path,
+its S3 copy, and the command with the paths filled in.
 
 ---
 

@@ -18,7 +18,7 @@ Two entry points, differing only in thoroughness:
     main()            the standalone `kd check-teacher`, which loads ONLY the
                       teacher and is far cheaper than a training smoke test
 
-    kd check-teacher --config configs/finance.yaml
+    kd check-teacher --config configs/qwen/finance.yaml
     kd check-teacher --teacher some-org/some-model --dtype bfloat16
 
 Exit status is 0 when the teacher is healthy and 2 when it is not, so it can gate
@@ -93,6 +93,21 @@ def load_teacher(teacher_id, adapter=None, dtype=None, device="cpu", verbose=Tru
     transformers may not map back onto the architecture. Merging here, from the
     canonical base, sidesteps that entirely.
     """
+    # A teacher that is itself a LoRA adapter, reached without going through
+    # kd.paths.normalise_teacher - a standalone tool handed the adapter
+    # directory directly. The adapter records its base, so it is split here
+    # rather than failing on a directory with no config.json.
+    if not adapter and os.path.isfile(os.path.join(str(teacher_id), "adapter_config.json")):
+        from .paths import adapter_base
+        base = adapter_base(teacher_id)
+        if not base:
+            raise RuntimeError(
+                f"{teacher_id} is a LoRA adapter that records no base model; "
+                f"name the base with --teacher and the adapter with --teacher-adapter")
+        if verbose:
+            print(f" -> {teacher_id} is a LoRA adapter; loading its base {base}")
+        teacher_id, adapter = base, teacher_id
+
     model, info = AutoModelForCausalLM.from_pretrained(
         teacher_id, dtype=dtype, low_cpu_mem_usage=True, output_loading_info=True)
     if adapter:
@@ -303,9 +318,9 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("-c", "--config", default="configs/finance.yaml",
+    ap.add_argument("-c", "--config", default="configs/qwen/finance.yaml",
                     help="Config file to read models.teacher from "
-                         "(default: configs/finance.yaml)")
+                         "(default: configs/qwen/finance.yaml)")
     ap.add_argument("-t", "--teacher", default=None,
                     help="Teacher repo id, overriding the config file")
     ap.add_argument("-a", "--teacher-adapter", default=None,
@@ -335,6 +350,15 @@ def main(args=None):
     device = hardware["device"]
     dtype = DTYPES[args.dtype] or hardware["dtype"]
 
+    # models.teacher may point at a LoRA adapter; split it into base + adapter
+    # the same way preflight does, so this check loads what training will.
+    from . import paths
+    if not (args.teacher or args.teacher_adapter):
+        try:
+            paths.resolve_teacher(config)
+        except RuntimeError as exc:
+            print(f"xx  {exc}")
+            return 2
     teacher_id = args.teacher or config["models"]["teacher"]
     adapter_id = args.teacher_adapter or config["models"].get("teacher_adapter")
     tokenizer_id = args.tokenizer or teacher_id

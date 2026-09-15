@@ -2,10 +2,10 @@
 # ===========================================================================
 #  Ask the distilled student a question, or score it on the held-out split.
 #
-#      python scripts/ask.py --config configs/enlibraQ3-8B.yaml \
+#      python scripts/ask.py --config configs/enlibra/enlibraQ3-8B.yaml \
 #          --question "What is a star formed from?"
 #
-#      python scripts/ask.py --config configs/enlibraQ3-8B.yaml --accuracy
+#      python scripts/ask.py --config configs/enlibra/enlibraQ3-8B.yaml --accuracy
 #
 #  WHY THIS EXISTS ALONGSIDE `kd evaluate`
 #  ---------------------------------------
@@ -189,7 +189,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Ask the distilled student, or score it on the held-out split.",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    parser.add_argument("-c", "--config", default="configs/enlibraQ3-8B.yaml",
+    parser.add_argument("-c", "--config", default="configs/enlibra/enlibraQ3-8B.yaml",
                         help="Profile the adapter was trained from. Supplies the "
                              "base model, the domains and the seed.")
     parser.add_argument("--adapter", default=None, metavar="DIR",

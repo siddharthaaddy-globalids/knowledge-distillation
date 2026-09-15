@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # Finance distillation - Qwen3.5-2B + a finance LoRA  ->  Qwen3.5-0.8B
 #
-#   kd pipeline --config configs/finance.yaml
+#   kd pipeline --config configs/qwen/finance.yaml
 #
 # The teacher is assembled from a BASE MODEL PLUS A LORA ADAPTER rather than
 # loaded from a merged checkpoint. That is the safer of the two forms, and it is

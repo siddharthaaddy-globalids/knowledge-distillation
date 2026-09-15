@@ -16,10 +16,19 @@ teacher, on the same held-out split. The base student column is what makes the
 numbers mean anything: without it there is no way to tell "distillation worked"
 apart from "the small model could already do this".
 
-    kd evaluate --config configs/finance.yaml
-    kd evaluate --config configs/finance.yaml --dtype bfloat16 --samples 100
-    kd evaluate --config configs/finance.yaml --tasks ifeval,hellaswag
-    kd evaluate --config configs/mac.yaml --json results.json
+A fourth column, the TEACHER'S OWN BASE - the stock model it was fine-tuned from
+- is measured the same way when it is known (models.teacher_base, or a teacher
+that is base + adapter) and `evaluation.players` names it. It says what the
+fine-tune bought the teacher: how far the teacher moved from the stock model is
+the most there was to distil, and a student that agrees with the teacher no more
+than the stock base does has learned nothing the base did not already know. It
+is loaded in a second pass after the student is freed, so peak memory is two
+teachers rather than three models.
+
+    kd evaluate --config configs/qwen/finance.yaml
+    kd evaluate --config configs/qwen/finance.yaml --dtype bfloat16 --samples 100
+    kd evaluate --config configs/qwen/finance.yaml --tasks ifeval,hellaswag
+    kd evaluate --config configs/smollm/mac.yaml --json results.json
 
 The held-out split is rebuilt with the training seed, so it is exactly the split
 the student never trained on.
@@ -64,9 +73,9 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("-c", "--config", default="configs/default.yaml",
+    ap.add_argument("-c", "--config", default="configs/smollm/default.yaml",
                     help="Training config the adapter was produced from "
-                         "(default: configs/default.yaml)")
+                         "(default: configs/smollm/default.yaml)")
     ap.add_argument("-a", "--adapter", default=None,
                     help="Adapter directory to evaluate "
                          "(default: the newest adapter under project.runs_dir)")
@@ -75,6 +84,12 @@ def parse_args():
     ap.add_argument("--teacher-adapter", default=None,
                     help="LoRA adapter merged into the teacher, when the teacher is "
                          "a base model plus an adapter rather than a merged checkpoint")
+    ap.add_argument("--teacher-base", default=None,
+                    help="The stock model the teacher was fine-tuned from, scored as "
+                         "a fourth column (default: models.teacher_base, or the "
+                         "base of a teacher given as base + adapter)")
+    ap.add_argument("--no-teacher-base", action="store_true",
+                    help="Skip the fourth column even when the base is known")
     ap.add_argument("-n", "--samples", type=int, default=50,
                     help="Held-out samples to score (default: 50)")
     ap.add_argument("--device", default=None, choices=["auto", "cpu", "mps", "cuda"],
@@ -223,6 +238,67 @@ def generate(model, tokenizer, prompt, device, new_tokens=64):
                              repetition_penalty=1.1,
                              pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
     return tokenizer.decode(out[0][ids.input_ids.shape[1]:], skip_special_tokens=True).strip()
+
+
+# --------------------------------------------------------------------------- #
+# The teacher's own base, scored against the teacher
+# --------------------------------------------------------------------------- #
+def score_teacher_base(base_id, teacher, teacher_id, tokenizer, samples, device,
+                       dtype, config):
+    """Agreement with, KL from, and perplexity beside the fine-tuned teacher.
+
+    The same measurement the student gets, applied to the model the teacher
+    was fine-tuned from. Returns {agreement_pct, kl, perplexity, params,
+    generations}, or None when nothing could be scored.
+
+    Loaded here rather than alongside the student because it is the teacher's
+    size, and the caller frees the student first. The base is trimmed to the
+    teacher's output width the way the student is - a stock checkpoint pads
+    its vocabulary for alignment and the fine-tune may have trimmed it - so a
+    genuine vocabulary mismatch is the only reason the comparison is refused.
+    """
+    from . import paths
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_id, dtype=dtype, low_cpu_mem_usage=True)
+    try:
+        paths.fit_vocab(model, paths.vocab_target(base_id, teacher_id, len(tokenizer)),
+                        label="teacher base")
+    except ValueError as exc:
+        print(f" !! {exc}")
+        return None
+    model = model.to(device).eval()
+
+    tokens, agree, kl, nll = 0, 0, 0.0, 0.0
+    for messages in samples:
+        ids, prompt_len = encode(tokenizer, messages, device)
+        with torch.no_grad():
+            t_logits, targets = completion_slice(teacher(ids).logits, ids, prompt_len)
+            if t_logits is None or t_logits.shape[0] == 0:
+                continue
+            b_logits, _ = completion_slice(model(ids).logits, ids, prompt_len)
+        if t_logits.shape[-1] != b_logits.shape[-1]:
+            print(f" !! the teacher's base has a {b_logits.shape[-1]}-wide vocabulary "
+                  f"against the teacher's {t_logits.shape[-1]}; not comparable")
+            return None
+        tokens += t_logits.shape[0]
+        a, k = compare_distributions(t_logits, b_logits)
+        agree += a
+        kl += k
+        nll += summed_nll(b_logits, targets)
+        del t_logits, b_logits
+    if not tokens:
+        return None
+
+    generations = {}
+    for prompt in (config.get("benchmark_prompts") or [])[:3]:
+        generations[prompt] = generate(model, tokenizer, prompt, device)
+    params = sum(p.numel() for p in model.parameters())
+    del model
+    gc.collect()
+    return {"agreement_pct": agree / tokens * 100, "kl": kl / tokens,
+            "perplexity": math.exp(nll / tokens), "params": params,
+            "generations": generations}
 
 
 # --------------------------------------------------------------------------- #
@@ -398,7 +474,7 @@ def report_similarity(result):
 # Optional: lm-evaluation-harness
 # --------------------------------------------------------------------------- #
 def run_lm_eval(tasks, student_id, adapter_dir, teacher_id, teacher_adapter,
-                dtype_name, device, limit):
+                dtype_name, device, limit, teacher_base=None):
     """Score base student, distilled student and teacher on standard benchmarks.
 
     lm-evaluation-harness is the de facto standard harness (it is what the HF Open
@@ -417,6 +493,8 @@ def run_lm_eval(tasks, student_id, adapter_dir, teacher_id, teacher_adapter,
         "teacher": f"pretrained={teacher_id}"
                    + (f",peft={teacher_adapter}" if teacher_adapter else ""),
     }
+    if teacher_base:
+        runs["teacher_base"] = f"pretrained={teacher_base}"
 
     results = {}
     for label, model_args in runs.items():
@@ -552,9 +630,30 @@ def main(args=None):
     dtype = DTYPES[args.dtype] or hardware["dtype"]
     dtype_name = str(dtype).replace("torch.", "")
 
+    from . import paths
+
+    # s3:// parts fetched, and a models.teacher that is really a LoRA adapter
+    # split into base + adapter - unless the command line named the teacher
+    # itself, in which case it is taken exactly as given.
+    if not (args.teacher or args.teacher_adapter):
+        try:
+            paths.resolve_teacher(config)
+        except RuntimeError as exc:
+            raise SystemExit(f"xx  {exc}") from exc
     teacher_id = args.teacher or config["models"]["teacher"]
     student_id = args.student or config["models"]["student"]
     teacher_adapter = args.teacher_adapter or config["models"].get("teacher_adapter")
+
+    # The fourth column. Known from the command line, from the config, or from
+    # the teacher being base + adapter; wanted when evaluation.players says so.
+    players = list((config.get("evaluation") or {}).get("players")
+                   or ["base", "distilled", "teacher-base", "teacher"])
+    teacher_base_id = None
+    if not getattr(args, "no_teacher_base", False) and (
+            getattr(args, "teacher_base", None) or "teacher-base" in players):
+        teacher_base_id = getattr(args, "teacher_base", None) or paths.teacher_base_of(config)
+        if teacher_base_id and paths.is_remote(teacher_base_id):
+            teacher_base_id = paths.localise(teacher_base_id, config, label="teacher base")
 
     # Explicit --adapter wins; then a pinned project.output_dir; otherwise the newest
     # adapter any run produced. Falling back to the newest run is what makes
@@ -580,6 +679,8 @@ def main(args=None):
     print("  Distillation evaluation")
     print(BAR)
     print(f"   teacher   : {teacher_id}" + (f"  + {teacher_adapter}" if teacher_adapter else ""))
+    if teacher_base_id:
+        print(f"   its base  : {teacher_base_id}  (scored as a fourth column)")
     print(f"   student   : {student_id}")
     print(f"   adapter   : {adapter_dir}")
     print(f"   device    : {device} ({dtype_name})")
@@ -596,7 +697,8 @@ def main(args=None):
     # --- models -------------------------------------------------------------- #
     # Teacher and student are both resident: agreement and KL need both
     # distributions for the same position at the same time.
-    print(f"\n[1/4] Loading teacher ({teacher_id})...")
+    phases = 5 if teacher_base_id else 4
+    print(f"\n[1/{phases}] Loading teacher ({teacher_id})...")
     teacher = AutoModelForCausalLM.from_pretrained(
         teacher_id, dtype=dtype, low_cpu_mem_usage=True)
     if teacher_adapter:
@@ -608,7 +710,7 @@ def main(args=None):
     # One student instance serves as both columns: PEFT's disable_adapter() context
     # turns the LoRA branches off, which is the base student exactly. Loading a
     # second copy would double peak memory for no additional information.
-    print(f"[2/4] Loading student ({student_id}) + adapter...")
+    print(f"[2/{phases}] Loading student ({student_id}) + adapter...")
     from peft import PeftModel
     student = AutoModelForCausalLM.from_pretrained(
         student_id, dtype=dtype, low_cpu_mem_usage=True)
@@ -626,7 +728,7 @@ def main(args=None):
     adapter_params = sum(p.numel() for n, p in student.named_parameters() if "lora_" in n)
 
     # --- fidelity + perplexity ----------------------------------------------- #
-    print(f"[3/4] Scoring {len(samples)} held-out samples...")
+    print(f"[3/{phases}] Scoring {len(samples)} held-out samples...")
     tokens = 0
     agree_base = agree_dist = 0
     kl_base = kl_dist = 0.0
@@ -684,7 +786,7 @@ def main(args=None):
     ppl_dist = math.exp(nll_dist / tokens)
 
     # --- efficiency + generations -------------------------------------------- #
-    print("[4/4] Measuring decode throughput...")
+    print(f"[4/{phases}] Measuring decode throughput...")
     probe = (config.get("benchmark_prompts") or ["Explain compound interest."])[0]
     tps_teacher = measure_latency(teacher, tokenizer, probe, device)
     tps_dist = measure_latency(student, tokenizer, probe, device)
@@ -795,9 +897,48 @@ def main(args=None):
             model_type=args.similarity_model, rescale=not args.no_rescale)
         report_similarity(similarity)
 
+    # --- the fourth column: the teacher's own base ---------------------------- #
+    # After everything that needs the student, which is freed first: the base
+    # is the teacher's size, and two teachers plus a student is more than a
+    # 16 GB card holds for a 3B pair. Same split, same positions, same teacher
+    # logits, so the numbers sit in the same table as the student's.
+    teacher_base = None
+    if teacher_base_id:
+        print(f"\n[5/{phases}] Loading the teacher's base ({teacher_base_id})...")
+        del student
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        elif device == "mps" and hasattr(torch, "mps"):
+            torch.mps.empty_cache()
+        try:
+            teacher_base = score_teacher_base(
+                teacher_base_id, teacher, teacher_id, tokenizer, samples, device,
+                dtype, config)
+        except Exception as exc:  # noqa: BLE001 - a column, not the evaluation
+            print(f" !! teacher base skipped: {type(exc).__name__}: {exc}")
+            teacher_base = None
+        if teacher_base:
+            print("\n" + BAR)
+            print("  THE TEACHER'S OWN BASE - what the fine-tune bought the teacher")
+            print(BAR)
+            print(f"\n  {'metric':34} {'teacher base':>14} {'distilled':>11}")
+            print("  " + "-" * 70)
+            print(f"  {'top-1 agreement with teacher':34} "
+                  f"{teacher_base['agreement_pct']:13.2f}% {agreement_dist:10.2f}%")
+            print(f"  {'KL(teacher || model), per token':34} "
+                  f"{teacher_base['kl']:14.4f} {kl_dist_avg:11.4f}")
+            print(f"  {'held-out perplexity':34} "
+                  f"{teacher_base['perplexity']:14.3f} {ppl_dist:11.3f}")
+            print("\n  How far the teacher moved from the stock model it was fine-tuned")
+            print("  from is the most there was to distil. A distilled student that")
+            print("  agrees with the teacher no more than the stock base does has")
+            print("  learned nothing the base did not already know.")
+
     payload = {
         "teacher": teacher_id,
         "teacher_adapter": teacher_adapter,
+        "teacher_base": teacher_base_id if teacher_base else None,
         "student": student_id,
         "adapter": adapter_dir,
         # Where that adapter lives, here and in the bucket, and the profile
@@ -843,11 +984,26 @@ def main(args=None):
         "generation_similarity_texts": similarity_texts,
     }
 
+    if teacher_base:
+        payload["fidelity"]["top1_agreement_teacher_base_pct"] = teacher_base["agreement_pct"]
+        payload["fidelity"]["kl_teacher_base"] = teacher_base["kl"]
+        payload["capability"]["perplexity_teacher_base"] = teacher_base["perplexity"]
+        payload["closeness_to_teacher"]["prediction_agreement_teacher_base_pct"] = \
+            teacher_base["agreement_pct"]
+        payload["closeness_to_teacher"]["perplexity_retention_teacher_base_pct"] = (
+            ppl_teacher / teacher_base["perplexity"] * 100
+            if teacher_base["perplexity"] else float("nan"))
+        payload["efficiency"]["teacher_base_params"] = teacher_base["params"]
+        for prompt, text in (teacher_base.get("generations") or {}).items():
+            generations.setdefault(prompt, {})["teacher-base"] = text
+
     # Free the resident models before lm-eval spawns its own processes. Not
     # cosmetic: each lm-eval run loads its own copy of the model, so on a 16 GB
     # unified-memory Mac the parent still caching ~6 GB is the difference between
     # the benchmark running and the machine swapping itself to a halt.
-    del teacher, student
+    del teacher
+    if not teacher_base_id:
+        del student
     gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -856,7 +1012,8 @@ def main(args=None):
 
     if args.tasks:
         task_results = run_lm_eval(args.tasks, student_id, adapter_dir, teacher_id,
-                                   teacher_adapter, dtype_name, device, args.limit)
+                                   teacher_adapter, dtype_name, device, args.limit,
+                                   teacher_base=teacher_base_id if teacher_base else None)
         if task_results:
             report_tasks(task_results)
             payload["tasks"] = task_results

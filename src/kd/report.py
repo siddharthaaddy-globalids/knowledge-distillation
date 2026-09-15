@@ -101,6 +101,24 @@ def _arena_summary(arena):
                 f"student - so on this set there was no gap to close, and the "
                 f"comparison says more about the questions than about the models.")
 
+    # What the fine-tune bought the TEACHER, in the same terms. A teacher no
+    # better than the stock model it came from had nothing to pass on, and a
+    # student that matches it has matched something the stock model already
+    # knew - which is worth saying next to the number above.
+    teacher_base = players.get("teacher-base")
+    if teacher and teacher_base:
+        bought = pct(teacher) - pct(teacher_base)
+        if bought > 0:
+            lines.append(
+                f"For scale: the teacher's own fine-tune took it from "
+                f"{pct(teacher_base):.1f}% (its stock base) to {pct(teacher):.1f}%, "
+                f"a gain of {bought:.1f} points - that is what there was to distil.")
+        else:
+            lines.append(
+                f"For scale: the teacher's stock base already scores "
+                f"{pct(teacher_base):.1f}%, at or above the fine-tuned teacher - so "
+                f"on this set the fine-tune added nothing for the student to learn.")
+
     # Answered-vs-correct kept separate, because a model that never produces a
     # parseable letter scores 0% for a reason that has nothing to do with what
     # it knows - and that is a fixable problem, unlike being wrong.
@@ -253,8 +271,9 @@ def _adapter_facts(payload):
     # machine, which the local path is not.
     target = where.get("s3") or local
     commands = [
-        ("everything this report can show (evaluate, arena, report)",
-         f"./run.sh --config {profile} --from evaluate --adapter {target}"),
+        ("everything this report can show (evaluate, arena, report), into the "
+         "adapter's own bundle under evaluation/",
+         f"./run.sh --config {profile} eval --adapter {target}"),
         ("the answer key and the similarity table alone (no teacher fidelity)",
          f"./run.sh --config {profile} arena --adapter {target}"),
     ]
@@ -497,14 +516,36 @@ def loss_note(beta, ce_alpha=0.0):
             + ceiling)
 
 
-# What the four columns mean unless a section says otherwise. Most sections
-# compare the three models; the similarity table compares three PAIRS of them,
-# and labelling its columns with model names would misdescribe every cell.
+# The models a report can have a column for, in the order the columns print,
+# and what each column is called. Most sections compare the models; the
+# similarity table compares PAIRS of them, and carries its own headers.
+#
+# The teacher's stock base is a column only when it was scored - a merged
+# teacher checkpoint cannot say what it was built from, and a report that
+# printed a column of dashes for it would look like a measurement that failed.
+COLUMNS = (("base", "Base student"), ("distilled", "Distilled"),
+           ("teacher-base", "Teacher base"), ("teacher", "Teacher"))
 DEFAULT_HEADERS = ("Metric", "Base student", "Distilled", "Teacher")
 
 
-def _closeness_rows(arena, total, pct):
-    """Rows for the closeness section, columns Base / Distilled / Teacher.
+def _columns(payload):
+    """The model columns this payload can fill: [(player, header), ...]."""
+    players = set((payload.get("arena") or {}).get("players") or {})
+    fid = payload.get("fidelity") or {}
+    cap = payload.get("capability") or {}
+    has_teacher_base = ("teacher-base" in players
+                        or "top1_agreement_teacher_base_pct" in fid
+                        or "perplexity_teacher_base" in cap)
+    return [(name, header) for name, header in COLUMNS
+            if name != "teacher-base" or has_teacher_base]
+
+
+def _headers(payload):
+    return ("Metric",) + tuple(header for _name, header in _columns(payload))
+
+
+def _closeness_rows(arena, total, pct, columns):
+    """Rows for the closeness section, one cell per model column.
 
     The teacher column is the ceiling by definition - it agrees with itself on
     everything - and is printed rather than left blank so the table says what
@@ -514,42 +555,54 @@ def _closeness_rows(arena, total, pct):
     if not close:
         return []
     players = arena.get("players") or {}
-    cb, cd = close.get("base") or {}, close.get("distilled") or {}
+    names = [name for name, _header in columns]
+    entry = lambda name: close.get(name) or {}
 
-    def same(entry):
-        if entry.get("same_answer") is None:
+    def same(name):
+        if name == "teacher":
+            return f"{total} / {total}  (100.0%)"
+        e = entry(name)
+        if e.get("same_answer") is None:
             return "-"
-        return f"{entry['same_answer']} / {entry['of']}  ({pct(entry.get('same_answer_pct'))})"
+        return f"{e['same_answer']} / {e['of']}  ({pct(e.get('same_answer_pct'))})"
 
-    rows = [("Gave the teacher's answer", same(cb), same(cd),
-             f"{total} / {total}  (100.0%)")]
-    cos = lambda e: (f"{e['explanation_cosine']:.3f}"
-                     if isinstance(e.get("explanation_cosine"), float) else "-")
-    if any(isinstance(e.get("explanation_cosine"), float) for e in (cb, cd)):
-        rows.append(("Explanations alike (cosine, 0-1)", cos(cb), cos(cd), "1.000"))
+    def cos(name):
+        if name == "teacher":
+            return "1.000"
+        value = entry(name).get("explanation_cosine")
+        return f"{value:.3f}" if isinstance(value, float) else "-"
+
+    rows = [("Gave the teacher's answer", *(same(n) for n in names))]
+    if any(isinstance(entry(n).get("explanation_cosine"), float) for n in names):
+        rows.append(("Explanations alike (cosine, 0-1)", *(cos(n) for n in names)))
     # Accuracy as a share of the teacher's: the same closeness, asked of the
     # answer key. Skipped when the teacher scored nothing, since a share of
     # zero is not a number.
     tea = (players.get("teacher") or {}).get("accuracy")
     if isinstance(tea, float) and tea > 0:
-        share = lambda name: ((players.get(name) or {}).get("accuracy"))
-        cell = lambda v: (f"{v / tea * 100:.0f}%" if isinstance(v, float) else "-")
+        def share(name):
+            if name == "teacher":
+                return "100%"
+            value = (players.get(name) or {}).get("accuracy")
+            return f"{value / tea * 100:.0f}%" if isinstance(value, float) else "-"
         rows.append(("Accuracy, as a share of the teacher's",
-                     cell(share("base")), cell(share("distilled")), "100%"))
+                     *(share(n) for n in names)))
     return rows
 
 
 def _sections(payload):
     """(title, rows, headers) for every section, headers defaulted."""
-    return [(s[0], s[1], s[2] if len(s) > 2 else DEFAULT_HEADERS)
+    default = _headers(payload)
+    return [(s[0], s[1], s[2] if len(s) > 2 else default)
             for s in _report_rows(payload)]
 
 
 def _report_rows(payload):
-    """(section, [(label, base, distilled, teacher)]) for both report formats.
+    """(section, [(label, cell, cell, ...)]) for both report formats.
 
-    A section may carry a third element, its own column headers, for a table
-    whose columns are not the three models.
+    Every row carries one cell per model column (see `_columns`) unless the
+    section carries a third element, its own column headers, for a table whose
+    columns are not the models.
     """
     fid = payload.get("fidelity")
     cap = payload.get("capability")
@@ -558,7 +611,13 @@ def _report_rows(payload):
     fmt = lambda v, spec=".4f": (format(v, spec)
                                  if isinstance(v, (int, float)) and math.isfinite(v)
                                  else "-")
+    columns = _columns(payload)
+    names = [name for name, _header in columns]
     sections = []
+
+    def per_model(values):
+        """One cell per column from {player: text}; '-' where nothing was measured."""
+        return tuple(values.get(n, "-") for n in names)
 
     # Closeness to the teacher first: the main score. Then the answer key -
     # who was RIGHT - as context. Fidelity further down says the same thing
@@ -567,17 +626,14 @@ def _report_rows(payload):
     players = arena.get("players") or {}
     if players:
         total = arena.get("questions", 0)
-        order = [n for n in ("base", "distilled", "teacher") if n in players]
         pct = lambda v: (f"{v * 100:.1f}%" if isinstance(v, float) else "-")
 
-        def three(cell):
-            values = {n: cell(players[n]) for n in order}
-            return (values.get("base", "-"), values.get("distilled", "-"),
-                    values.get("teacher", "-"))
+        def each(cell):
+            return per_model({n: cell(players[n]) for n in names if n in players})
 
         subset = (f" — a SUBSET of {arena['available']}, not the score"
                   if arena.get("available") and arena.get("limited_to") else "")
-        close_rows = _closeness_rows(arena, total, pct)
+        close_rows = _closeness_rows(arena, total, pct, columns)
         if close_rows:
             sections.append(
                 (f"How close is it to the teacher? — {total} held-out "
@@ -585,14 +641,14 @@ def _report_rows(payload):
 
         rows = [
             ("Produced a parseable answer",
-             *three(lambda e: f"{e['answered']} / {total}")),
+             *each(lambda e: f"{e['answered']} / {total}")),
             (f"Correct, counting all {total}",
-             *three(lambda e: pct(e.get("accuracy")))),
+             *each(lambda e: pct(e.get("accuracy")))),
             ("Correct, when it answered",
-             *three(lambda e: pct(e.get("accuracy_when_answered")))),
+             *each(lambda e: pct(e.get("accuracy_when_answered")))),
             ("Answered in the trained <Answer> format",
-             *three(lambda e: f"{e.get('in_trained_format', 0)} / {total}")),
-            ("Elo", *three(lambda e: f"{e['elo']:.0f}  ±{e['elo_spread']:.0f}")),
+             *each(lambda e: f"{e.get('in_trained_format', 0)} / {total}")),
+            ("Elo", *each(lambda e: f"{e['elo']:.0f}  ±{e['elo_spread']:.0f}")),
         ]
         sections.append(
             (f"The answer key — {total} held-out questions{subset} "
@@ -612,6 +668,8 @@ def _report_rows(payload):
     if asim.get("pairs"):
         pairs = asim["pairs"]
         want = ("base vs teacher", "distilled vs teacher", "base vs distilled")
+        if "teacher-base" in players:
+            want += ("teacher-base vs teacher",)
 
         def cell(pair, hop=None):
             entry = pairs.get(pair) or pairs.get(" vs ".join(reversed(pair.split(" vs "))))
@@ -627,44 +685,66 @@ def _report_rows(payload):
             rows.append((f"{hop} hop  ({counted.get('n', 0)} questions)",
                          *(cell(p, hop) for p in want)))
         rows.append(("All questions", *(cell(p) for p in want)))
+        titles = {"base vs teacher": "Base vs teacher",
+                  "distilled vs teacher": "Distilled vs teacher",
+                  "base vs distilled": "Base vs distilled",
+                  "teacher-base vs teacher": "Teacher base vs teacher"}
         sections.append((
             "How alike are the explanations? (cosine 0-1, by reasoning depth)",
             rows,
-            ("Reasoning depth", "Base vs teacher", "Distilled vs teacher",
-             "Base vs distilled")))
+            ("Reasoning depth",) + tuple(titles[p] for p in want)))
 
     if not (fid and cap and eff):
         return sections
 
+    # kd.evaluate's columns. The teacher-base cells exist only when the second
+    # pass ran (evaluation.players names it), and the column only when
+    # _columns says so - the two agree because both read the same keys.
+    tb_agree = fid.get("top1_agreement_teacher_base_pct")
+    tb_kl = fid.get("kl_teacher_base")
+    tb_ppl = cap.get("perplexity_teacher_base")
+    tb_ret = close.get("perplexity_retention_teacher_base_pct")
     sections += [
         ("How close is it to the teacher, token by token?", [
-            ("Prediction agreement",
-             fmt(close.get("prediction_agreement_base_pct"), ".2f") + "%",
-             fmt(close.get("prediction_agreement_distilled_pct"), ".2f") + "%", "100%"),
-            ("Perplexity retention",
-             fmt(close.get("perplexity_retention_base_pct"), ".2f") + "%",
-             fmt(close.get("perplexity_retention_distilled_pct"), ".2f") + "%", "100%"),
+            ("Prediction agreement", *per_model({
+                "base": fmt(close.get("prediction_agreement_base_pct"), ".2f") + "%",
+                "distilled": fmt(close.get("prediction_agreement_distilled_pct"), ".2f") + "%",
+                "teacher-base": fmt(tb_agree, ".2f") + "%" if tb_agree is not None else "-",
+                "teacher": "100%"})),
+            ("Perplexity retention", *per_model({
+                "base": fmt(close.get("perplexity_retention_base_pct"), ".2f") + "%",
+                "distilled": fmt(close.get("perplexity_retention_distilled_pct"), ".2f") + "%",
+                "teacher-base": fmt(tb_ret, ".2f") + "%" if tb_ret is not None else "-",
+                "teacher": "100%"})),
         ]),
         ("Fidelity - does it predict what the teacher predicts?", [
-            ("Top-1 agreement with teacher",
-             fmt(fid["top1_agreement_base_pct"], ".2f") + "%",
-             fmt(fid["top1_agreement_distilled_pct"], ".2f") + "%", "100%"),
-            ("KL divergence from teacher (lower is better)",
-             fmt(fid["kl_base"]), fmt(fid["kl_distilled"]), "0"),
+            ("Top-1 agreement with teacher", *per_model({
+                "base": fmt(fid["top1_agreement_base_pct"], ".2f") + "%",
+                "distilled": fmt(fid["top1_agreement_distilled_pct"], ".2f") + "%",
+                "teacher-base": fmt(tb_agree, ".2f") + "%" if tb_agree is not None else "-",
+                "teacher": "100%"})),
+            ("KL divergence from teacher (lower is better)", *per_model({
+                "base": fmt(fid["kl_base"]), "distilled": fmt(fid["kl_distilled"]),
+                "teacher-base": fmt(tb_kl), "teacher": "0"})),
         ]),
         ("Capability - is it better at the task?", [
-            ("Held-out perplexity (lower is better)",
-             fmt(cap["perplexity_base"], ".3f"), fmt(cap["perplexity_distilled"], ".3f"),
-             fmt(cap["perplexity_teacher"], ".3f")),
+            ("Held-out perplexity (lower is better)", *per_model({
+                "base": fmt(cap["perplexity_base"], ".3f"),
+                "distilled": fmt(cap["perplexity_distilled"], ".3f"),
+                "teacher-base": fmt(tb_ppl, ".3f"),
+                "teacher": fmt(cap["perplexity_teacher"], ".3f")})),
         ]),
         ("Cost", [
-            ("Parameters", "-", f"{eff['student_params'] / 1e9:.3f}B",
-             f"{eff['teacher_params'] / 1e9:.3f}B"),
-            ("Decode throughput (tokens/sec)", "-",
-             fmt(eff.get("distilled_tok_per_s"), ".1f"),
-             fmt(eff.get("teacher_tok_per_s"), ".1f")),
-            ("Trainable adapter parameters", "-",
-             f"{eff['adapter_params'] / 1e6:.2f}M", "-"),
+            ("Parameters", *per_model({
+                "distilled": f"{eff['student_params'] / 1e9:.3f}B",
+                "teacher-base": (f"{eff['teacher_base_params'] / 1e9:.3f}B"
+                                 if eff.get("teacher_base_params") else "-"),
+                "teacher": f"{eff['teacher_params'] / 1e9:.3f}B"})),
+            ("Decode throughput (tokens/sec)", *per_model({
+                "distilled": fmt(eff.get("distilled_tok_per_s"), ".1f"),
+                "teacher": fmt(eff.get("teacher_tok_per_s"), ".1f")})),
+            ("Trainable adapter parameters", *per_model({
+                "distilled": f"{eff['adapter_params'] / 1e6:.2f}M"})),
         ]),
     ]
 
@@ -672,12 +752,13 @@ def _report_rows(payload):
     if sim:
         rows = []
         if "bertscore_f1_base" in sim:
-            rows.append(("BERTScore vs teacher (meaning)",
-                         fmt(sim["bertscore_f1_base"]),
-                         fmt(sim["bertscore_f1_distilled"]), "1.0"))
+            rows.append(("BERTScore vs teacher (meaning)", *per_model({
+                "base": fmt(sim["bertscore_f1_base"]),
+                "distilled": fmt(sim["bertscore_f1_distilled"]), "teacher": "1.0"})))
         if "rougeL_base" in sim:
-            rows.append(("ROUGE-L vs teacher (wording)",
-                         fmt(sim["rougeL_base"]), fmt(sim["rougeL_distilled"]), "1.0"))
+            rows.append(("ROUGE-L vs teacher (wording)", *per_model({
+                "base": fmt(sim["rougeL_base"]),
+                "distilled": fmt(sim["rougeL_distilled"]), "teacher": "1.0"})))
         if rows:
             sections.insert(3, (
                 f"Free-running similarity - both models writing on their own "
@@ -759,7 +840,7 @@ thead th{font:500 .72rem/1.3 "IBM Plex Mono",ui-monospace,monospace;
 tbody td:not(:first-child){font-family:"IBM Plex Mono",ui-monospace,monospace;
   font-size:.88rem}
 .c-b{color:var(--muted)} .c-d{color:var(--accent);font-weight:600}
-.c-t{color:var(--target)}
+.c-t{color:var(--target)} .c-x{color:var(--muted)}
 tbody tr:last-child td{border-bottom:none}
 
 dl{display:grid;grid-template-columns:max-content 1fr;gap:.45rem 1.4rem;
@@ -875,11 +956,22 @@ def _render_html(payload, facts, sections, summary):
     if bars:
         body.append(f'<section><h2>How close it got</h2>{bars}</section>')
 
+    # Colour by position rather than by name: the first cell is where the
+    # student started, the second where it moved to, the last the target it
+    # moved toward, and anything between (the teacher's base) is context.
+    def styled(cells):
+        classes = ["c-x"] * len(cells)
+        if cells:
+            classes[0], classes[-1] = "c-b", "c-t"
+        if len(cells) > 1:
+            classes[1] = "c-d"
+        return "".join(f'<td class="{cls}">{esc(text)}</td>'
+                       for cls, text in zip(classes, cells))
+
     for title, rows, headers in sections:
         cells = "".join(
-            f'<tr><td>{esc(label)}</td><td class="c-b">{esc(b)}</td>'
-            f'<td class="c-d">{esc(d)}</td><td class="c-t">{esc(t)}</td></tr>'
-            for label, b, d, t in rows)
+            f'<tr><td>{esc(label)}</td>{styled(values)}</tr>'
+            for label, *values in rows)
         head_cells = "".join(f"<th>{esc(h)}</th>" for h in headers)
         body.append(
             f'<section><h2>{esc(title)}</h2><div class="tbl"><table><thead><tr>'
@@ -923,8 +1015,8 @@ def _render_html(payload, facts, sections, summary):
               'training - from any machine with the bucket:</p>'
             + "".join(f'<p class="cmd-h">{esc(what)}</p><pre class="cmd">{esc(cmd)}</pre>'
                       for what, cmd in commands)
-            + '<p class="lede">Both open a new run directory under '
-              '<code>runs/</code> and pick the adapter up from where it is; add '
+            + '<p class="lede">The first writes into the adapter&#39;s bundle under '
+              '<code>evaluation/</code>, here and in the bucket; add '
               '<code>--skip upload</code> to keep the result off S3.</p>'
             + '</section>')
 
@@ -1006,8 +1098,8 @@ def write_report(payload, path):
                     "from any machine with the bucket:", ""]
             for what, cmd in commands:
                 out += [f"{what}:", "", "```bash", cmd, "```", ""]
-            out += ["Both open a new run directory under `runs/` and pick the "
-                    "adapter up from where it is; add `--skip upload` to keep the "
+            out += ["The first writes into the adapter's bundle under evaluation/, "
+                    "here and in the bucket; add `--skip upload` to keep the "
                     "result off S3."]
         out += ["", "## Run", "", "| | |", "|---|---|"]
         out += [f"| {k} | {v} |" for k, v in facts]
@@ -1015,7 +1107,10 @@ def write_report(payload, path):
             out += ["", f"## {title}", "",
                     "| " + " | ".join(headers) + " |",
                     "|" + "---|" * len(headers)]
-            out += [f"| {label} | {b} | **{d}** | {t} |" for label, b, d, t in rows]
+            for label, *cells in rows:
+                # The distilled column bold, as before: it is the one being read.
+                marked = [f"**{c}**" if i == 1 else c for i, c in enumerate(cells)]
+                out.append(f"| {label} | " + " | ".join(marked) + " |")
         out += ["", "---", "",
                 "Every metric is reported for the untrained base student as well, "
                 "because that column is what separates \"distillation worked\" from "

@@ -56,7 +56,7 @@ RUN uv pip install --system --no-deps -e .
 # CUDA build or a broken import discovered on a paid GPU is the expensive way to
 # find out.
 RUN python -c "import torch, kd; print('torch', torch.__version__)" \
-    && python -m kd check --config configs/smoke.yaml > /dev/null \
+    && python -m kd check --config configs/smollm/smoke.yaml > /dev/null \
     && echo "image ok"
 
 # No ENTRYPOINT: RunPod passes the command to run as docker_args, and the

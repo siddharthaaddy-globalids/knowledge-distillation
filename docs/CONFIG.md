@@ -16,6 +16,12 @@ models:
   student: Qwen/Qwen3.5-0.8B
 ```
 
+Profiles are grouped one directory deep by what they distil — `configs/enlibra/`,
+`configs/smollm/`, `configs/qwen/`. One profile describes both the training and
+the evaluation of a pair. `extends` resolves relative to the profile first and
+then to `configs/`, so `extends: _base.yaml` works from any group and
+`extends: ../enlibra/enlibraQ25-3B.yaml` reaches across them.
+
 ## Precedence
 
 Lowest to highest:
@@ -38,7 +44,7 @@ won it:
 `--set` reaches any key below by dotted path, and is repeatable:
 
 ```bash
-kd pipeline --config configs/finance.yaml \
+kd pipeline --config configs/qwen/finance.yaml \
   --set training.max_steps=500 \
   --set lora.target_modules='[q_proj, v_proj]' \
   --set limits.max_cost_usd=2.0
@@ -49,9 +55,10 @@ what they would in the file. Scientific notation is accepted in the form people
 actually type: `--set training.learning_rate=1e-5` works, even though YAML 1.1
 itself requires `1.0e-05`.
 
-Short flags exist for the common ones — `--teacher`, `--student`, `--steps`,
-`--device`, `--dtype`, `--lr`, `--lora-r`, `--lora-alpha`, `--lmbda`, `--ce-alpha`, `--dataset`,
-`--seed`, `--output` — and beat `--set`.
+Short flags exist for the common ones — `--teacher`, `--teacher-adapter`,
+`--teacher-base`, `--student`, `--steps`, `--device`, `--dtype`, `--lr`,
+`--lora-r`, `--lora-alpha`, `--lmbda`, `--ce-alpha`, `--dataset`, `--seed`,
+`--output` — and beat `--set`.
 
 ## Typos are errors
 
@@ -83,8 +90,9 @@ budget before anyone notices, which is why this is fatal rather than a warning.
 | Key | Default | Meaning |
 |---|---|---|
 | `student` | `HuggingFaceTB/SmolLM2-135M-Instruct` | Hub id, local path, or `s3://` URI. |
-| `teacher` | `HuggingFaceTB/SmolLM2-360M-Instruct` | Same. **Must share a tokenizer vocabulary with the student** for standard GKD. |
-| `teacher_adapter` | `null` | LoRA adapter merged into the teacher at load time. Prefer this over a merged checkpoint from another framework — those keep that framework's key layout, which plain transformers may not map back. |
+| `teacher` | `HuggingFaceTB/SmolLM2-360M-Instruct` | A merged checkpoint, a base model (with `teacher_adapter` beside it), **or a LoRA adapter alone** — a directory, `s3://` prefix or Hub repo holding `adapter_config.json`. Preflight recognises an adapter, reads the base it records, and rewrites this into base + adapter before anything loads. **Must share a tokenizer vocabulary with the student** for standard GKD. |
+| `teacher_adapter` | `null` | LoRA adapter merged into the teacher at load time. Prefer base + adapter over a merged checkpoint from another framework — those keep that framework's key layout, which plain transformers may not map back. |
+| `teacher_base` | `null` | The stock model the teacher was fine-tuned from, scored by the evaluation as the `teacher-base` player. Implied when the teacher is base + adapter (it is the base) or was given as an adapter (it is what the adapter records — this key overrides that record). A merged checkpoint cannot say what it was built from, so name it here, or the player is skipped with a note. |
 | `tokenizer` | `teacher` | `teacher`, `student`, or an explicit id/path. |
 
 ## `hardware`
@@ -154,10 +162,13 @@ A second, different measurement, for datasets that have a **correct answer**.
 | `arena_limit` | `null` | Score only the first N questions. For proving the stage runs, not for a real score. |
 | `teacher_check_max_new_tokens` | `2048` | How much of the teacher's answer the `teacher-check` stage prints. Not a quality setting — the check reads the first token's distribution — but the text is what a person looks at, and an answer cut off mid-sentence tells them nothing. |
 
-Three players are rated against each other question by question: the **base**
-student (no adapter, the control), the **distilled** student, and the
-**teacher** (the ceiling). Distilled below base means training hurt; distilled
-level with base means the format transferred but the capability did not.
+The players (`evaluation.players`) are rated against each other question by
+question: the **base** student (no adapter, the control), the **distilled**
+student, the **teacher-base** (the stock model the teacher was fine-tuned from,
+when known) and the **teacher** (the ceiling). Distilled below base means
+training hurt; distilled level with base means the format transferred but the
+capability did not; teacher level with teacher-base means the fine-tune gave the
+teacher nothing to pass on.
 
 The headline is **closeness to the teacher**, not accuracy: how often each
 student gave the teacher's answer, and (when `sentence-transformers` is
@@ -165,7 +176,7 @@ installed) how alike its explanations are. It is written to `arena.json` under
 `closeness` and to `metrics.json`, and it is the number the report leads with.
 Accuracy and Elo are reported beneath it as context.
 
-Whichever way it runs — as a pipeline stage or as `kd arena` — it writes
+Whichever way it runs — as a stage of `kd eval` or as `kd arena` — it writes
 `arena.json` (the numbers, including the hop-wise cosine between the players'
 explanations), `arena-transcript.jsonl` (every question and every word each
 player said about it) and an HTML report. The standalone command writes them
@@ -226,10 +237,21 @@ chit-chat has not transferred what it was meant to.
 
 ## `evaluation`
 
+Evaluation is its own pipeline, `kd eval`, walked against an adapter that
+already exists. It writes into a directory of its own **inside the adapter's
+bundle** — `runs/<train-run>/evaluation/<name>-<YYYY-MM-DD>-<HHMM>/` — and to
+the same path beside the adapter in the bucket, so one adapter accumulates any
+number of evaluations and nothing is ever overwritten.
+
 | Key | Default | Meaning |
 |---|---|---|
+| `adapter` | `null` | What `kd eval` scores: an adapter directory, a file inside one, or an `s3://` URI. `null` means `--adapter` on the command line, else the newest adapter under `project.runs_dir`. |
+| `name` | `null` | What the evaluation is for — `full`, `quick`, `after-parser-fix`. Leads the directory name. `null` uses the profile name. |
+| `after_training` | `false` | `true` runs the evaluation **inside** `kd pipeline`, as its `evaluation` stage, right after training — the pod already has the teacher resident. Same output layout either way. |
+| `players` | `[base, distilled, teacher-base, teacher]` | Who is scored. `teacher-base` is skipped with a note when the base is unknown; drop `teacher` and `teacher-base` to compare base against distilled without loading the teacher. |
+| `stages` | preflight, evaluate, arena, report, upload | What `kd eval` walks; the same `{name, gate}` shape as `pipeline.stages`. |
 | `samples` | `50` | Held-out samples scored for fidelity and perplexity. |
-| `tasks` | `null` | lm-eval task list, e.g. `"ifeval,arc_easy"`. Needs `uv sync --extra eval`. Slow: three models are scored. |
+| `tasks` | `null` | lm-eval task list, e.g. `"ifeval,arc_easy"`. Needs `uv sync --extra eval`. Slow: every player is scored. |
 | `limit` | `null` | Per-task example cap, for a quick look. |
 | `gen_similarity` | `0` | Free-running BERTScore prompts. Unlike agreement and KL, this is not teacher-forced, so it sees the student's own drift. Slow. |
 | `similarity_model` | `roberta-large` | BERTScore encoder (~1.4 GB on first use). |
@@ -238,29 +260,39 @@ chit-chat has not transferred what it was meant to.
 
 ## `pipeline`
 
-`stages` is an ordered list of `{name, gate}`. A **gate** stage that fails aborts
-the run; a non-gate stage that fails is reported and the run continues, so a
-broken report never destroys a good adapter.
+`stages` is an ordered list of `{name, gate}`: what `kd pipeline` walks. A
+**gate** stage that fails aborts the run; a non-gate stage that fails is
+reported and the run continues, so a broken report never destroys a good
+adapter.
 
 | Stage | Gate | What it does |
 |---|---|---|
-| `preflight` | yes | Resolve config and hardware; fetch any `s3://` inputs. Seconds. |
+| `preflight` | yes | Resolve config and hardware; fetch any `s3://` inputs; split a teacher given as a LoRA adapter into base + adapter. Seconds. |
 | `teacher-check` | yes | Loads **only** the teacher: missing weights, NaN scan, coherence. |
 | `smoke` | yes | Two real steps. Measures s/step and projects the full run against the limits. |
 | `train` | yes | |
-| `evaluate` | no | Fidelity and capability against the base student. |
-| `report` | no | `report.html` in the run bundle. |
+| `evaluation` | no | The evaluation pipeline (`evaluation.stages`), inside the run. Skipped unless `evaluation.after_training`. |
 | `publish` | no | Skipped unless `publish.enabled`. |
 | `upload` | no | Skipped unless `s3.enabled`. Also runs after a failure, so logs survive. |
 
+The evaluation pipeline that `kd eval` walks:
+
+| Stage | Gate | What it does |
+|---|---|---|
+| `preflight` | yes | Fetch the teacher and the adapter; validate the players; say where the results go. |
+| `evaluate` | no | Fidelity and capability, token by token, against the teacher. |
+| `arena` | no | Accuracy and Elo on the answer key. Skipped unless `evaluation.arena_file`. |
+| `report` | no | `report.html` in the evaluation directory. |
+| `upload` | no | To `<bundle>/evaluation/<id>/` in the bucket. Skipped unless `s3.enabled`. |
+
 Narrow a single run with `--only STAGE`, `--from STAGE` or `--skip STAGE` rather
-than editing this list — editing it changes what every run of the profile means.
+than editing these lists — editing them changes what every run of the profile means.
 
 ## `limits`
 
 | Key | Default | Meaning |
 |---|---|---|
-| `max_runtime_minutes` | `180` | Hard stop. |
+| `max_runtime_minutes` | `null` | Hard stop. Off by default — see below. |
 | `max_steps` | `null` | Ceiling above `training.max_steps`. The tighter of the two wins; a ceiling above the request can never bind. |
 | `max_cost_usd` | `null` | Only meaningful on a rented pod. Inert locally, because nothing is being rented. |
 | `confirm_above_usd` | `1.00` | Print the estimate and ask before renting above this. |
@@ -302,10 +334,10 @@ Optional. See [RUNPOD.md](RUNPOD.md) for how it fits with a rented GPU.
 | `endpoint_url` | `null` | Set for MinIO, R2, or RunPod volumes. |
 | `region` | `null` | |
 | `cache_dir` | `~/.cache/kd/s3` | Fetched inputs are cached here, so a second run costs a listing rather than gigabytes. |
-| `upload` | `[adapter, logs, report, metrics]` | Also available: `checkpoints`. `manifest.json` and `config.resolved.yaml` always go. |
+| `upload` | `[adapter, logs, report, metrics, evaluation]` | Also available: `checkpoints`. `evaluation` is every scoring done inside the run; one done later with `kd eval` uploads its own directory to the same place. `manifest.json` and `config.resolved.yaml` always go. |
 
-When enabled, `models.teacher`, `models.student`, `models.teacher_adapter` and
-`dataset.source` may be `s3://` URIs. They are fetched in `preflight`, before
+When enabled, `models.teacher`, `models.teacher_adapter`, `models.teacher_base`,
+`models.student`, `dataset.source` and `evaluation.adapter` may be `s3://` URIs. They are fetched in `preflight`, before
 anything tries to load them, so a bad bucket fails in seconds rather than after
 the dataset build.
 
@@ -337,11 +369,12 @@ Optional. See [RUNPOD.md](RUNPOD.md).
 For retargeting a downloaded runner without editing YAML. They sit below `--set`
 and explicit flags.
 
-`KD_TEACHER_MODEL` `KD_STUDENT_MODEL` `KD_TEACHER_ADAPTER` `KD_TOKENIZER`
-`KD_DATASET` `KD_OUTPUT_DIR` `KD_RUNS_DIR` `KD_DEVICE` `KD_DTYPE` `KD_THREADS`
-`KD_MAX_STEPS` `KD_BATCH_SIZE` `KD_GRAD_ACCUM` `KD_LEARNING_RATE` `KD_LORA_R`
-`KD_LORA_ALPHA` `KD_LMBDA` `KD_BETA` `KD_MAX_NEW_TOKENS` `KD_SEED`
-`KD_EVAL_TASKS` `KD_EVAL_SAMPLES` `KD_MAX_RUNTIME_MINUTES` `KD_MAX_COST_USD`
+`KD_TEACHER_MODEL` `KD_STUDENT_MODEL` `KD_TEACHER_ADAPTER` `KD_TEACHER_BASE`
+`KD_TOKENIZER` `KD_DATASET` `KD_OUTPUT_DIR` `KD_RUNS_DIR` `KD_DEVICE` `KD_DTYPE`
+`KD_THREADS` `KD_MAX_STEPS` `KD_BATCH_SIZE` `KD_GRAD_ACCUM` `KD_LEARNING_RATE`
+`KD_LORA_R` `KD_LORA_ALPHA` `KD_LMBDA` `KD_BETA` `KD_CE_ALPHA` `KD_MAX_NEW_TOKENS`
+`KD_SEED` `KD_EVAL_TASKS` `KD_EVAL_SAMPLES` `KD_EVAL_ADAPTER` `KD_EVAL_NAME`
+`KD_MAX_RUNTIME_MINUTES` `KD_MAX_COST_USD`
 
 An invalid value is an error, not a silently ignored setting:
 

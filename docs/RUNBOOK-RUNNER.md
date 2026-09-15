@@ -39,17 +39,17 @@ chmod +x distill.sh
 ./distill.sh doctor
 
 # Resolve the config and hardware without running anything
-./distill.sh check --config configs/smoke.yaml
+./distill.sh check --config configs/smollm/smoke.yaml
 
 # The whole pipeline, end to end (~2 minutes plus first-run downloads)
-./distill.sh --config configs/smoke.yaml
+./distill.sh --config configs/smollm/smoke.yaml
 ```
 
 The first invocation installs uv, clones the pinned source into
 `~/.cache/kd-runner`, and downloads torch. That takes a few minutes once;
 everything after it is fast.
 
-`configs/smoke.yaml` distils SmolLM2-360M into SmolLM2-135M for two steps. It is
+`configs/smollm/smoke.yaml` distils SmolLM2-360M into SmolLM2-135M for two steps. It is
 deliberately too short to learn anything — its job is to prove every stage runs
 on this machine.
 
@@ -60,19 +60,25 @@ A successful run looks like this:
 ==> Cloning https://github.com/<org>/<repo>.git @ 053cee7f9a2b
 ==> Syncing dependencies (the first run downloads torch - this takes a while)
 
-[1/8] preflight            OK       0s
-[2/8] teacher-check        OK      22s
-[3/8] smoke                OK      51s
+[1/7] preflight            OK       0s
+[2/7] teacher-check        OK      22s
+[3/7] smoke                OK      51s
       5.13 s/step measured -> 2 steps is about 10s
-[4/8] train                OK      36s
-[5/8] evaluate             OK      22s
-[6/8] report               OK       0s
-[7/8] publish              skipped - publish.enabled is false
-[8/8] upload               skipped - s3.enabled is false
+[4/7] train                OK      36s
+[5/7] evaluation           ...
+      evaluation smoke-2026-09-08-1523 -> runs/smoke-2026-09-08-1522/evaluation/smoke-2026-09-08-1523
+      [1/4] preflight      OK       0s
+      [2/4] evaluate       OK      22s
+      [3/4] arena          skipped - evaluation.arena_file is not set
+      [4/4] report         OK       0s
+[5/7] evaluation           OK      23s
+[6/7] publish              skipped - publish.enabled is false
+[7/7] upload               skipped - s3.enabled is false
 
   run bundle : runs/smoke-2026-09-08-1522
   adapter    : runs/smoke-2026-09-08-1522/final_adapter
-  report     : runs/smoke-2026-09-08-1522/report.html
+  evaluation : runs/smoke-2026-09-08-1522/evaluation/smoke-2026-09-08-1523
+  report     : runs/smoke-2026-09-08-1522/evaluation/smoke-2026-09-08-1523/report.html
 ```
 
 Open that `report.html` in a browser. It leads with one number — **how close
@@ -88,7 +94,7 @@ With no leading subcommand — or when the first argument starts with `-` — it
 the full gated pipeline. Otherwise the first argument is the subcommand:
 
 ```bash
-./distill.sh --config configs/finance.yaml      # -> the full pipeline
+./distill.sh --config configs/qwen/finance.yaml      # -> the full pipeline
 ./distill.sh evaluate --config configs/x.yaml   # -> just evaluation
 ./distill.sh doctor                             # -> just the environment report
 ```
@@ -102,7 +108,8 @@ this document reaches the pipeline unchanged.
 | `check` | Resolve config and hardware, print, run nothing. |
 | `doctor` | Device, package versions, which optional features and credentials are present. |
 | `train` | Just training, no gates. |
-| `evaluate` | Score an adapter against the teacher. |
+| `eval` | Score an adapter: evaluate, arena, report, upload, into the adapter's own bundle. |
+| `evaluate` | The fidelity measurement alone, standalone. |
 | `check-teacher` | Is this teacher fit to distil from? Loads only the teacher. |
 | `fix-teacher` | Repair a checkpoint whose tensor names do not match its architecture. |
 | `convert-adapter` | MLX / unsloth LoRA into PEFT format. |
@@ -132,17 +139,34 @@ failed gate.
 
 | # | Stage | Gate | |
 |---|---|---|---|
-| 01 | `preflight` | ✓ | Resolve config and hardware; fetch any `s3://` inputs. Seconds, so a bad bucket or a typo fails immediately. |
+| 01 | `preflight` | ✓ | Resolve config and hardware; fetch any `s3://` inputs; split a teacher given as a LoRA adapter into base + adapter. Seconds, so a bad bucket or a typo fails immediately. |
 | 02 | `teacher-check` | ✓ | Loads *only* the teacher: randomly-initialised weights, NaN scan, is the output actually language. |
 | 03 | `smoke` | ✓ | Two real steps. Measures seconds-per-step and projects the full run against your limits. |
 | 04 | `train` | ✓ | The run itself, under the time and cost ceilings. |
-| 05 | `evaluate` | | Fidelity and capability, measured against the untrained base student. |
-| 06 | `report` | | A readable `report.html` in the run bundle. |
-| 07 | `publish` | | To the Hugging Face Hub. Skipped unless switched on. |
-| 08 | `upload` | | To S3. Skipped unless switched on — and runs even after a failure, so the logs survive. |
+| 05 | `evaluation` | | The whole evaluation pipeline, inside the run. **Off by default** — `evaluation.after_training: true` turns it on; the smoke profile has it on. |
+| 06 | `publish` | | To the Hugging Face Hub. Skipped unless switched on. |
+| 07 | `upload` | | To S3. Skipped unless switched on — and runs even after a failure, so the logs survive. |
 
 A **gate** stage that fails aborts the run. A non-gate stage that fails is
 reported and the run continues, so a broken report never destroys a good adapter.
+
+Evaluation is a pipeline of its own, `kd eval`, run against an adapter that
+already exists — this checkout's newest, or one named with `--adapter` by path
+or `s3://` URI. It walks `preflight → evaluate → arena → report → upload` and
+writes into the adapter's bundle under `evaluation/<name>-<date>-<time>/`, on
+disk and in the bucket, so one adapter can be scored any number of times:
+
+| Stage | Gate | |
+|---|---|---|
+| `preflight` | ✓ | Fetch the teacher and the adapter; check the players; say where the results go. |
+| `evaluate` | | Fidelity and capability, token by token, against the teacher. |
+| `arena` | | Accuracy and Elo on the answer key. Skipped unless `evaluation.arena_file`. |
+| `report` | | A readable `report.html` in the evaluation directory. |
+| `upload` | | To `<bundle>/evaluation/<id>/` in the bucket. Skipped unless `s3.enabled`. |
+
+Four players: the **base** student, the **distilled** student, the
+**teacher-base** (the stock model the teacher was fine-tuned from) and the
+**teacher**.
 
 ### Why the first two gates exist
 
@@ -156,13 +180,17 @@ mistake.
 ### Running part of it
 
 ```bash
-./distill.sh --config configs/finance.yaml --only train
-./distill.sh --config configs/finance.yaml --from evaluate
-./distill.sh --config configs/finance.yaml --skip smoke
+./distill.sh --config configs/qwen/finance.yaml --only train
+./distill.sh --config configs/qwen/finance.yaml --skip smoke
+./distill.sh eval --config configs/qwen/finance.yaml                 # score the newest adapter
+./distill.sh eval --config configs/qwen/finance.yaml --from report   # re-render the last scoring
 ```
 
-`--from` and `--only` open a new run directory but pick up the newest previous
-run's adapter or evaluation, so you can re-report without retraining.
+Training and evaluation are separate pipelines. `kd pipeline` ends with the
+adapter (and, with `s3.enabled`, its upload); `kd eval` scores an adapter into
+that adapter's own bundle under `evaluation/<name>-<date>/`. `--from` and
+`--only` on either pick up the newest previous output, so you can re-report
+without retraining or rescoring.
 
 ### Exit codes
 
@@ -186,14 +214,14 @@ profile without having anything locally:
 
 | Profile | Pair | For |
 |---|---|---|
-| `configs/default.yaml` | SmolLM2 360M → 135M | Runs anywhere. |
-| `configs/mac.yaml` | Same pair | Apple Silicon (MPS), with real batching instead of accumulation. |
-| `configs/smoke.yaml` | Same pair, 2 steps | First-run validation. |
-| `configs/finance.yaml` | Qwen3.5-2B → 0.8B | A finance-tuned teacher on finance-alpaca. |
-| `configs/qwen-poc.yaml` | Qwen3.5-2B → 0.8B | Stock models. A known-good pairing for proving the pipeline. |
+| `configs/smollm/default.yaml` | SmolLM2 360M → 135M | Runs anywhere. |
+| `configs/smollm/mac.yaml` | Same pair | Apple Silicon (MPS), with real batching instead of accumulation. |
+| `configs/smollm/smoke.yaml` | Same pair, 2 steps | First-run validation. |
+| `configs/qwen/finance.yaml` | Qwen3.5-2B → 0.8B | A finance-tuned teacher on finance-alpaca. |
+| `configs/qwen/qwen-poc.yaml` | Qwen3.5-2B → 0.8B | Stock models. A known-good pairing for proving the pipeline. |
 
 ```bash
-./distill.sh --config configs/finance.yaml
+./distill.sh --config configs/qwen/finance.yaml
 ```
 
 ### Overriding without editing anything
@@ -203,7 +231,7 @@ This matters more here than in a checkout: you have no working copy to edit, so
 repeatable:
 
 ```bash
-./distill.sh --config configs/finance.yaml \
+./distill.sh --config configs/qwen/finance.yaml \
   --set models.teacher=Qwen/Qwen3.5-2B \
   --set training.max_steps=500 \
   --set hardware.dtype=bfloat16 \
@@ -238,7 +266,7 @@ writes the effective configuration to stdout and the banner to stderr, so it
 redirects cleanly into a file you can edit:
 
 ```bash
-./distill.sh check --config configs/finance.yaml --full > my-run.yaml
+./distill.sh check --config configs/qwen/finance.yaml --full > my-run.yaml
 ```
 
 That gives you all 133 lines with every value already resolved - a complete,
@@ -283,7 +311,7 @@ The runner does its work inside the fetched source, so run bundles land under
 them:
 
 ```bash
-./distill.sh --config configs/finance.yaml --set project.runs_dir="$PWD/runs"
+./distill.sh --config configs/qwen/finance.yaml --set project.runs_dir="$PWD/runs"
 ```
 
 One directory per run, never overwritten — and the same unit that gets uploaded
@@ -342,17 +370,17 @@ Score base, distilled and teacher on lm-evaluation-harness tasks, and compare
 free-running generations with BERTScore.
 
 ```bash
-./distill.sh --extra eval evaluate --config configs/finance.yaml \
+./distill.sh --extra eval evaluate --config configs/qwen/finance.yaml \
   --tasks ifeval --limit 100 \
   --gen-similarity 20
 ```
 
-Slow — it scores three models. Start with `--limit`. The extra installs once and
+Slow — it scores every player. Start with `--limit`. The extra installs once and
 stays in the runner's cached environment — but name every group you want on each
 invocation, because `uv` removes extras it was not asked for:
 
 ```bash
-./distill.sh --extra eval --extra remote --config configs/finance.yaml
+./distill.sh --extra eval --extra remote --config configs/qwen/finance.yaml
 ```
 
 ### Hugging Face Hub — *`publish.enabled: false`*
@@ -363,7 +391,7 @@ Publishes the adapter to `<repo>-lora` and a merged, ready-to-run model to
 ```bash
 export HF_TOKEN=...
 
-./distill.sh --config configs/finance.yaml \
+./distill.sh --config configs/qwen/finance.yaml \
   --set publish.enabled=true \
   --set publish.repo=my-org/qwen-finance
 ```
@@ -378,7 +406,7 @@ On a throwaway machine this is how you get results off it.
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 
-./distill.sh --extra remote --config configs/finance.yaml \
+./distill.sh --extra remote --config configs/qwen/finance.yaml \
   --set s3.enabled=true \
   --set s3.bucket=my-bucket
 ```
@@ -395,7 +423,7 @@ export RUNPOD_API_KEY=...
 
 # rents nothing - just checks auth and reads the catalogue
 ./distill.sh --extra remote runpod gpus \
-  --config configs/finance.yaml \
+  --config configs/qwen/finance.yaml \
   --set runpod.enabled=true
 ```
 
@@ -455,7 +483,7 @@ export KD_MAX_STEPS=500
 export KD_DEVICE=cuda
 export KD_WORKDIR=/mnt/scratch/kd       # keep the checkout off the boot disk
 
-./distill.sh --config configs/finance.yaml
+./distill.sh --config configs/qwen/finance.yaml
 ```
 
 `KD_*` variables sit below `--set` and explicit flags, so a flag on the command
@@ -475,7 +503,7 @@ line still wins.
 from the same stage definition, so the two cannot drift.
 
 ```powershell
-.\distill.ps1 -Config configs\smoke.yaml
+.\distill.ps1 -Config configs\smollm\smoke.yaml
 .\distill.ps1 doctor
 .\distill.ps1 -Extra eval evaluate -Config configs\finance.yaml --tasks ifeval
 .\distill.ps1 -Config configs\finance.yaml --set training.max_steps=500
@@ -492,7 +520,7 @@ Nothing is interactive, so it drops straight into a step:
 ```bash
 curl -fsSL -o distill.sh "$RUNNER_URL"
 chmod +x distill.sh
-./distill.sh --config configs/finance.yaml --set training.max_steps=200
+./distill.sh --config configs/qwen/finance.yaml --set training.max_steps=200
 ```
 
 Pin `--workdir` to a cached path if the job has one; the fetched source and the
@@ -506,7 +534,7 @@ published image — CI's **Build CUDA image** workflow (run manually from *Actio
 publishes `ghcr.io/<org>/kd:<sha>` with CUDA 12.8, torch and the source baked in.
 
 ```bash
-./distill.sh --extra remote runpod launch --config configs/finance.yaml \
+./distill.sh --extra remote runpod launch --config configs/qwen/finance.yaml \
   --set runpod.enabled=true \
   --set runpod.image=ghcr.io/<org>/kd:abc1234 \
   --set s3.enabled=true --set s3.bucket=my-bucket \
@@ -545,9 +573,9 @@ Sometimes you want to run a feature branch without waiting for CI to build a
 runner for it. `--ref` points the same runner at a different revision:
 
 ```bash
-./distill.sh --ref feature/new-scheduler --config configs/finance.yaml
-./distill.sh --ref v1.2.0 --config configs/finance.yaml       # a tag
-./distill.sh --ref 9f3a1c2 --config configs/finance.yaml      # any commit
+./distill.sh --ref feature/new-scheduler --config configs/qwen/finance.yaml
+./distill.sh --ref v1.2.0 --config configs/qwen/finance.yaml       # a tag
+./distill.sh --ref 9f3a1c2 --config configs/qwen/finance.yaml      # any commit
 ```
 
 It is manual and it announces itself, every time:
@@ -581,7 +609,7 @@ Limits are checked twice: once before the run starts, and again while it is
 going.
 
 ```bash
-./distill.sh --config configs/finance.yaml \
+./distill.sh --config configs/qwen/finance.yaml \
   --set limits.max_runtime_minutes=180 \
   --set limits.max_cost_usd=2.00
 ```
@@ -629,7 +657,7 @@ transformers built for it — common in merged exports from MLX or unsloth.
 `from_pretrained` does not raise; it randomly initialises what it could not map.
 
 ```bash
-./distill.sh fix-teacher --config configs/finance.yaml   # rename, no retraining
+./distill.sh fix-teacher --config configs/qwen/finance.yaml   # rename, no retraining
 ./distill.sh check-teacher --teacher ./teacher-fixed
 ```
 
@@ -658,7 +686,7 @@ From the runner, that is `--extra remote` — it does the same `uv sync` inside 
 fetched checkout:
 
 ```bash
-./distill.sh --extra remote --config configs/finance.yaml --set s3.enabled=true
+./distill.sh --extra remote --config configs/qwen/finance.yaml --set s3.enabled=true
 ```
 
 ### A pod is still running
@@ -678,7 +706,7 @@ Lower `hardware.dtype` to `bfloat16` (halves the weights, needs CUDA or macOS
 batching cheap.
 
 ```bash
-./distill.sh --config configs/finance.yaml --set hardware.dtype=bfloat16
+./distill.sh --config configs/qwen/finance.yaml --set hardware.dtype=bfloat16
 ```
 
 ### The runner itself misbehaves

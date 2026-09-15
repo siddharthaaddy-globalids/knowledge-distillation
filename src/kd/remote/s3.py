@@ -41,6 +41,13 @@ UPLOAD_GROUPS = {
                 # surprising, which is exactly when the pod is already gone.
                 "arena-transcript.jsonl"],
     "checkpoints": ["checkpoints/**"],
+    # Every scoring of the adapter, each in its own directory under
+    # evaluation/. Small - numbers, transcripts and a report - and the reason
+    # the bundle is worth opening a week later, so it ships by default. An
+    # evaluation run on another machine uploads its one directory on its own
+    # (see evaluation_prefix); this group is for the case where the scoring
+    # happened inside the training run.
+    "evaluation": ["evaluation/**"],
 }
 
 # Always uploaded, whatever `s3.upload` says. Both are small, and without them the
@@ -86,6 +93,22 @@ def run_prefix(config, run_id):
     """Where a run bundle lives in the bucket: <prefix>/runs/<run-id>."""
     prefix = ((config.get("s3") or {}).get("prefix") or "").strip("/")
     return f"{prefix}/runs/{run_id}" if prefix else f"runs/{run_id}"
+
+
+def evaluation_prefix(bundle_uri, eval_id):
+    """Where an evaluation lives in the bucket: <bundle>/evaluation/<eval-id>.
+
+    `bundle_uri` is the s3:// address of the bundle holding the adapter that
+    was scored, so the evaluation lands beside the adapter in the bucket
+    exactly as it does on disk - and a listing of the bundle shows every time
+    that adapter was scored, whichever machine did it.
+    """
+    from ..paths import split_uri
+    from ..runlog import EVALUATION_DIR
+
+    bucket, key = split_uri(bundle_uri)
+    key = f"{key}/{EVALUATION_DIR}/{eval_id}" if key else f"{EVALUATION_DIR}/{eval_id}"
+    return bucket, key
 
 
 # --------------------------------------------------------------------------- #
@@ -317,8 +340,13 @@ def _selected_files(run_dir, groups):
     return sorted(set(found))
 
 
-def upload_bundle(config, run_dir, run_id, groups=None, log=None):
+def upload_bundle(config, run_dir, run_id, groups=None, log=None, destination=None):
     """Sync the parts of a run bundle named by `s3.upload` to the bucket.
+
+    `destination` is an explicit (bucket, key prefix) to write under instead of
+    the run's own <prefix>/runs/<run_id>. An evaluation uses it to land inside
+    the bundle of the adapter it scored, which may be in a different bucket
+    from the one this config would upload a new run to.
 
     Returns a summary including the s3:// URI of the bundle, which goes into the
     run manifest so the local record says where the remote copy went.
@@ -334,8 +362,11 @@ def upload_bundle(config, run_dir, run_id, groups=None, log=None):
             f"unknown s3.upload entries: {unknown}\n"
             f"  valid: {', '.join(sorted(UPLOAD_GROUPS))}")
 
-    bucket = bucket_or_die(config)
-    prefix = run_prefix(config, run_id)
+    if destination:
+        bucket, prefix = destination
+    else:
+        bucket = bucket_or_die(config)
+        prefix = run_prefix(config, run_id)
 
     files = _selected_files(run_dir, groups)
     if not files:

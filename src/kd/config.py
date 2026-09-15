@@ -55,6 +55,7 @@ ENV_OVERRIDES = {
     "KD_STUDENT_MODEL": ("models.student", str),
     "KD_TEACHER_MODEL": ("models.teacher", str),
     "KD_TEACHER_ADAPTER": ("models.teacher_adapter", str),
+    "KD_TEACHER_BASE": ("models.teacher_base", str),
     "KD_TOKENIZER": ("models.tokenizer", str),
     "KD_DATASET": ("dataset.source", str),
     "KD_OUTPUT_DIR": ("project.output_dir", str),
@@ -75,6 +76,8 @@ ENV_OVERRIDES = {
     "KD_SEED": ("project.seed", int),
     "KD_EVAL_TASKS": ("evaluation.tasks", str),
     "KD_EVAL_SAMPLES": ("evaluation.samples", int),
+    "KD_EVAL_ADAPTER": ("evaluation.adapter", str),
+    "KD_EVAL_NAME": ("evaluation.name", str),
     "KD_MAX_RUNTIME_MINUTES": ("limits.max_runtime_minutes", int),
     "KD_MAX_COST_USD": ("limits.max_cost_usd", float),
 }
@@ -330,10 +333,13 @@ def validate(config, base):
     if domains is not None:
         _validate_list_of_mappings(domains, DOMAIN_KEYS, "dataset.domains", errors)
         working["dataset"].pop("domains", None)
-    stages = _get_path(working, "pipeline.stages")
-    if stages is not None:
-        _validate_list_of_mappings(stages, STAGE_KEYS, "pipeline.stages", errors)
-        working["pipeline"].pop("stages", None)
+    # Two stage lists, one per pipeline: what `kd pipeline` walks and what
+    # `kd eval` walks. Same vocabulary, same check.
+    for section in ("pipeline", "evaluation"):
+        stages = _get_path(working, f"{section}.stages")
+        if stages is not None:
+            _validate_list_of_mappings(stages, STAGE_KEYS, f"{section}.stages", errors)
+            working[section].pop("stages", None)
 
     for path in OPAQUE_MAPPINGS:
         value = _get_path(working, path)
@@ -680,6 +686,8 @@ def describe(config, hardware, run_id=None):
     ]
     if config["models"].get("teacher_adapter"):
         lines.append(f" teacher lora  : {config['models']['teacher_adapter']}")
+    if config["models"].get("teacher_base"):
+        lines.append(f" teacher base  : {config['models']['teacher_base']}")
     lines += [
         f" dataset       : {config['dataset']['source']}",
         f" device        : {hardware['device']} ({hardware['dtype_name']})",

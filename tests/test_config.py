@@ -16,6 +16,22 @@ from kd import config as kdc  # noqa: E402
 PROFILES = ["default", "mac", "smoke", "finance", "qwen-poc"]
 CONFIGS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs")
 
+
+def profile_path(name):
+    """A profile by bare name, wherever it sits under configs/<group>/."""
+    import glob
+
+    found = glob.glob(os.path.join(CONFIGS, "*", f"{name}.yaml"))
+    assert found, f"no profile named {name} under configs/*/"
+    return found[0]
+
+
+def shipped_profiles():
+    """Every profile file, in every group. _base.yaml is not a profile."""
+    import glob
+
+    return sorted(glob.glob(os.path.join(CONFIGS, "*", "*.yaml")))
+
 passed = []
 failed = []
 
@@ -33,7 +49,7 @@ def check(name, fn):
 
 def profile(name, **kwargs):
     kwargs.setdefault("use_env", False)
-    return kdc.load_config(os.path.join(CONFIGS, f"{name}.yaml"), **kwargs)
+    return kdc.load_config(profile_path(name), **kwargs)
 
 
 def expect_error(fn, *fragments):
@@ -325,13 +341,9 @@ def test_every_data_files_entry_exists():
 
     Only local sources are checked. A Hub id is not this test's business.
     """
-    import glob
-
     offences = []
-    for path in sorted(glob.glob(os.path.join(CONFIGS, "*.yaml"))):
+    for path in shipped_profiles():
         name = os.path.splitext(os.path.basename(path))[0]
-        if name.startswith("_"):
-            continue
         resolved = kdc.load_config(path, use_env=False)
         dataset = resolved.get("dataset") or {}
         source = str(dataset.get("source") or "")
@@ -360,13 +372,9 @@ def test_arena_file_exists_where_named():
     Same failure shape as above and a worse place to discover it: the arena
     stage runs after training, so a bad path there wastes the whole run.
     """
-    import glob
-
     offences = []
-    for path in sorted(glob.glob(os.path.join(CONFIGS, "*.yaml"))):
+    for path in shipped_profiles():
         name = os.path.splitext(os.path.basename(path))[0]
-        if name.startswith("_"):
-            continue
         arena_file = (kdc.load_config(path, use_env=False).get("evaluation")
                       or {}).get("arena_file")
         if not arena_file or str(arena_file).startswith("s3://"):
@@ -377,6 +385,55 @@ def test_arena_file_exists_where_named():
             offences.append(f"{name}.yaml: evaluation.arena_file '{arena_file}'")
     assert not offences, "configs name held-out sets that do not exist: " \
         + "; ".join(offences)
+
+
+def test_every_shipped_profile_resolves():
+    """Every file under configs/<group>/ is a profile that loads, base included."""
+    for path in shipped_profiles():
+        cfg = kdc.load_config(path, use_env=False)
+        assert cfg["gkd"]["beta"] == 0.9, f"{path} lost gkd.beta"
+        assert "configs/_base.yaml" in " ".join(cfg["_meta"]["chain"]).replace("\\", "/")
+
+
+def test_extends_reaches_across_groups():
+    """A profile in one group can extend one in another, and the chain says so."""
+    import shutil
+    outside = tempfile.mkdtemp(prefix="kd-test-", dir=CONFIGS)
+    try:
+        path = os.path.join(outside, "mine.yaml")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("extends: ../enlibra/enlibraQ25-3B.yaml\n"
+                         "evaluation:\n  name: full\n")
+        cfg = kdc.load_config(path, use_env=False)
+        chain = [c.replace("\\", "/") for c in cfg["_meta"]["chain"]]
+        assert chain[:2] == ["configs/_base.yaml", "configs/enlibra/enlibraQ25-3B.yaml"], chain
+        assert cfg["evaluation"]["name"] == "full"
+        # Inherited, not restated: the pair and its bucket.
+        assert cfg["models"]["teacher_base"] == "Qwen/Qwen2.5-3B-Instruct"
+        assert cfg["s3"]["bucket"] == "enlibra"
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_evaluation_stages_are_validated_like_pipeline_stages():
+    with_temp_config(
+        "extends: _base.yaml\nevaluation:\n  stages:\n    - {name: evaluate, gaet: true}\n",
+        lambda p: expect_error(lambda: kdc.load_config(p, use_env=False),
+                               "evaluation.stages[0].gaet", "gate"))
+
+
+def test_evaluation_is_off_by_default_and_the_smoke_profiles_turn_it_on():
+    assert kdc.load_config(None, use_env=False)["evaluation"]["after_training"] is False
+    assert profile("enlibraQ25-3B")["evaluation"]["after_training"] is False
+    for name in ("smoke", "enlibraQ25-flow", "enlibraQ25-3B-smoke", "enlibraQ3-8B-smoke"):
+        assert profile(name)["evaluation"]["after_training"] is True, name
+
+
+def test_stand_in_teachers_do_not_inherit_a_real_teacher_base():
+    """A stock stand-in was fine-tuned from nothing; the parent's base must not leak."""
+    assert profile("enlibraQ3-8B")["models"]["teacher_base"] == "Qwen/Qwen3-8B"
+    for name in ("enlibraQ3-8B-smoke", "enlibraQ3-8B-mac", "enlibraQ25-flow"):
+        assert profile(name)["models"]["teacher_base"] is None, name
 
 
 for _name, _fn in sorted(list(globals().items())):

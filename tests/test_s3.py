@@ -87,7 +87,7 @@ def check(name, fn):
 
 
 def make_config(workspace, enabled=True, **s3_settings):
-    config = kdc.load_config(os.path.join(CONFIGS, "smoke.yaml"), use_env=False)
+    config = kdc.load_config(os.path.join(CONFIGS, "smollm", "smoke.yaml"), use_env=False)
     config["project"]["runs_dir"] = os.path.join(workspace, "runs")
     config["s3"].update({"enabled": enabled, "bucket": "test-bucket", "prefix": "kd",
                          "cache_dir": os.path.join(workspace, "cache")})
@@ -309,6 +309,45 @@ def test_bundle_prefix_layout(workspace):
     assert s3.run_prefix(config, "RUNID") == "kd/runs/RUNID"
     config["s3"]["prefix"] = ""
     assert s3.run_prefix(config, "RUNID") == "runs/RUNID"
+
+
+def test_evaluation_prefix_sits_inside_the_bundle(workspace):
+    """An evaluation lands at <bundle>/evaluation/<id>, whatever bucket the bundle is in."""
+    assert s3.evaluation_prefix("s3://b/kd/runs/RUNID", "full-2026-09-15-1030") == \
+        ("b", "kd/runs/RUNID/evaluation/full-2026-09-15-1030")
+    assert s3.evaluation_prefix("s3://other/x/y/", "quick-1") == \
+        ("other", "x/y/evaluation/quick-1")
+    assert s3.evaluation_prefix("s3://bare", "e") == ("bare", "evaluation/e")
+
+
+def test_an_explicit_destination_overrides_the_run_prefix(workspace):
+    """The evaluation upload names where it goes; the config's prefix is not used."""
+    config = make_config(workspace, upload=["logs", "metrics"])
+    run_dir, run_id = seed_bundle(workspace, config)
+    fake = install_fake()
+    summary = s3.upload_bundle(config, run_dir, run_id,
+                               destination=("elsewhere", "their/runs/T/evaluation/E"))
+    assert summary["uri"] == "s3://elsewhere/their/runs/T/evaluation/E", summary
+    assert all(key.startswith("their/runs/T/evaluation/E/") for key in fake.uploaded), \
+        list(fake.uploaded)
+    assert "their/runs/T/evaluation/E/manifest.json" in fake.uploaded
+
+
+def test_evaluations_inside_a_bundle_ship_with_it(workspace):
+    """The `evaluation` group covers every scoring done inside the training run."""
+    config = make_config(workspace, upload=["evaluation"])
+    run_dir, run_id = seed_bundle(workspace, config)
+    inner = os.path.join(run_dir, "evaluation", "full-2026-09-15-1030")
+    os.makedirs(inner)
+    for name in ("arena.json", "report.html"):
+        with open(os.path.join(inner, name), "w") as handle:
+            handle.write("x")
+    fake = install_fake()
+    s3.upload_bundle(config, run_dir, run_id)
+    keys = {key.split(f"runs/{run_id}/")[-1] for key in fake.uploaded}
+    assert "evaluation/full-2026-09-15-1030/arena.json" in keys, keys
+    assert "evaluation/full-2026-09-15-1030/report.html" in keys, keys
+    assert "final_adapter/adapter_model.safetensors" not in keys, keys
 
 
 def test_uploaded_manifest_is_current(workspace):

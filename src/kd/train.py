@@ -5,8 +5,8 @@ Fully config-driven. Models, dataset, LoRA shape, schedule and hardware all come
 from a YAML file, so retargeting to a different teacher, student or dataset never
 requires a code edit:
 
-    kd train --config configs/finance.yaml
-    kd train --config configs/finance.yaml --set training.max_steps=600
+    kd train --config configs/qwen/finance.yaml
+    kd train --config configs/qwen/finance.yaml --set training.max_steps=600
 
 What the run does, in order:
   1. tokenizer - student and teacher must share a vocabulary for standard GKD

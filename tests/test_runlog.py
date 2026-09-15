@@ -40,7 +40,7 @@ def check(name, fn):
 
 
 def make_config(workspace, **overrides):
-    config = kdc.load_config(os.path.join(CONFIGS, "smoke.yaml"), use_env=False)
+    config = kdc.load_config(os.path.join(CONFIGS, "smollm", "smoke.yaml"), use_env=False)
     config["project"]["runs_dir"] = os.path.join(workspace, "runs")
     for path, value in overrides.items():
         config["project"][path] = value
@@ -66,6 +66,40 @@ def test_creates_the_bundle(workspace):
     for name in (runlog.RESOLVED_CONFIG, runlog.RUN_LOG, runlog.EVENTS, runlog.MANIFEST):
         assert os.path.isfile(os.path.join(run_dir, name)), f"missing {name}"
     assert os.path.isdir(os.path.join(run_dir, runlog.CHECKPOINT_DIR))
+
+
+def test_a_run_can_be_placed_inside_another_bundle(workspace):
+    """An evaluation is a Run created under <bundle>/evaluation, with no checkpoints."""
+    config = make_config(workspace)
+    with runlog.Run(config, quiet=True, run_id="trained") as outer:
+        bundle = outer.dir
+    home = os.path.join(bundle, runlog.EVALUATION_DIR)
+    with runlog.Run(config, quiet=True, run_id="full-2026-09-15-1030", parent=home,
+                    checkpoints=False, latest=False) as inner:
+        where = inner.dir
+    assert os.path.dirname(where) == home, where
+    assert not os.path.isdir(os.path.join(where, runlog.CHECKPOINT_DIR))
+    assert os.path.isfile(os.path.join(where, runlog.MANIFEST))
+    assert read_manifest(where)["run_id"] == "full-2026-09-15-1030"
+    # No `latest` pointer next to it, and the outer run's pointer is untouched.
+    assert not any(os.path.exists(os.path.join(home, p)) for p in ("latest", "latest.txt"))
+    # A second run with the SAME explicit id under a parent gets a suffix, not
+    # the first one's directory: named evaluations must never overwrite.
+    with runlog.Run(config, quiet=True, run_id="full-2026-09-15-1030", parent=home,
+                    checkpoints=False, latest=False) as again:
+        assert again.run_id == "full-2026-09-15-1030-2", again.run_id
+        assert again.dir != where
+    assert runlog.bundle_of(os.path.join(bundle, runlog.ADAPTER_DIR)) == bundle
+    assert runlog.bundle_of(os.path.join(bundle, runlog.CHECKPOINT_DIR, "checkpoint-5")) == bundle
+    found = runlog.discover_evaluations(bundle)
+    assert len(found) == 2 and all(os.path.dirname(p) == home for p in found), found
+
+
+def test_eval_id_shape(workspace):
+    from datetime import datetime, timezone
+
+    when = datetime(2026, 9, 15, 10, 30, tzinfo=timezone.utc)
+    assert runlog.make_eval_id("full", when) == "full-2026-09-15-1030"
 
 
 def test_run_id_shape(workspace):

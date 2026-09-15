@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # Apple Silicon (M-series) profile - MPS backend over unified memory.
 #
-#   kd pipeline --config configs/mac.yaml
+#   kd pipeline --config configs/smollm/mac.yaml
 #
 # Unified memory means the GPU addresses the same physical RAM as the CPU, so
 # there is no host->device copy and no separate VRAM ceiling. The practical
@@ -21,7 +21,7 @@
 # it saves memory but will not necessarily be faster. `auto` selects float32,
 # which is the safe choice. On macOS 14+ ask for the headroom explicitly:
 #
-#   kd pipeline --config configs/mac.yaml --set hardware.dtype=bfloat16
+#   kd pipeline --config configs/smollm/mac.yaml --set hardware.dtype=bfloat16
 # ---------------------------------------------------------------------------
 extends: _base.yaml
 

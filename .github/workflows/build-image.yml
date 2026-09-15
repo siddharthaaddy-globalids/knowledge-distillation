@@ -82,7 +82,7 @@ jobs:
             echo
             echo "Rent a GPU against it:"
             echo '```'
-            echo "kd runpod launch --config configs/finance.yaml \\"
+            echo "kd runpod launch --config configs/qwen/finance.yaml \\"
             echo "  --set runpod.enabled=true \\"
             echo "  --set runpod.image=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha_short }}"
             echo '```'

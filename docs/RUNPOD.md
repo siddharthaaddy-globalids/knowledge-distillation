@@ -27,7 +27,7 @@ export HF_TOKEN=...                 # if the teacher is private
 ## A first run that rents nothing
 
 ```bash
-kd runpod gpus --config configs/finance.yaml --set runpod.enabled=true
+kd runpod gpus --config configs/qwen/finance.yaml --set runpod.enabled=true
 ```
 
 This authenticates, reads the catalogue and prints what is available under your
@@ -36,7 +36,7 @@ price cap. It is the cheapest way to find out that your key works.
 ## Launching
 
 ```bash
-kd runpod launch --config configs/finance.yaml \
+kd runpod launch --config configs/qwen/finance.yaml \
   --set runpod.enabled=true \
   --set runpod.image=ghcr.io/<org>/kd:<sha> \
   --set s3.enabled=true --set s3.bucket=<bucket> \
@@ -47,7 +47,7 @@ Or put those in a profile that extends your training config, so a launch is one
 argument:
 
 ```yaml
-# configs/finance-pod.yaml
+# configs/qwen/finance-pod.yaml
 extends: finance.yaml
 
 runpod:
@@ -64,7 +64,7 @@ limits:
 ```
 
 ```bash
-kd runpod launch --config configs/finance-pod.yaml
+kd runpod launch --config configs/qwen/finance-pod.yaml
 ```
 
 ## By hand, over SSH
@@ -100,7 +100,7 @@ handed to.
 
 ```bash
 ./scripts/runpod.sh --rehearse doctor
-./scripts/runpod.sh --rehearse --config configs/enlibraQ3-8B-smoke.yaml
+./scripts/runpod.sh --rehearse --config configs/enlibra/enlibraQ3-8B-smoke.yaml
 ```
 
 Without `/workspace`, it falls back to `~/kd-workspace` and says so.
@@ -133,7 +133,7 @@ whole run.
 **2. Does the config fit this GPU?**
 
 ```bash
-./scripts/runpod.sh check --config configs/finance.yaml
+./scripts/runpod.sh check --config configs/qwen/finance.yaml
 ```
 
 Resolves the config - every `extends`, every `--set`, every environment override -
@@ -144,7 +144,7 @@ is loaded and nothing is trained. This is where a batch size that will not fit i
 **3. Does the pipeline work end to end?**
 
 ```bash
-./scripts/runpod.sh --config configs/smoke.yaml
+./scripts/runpod.sh --config configs/smollm/smoke.yaml
 ```
 
 The full gated pipeline on tiny pools and two steps, in a couple of minutes. It
@@ -159,7 +159,7 @@ fortieth minute of a real run is not.
 **4. The real run.**
 
 ```bash
-./scripts/runpod.sh --config configs/finance.yaml \
+./scripts/runpod.sh --config configs/qwen/finance.yaml \
   --set limits.max_cost_usd=2.00 --set limits.max_runtime_minutes=90
 ```
 
@@ -205,19 +205,27 @@ than the adapter alone: `manifest.json` and `config.resolved.yaml` are what let
 the adapter say what produced it, and an adapter that cannot is a file you will
 not trust in a month.
 
-**The evaluation already happened.** `evaluate` and `report` are stages of the
-pipeline, so the pod measured transfer and wrote the report before it finished.
-Nothing needs re-running locally - open `report.html` and read `metrics.json`.
-They are also non-gate stages, so a failure there is logged and the run carries
-on: a broken report never destroys a good adapter.
+**The evaluation is a separate step.** The pod run ends with the adapter in the
+bundle; scoring it is `kd eval`, run wherever suits - on the pod straight away
+with `--set evaluation.after_training=true` (the teacher is resident and paid
+for there), or later on a cheaper machine against the bucket copy:
 
-Re-run `kd evaluate` on your own machine only when you want something the pod run
-did not produce:
+```bash
+kd eval --config configs/enlibra/enlibraQ25-3B.yaml \
+  --adapter s3://<bucket>/<prefix>/runs/<run-id>/final_adapter
+```
+
+Either way it writes into the adapter's bundle under
+`evaluation/<name>-<date>-<time>/`, here and in the bucket, and a failure there
+is logged without touching the adapter.
+
+Run `kd evaluate` on its own only when you want one measurement the pipeline
+does not produce by default:
 
 ```bash
 # benchmark tasks and generation similarity - needs `uv sync --extra eval`,
 # which the pod install deliberately skips
-kd evaluate --config configs/finance.yaml \
+kd evaluate --config configs/qwen/finance.yaml \
   --adapter ./runs/<run-id>/final_adapter --tasks ...
 ```
 
@@ -317,7 +325,7 @@ Feeding results back into a later run is symmetrical: any of `models.teacher`,
 URI, fetched in `preflight` and cached locally.
 
 ```bash
-kd evaluate --config configs/finance.yaml \
+kd evaluate --config configs/qwen/finance.yaml \
   --adapter s3://my-bucket/kd/runs/20260908T1412Z-finance-bb0c874/final_adapter
 ```
 

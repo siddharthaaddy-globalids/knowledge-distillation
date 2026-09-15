@@ -6,7 +6,7 @@
 #
 #  QUICK START
 #    chmod +x distill.sh
-#    ./distill.sh --config configs/finance.yaml
+#    ./distill.sh --config configs/qwen/finance.yaml
 #
 #  This script is a bootstrapper and nothing else. It installs uv, fetches the
 #  source pinned to the commit it was built from, and hands over to the Python
@@ -16,8 +16,8 @@
 #
 #  Anything it does not recognise is passed straight through:
 #
-#    ./distill.sh --config configs/finance.yaml --set training.max_steps=500
-#    ./distill.sh evaluate --config configs/finance.yaml
+#    ./distill.sh --config configs/qwen/finance.yaml --set training.max_steps=500
+#    ./distill.sh evaluate --config configs/qwen/finance.yaml
 #    ./distill.sh --help
 #
 #  With no leading subcommand it runs the full gated pipeline.
@@ -81,10 +81,10 @@ COMMAND
   check, check-teacher, fix-teacher, convert-adapter, publish, ui, doctor.
 
 EXAMPLES
-  ./distill.sh --config configs/finance.yaml
-  ./distill.sh --config configs/finance.yaml --set training.max_steps=500
-  ./distill.sh --config configs/finance.yaml --only train
-  ./distill.sh check --config configs/finance.yaml
+  ./distill.sh --config configs/qwen/finance.yaml
+  ./distill.sh --config configs/qwen/finance.yaml --set training.max_steps=500
+  ./distill.sh --config configs/qwen/finance.yaml --only train
+  ./distill.sh check --config configs/qwen/finance.yaml
   ./distill.sh doctor
   ./distill.sh --help
 

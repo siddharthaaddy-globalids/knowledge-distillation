@@ -1,6 +1,6 @@
 """Checks that an arena run cannot lose what it measured.
 
-Generation is the expensive, unrepeatable part of the arena: three models over a
+Generation is the expensive, unrepeatable part of the arena: four models over a
 held-out set, hours of it on a laptop. Everything after it - the similarity
 table, the terminal summary, the HTML report - is cheap and derived from what
 generation produced.
@@ -46,6 +46,9 @@ SAID = {
     "base": ["It is probably alpha. <Answer>: A", "the answer is C"],
     "distilled": ["<Explanation> beta fits. <Answer>: B",
                   "<Explanation> three. <Answer>: C"],
+    # The stock model the teacher was fine-tuned from: right on the first, and
+    # answering in prose rather than the trained format on the second.
+    "teacher-base": ["I think beta. <Answer>: B", "The answer is D"],
     "teacher": ["<Explanation> clearly beta. <Answer>: B",
                 "<Explanation> three it is. <Answer>: C"],
 }
@@ -53,7 +56,7 @@ GOLD = ["B", "C"]
 
 
 def fake_play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
-              players=("base", "distilled", "teacher"), show=0):
+              players=arena.PLAYERS, show=0):
     """What play() returns, without loading anything."""
     count = len(questions)
     completions = {name: SAID[name][:count] for name in players}
@@ -154,7 +157,7 @@ def test_the_transcript_holds_every_word_of_every_player():
     first = lines[0]
     assert first["gold"] == "B", first
     assert "Q1?" in first["asked"], first
-    assert set(first["players"]) == {"base", "distilled", "teacher"}, first["players"]
+    assert set(first["players"]) == set(arena.PLAYERS), first["players"]
     # The full text, not a truncated sample: this file is the only record of it.
     assert first["players"]["base"]["completion"] == SAID["base"][0], first["players"]
     assert first["players"]["teacher"]["correct"] is True, first["players"]
@@ -240,7 +243,7 @@ def test_the_payload_carries_closeness_to_the_teacher():
     assert code == 0
     close = load(directory)["closeness"]
     assert close["reference"] == "teacher", close
-    assert sorted(close["players"]) == ["base", "distilled"], close
+    assert sorted(close["players"]) == ["base", "distilled", "teacher-base"], close
     # distilled matched the teacher's letter on both questions; base on one.
     assert close["players"]["distilled"]["same_answer"] == 2, close
     assert close["players"]["base"]["same_answer"] == 1, close
@@ -254,7 +257,24 @@ def test_the_payload_names_what_was_scored():
     payload = load(directory)
     assert payload["arena_file"] == "./stub.jsonl", payload["arena_file"]
     assert payload["questions"] == len(GOLD), payload["questions"]
-    assert set(payload["players"]) == {"base", "distilled", "teacher"}
+    assert set(payload["players"]) == set(arena.PLAYERS)
+
+
+def test_players_come_from_the_config_and_skip_wins():
+    """evaluation.players picks the set; --skip removes from it; order is fixed."""
+    config = {"evaluation": {"players": ["teacher", "base"]}}
+    assert arena.chosen_players(config) == ("base", "teacher")
+    assert arena.chosen_players(config, skip=["teacher"]) == ("base",)
+    assert arena.chosen_players({}) == arena.PLAYERS
+    try:
+        arena.chosen_players({"evaluation": {"players": ["base", "techer"]}})
+    except ValueError as exc:
+        assert "techer" in str(exc), exc
+    else:
+        raise AssertionError("a misspelt player was accepted")
+    code, directory = run(skip=["teacher-base"])
+    assert code == 0
+    assert set(load(directory)["players"]) == {"base", "distilled", "teacher"}
 
 
 for _name, _fn in sorted(list(globals().items())):

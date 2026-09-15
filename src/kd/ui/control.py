@@ -103,9 +103,24 @@ def auto_profile():
 
 
 def config_file(profile):
+    """The path of a profile, wherever it sits under configs/.
+
+    Profiles are grouped one directory deep - configs/smollm/mac.yaml - and
+    named without the group, so the group is found by looking. Forward slashes
+    on every platform: this string is both an argv element and the command
+    shown on screen for copy-pasting into a shell.
+    """
+    import glob
+
     name = auto_profile() if profile == "auto" else profile
-    # Forward slashes on every platform: this string is both an argv element and the
-    # command shown on screen for copy-pasting into a shell.
+    if "/" in name or name.endswith(".yaml"):
+        return name.replace("\\", "/")
+    from ..config import CONFIG_DIR
+
+    found = glob.glob(os.path.join(CONFIG_DIR, "*", f"{name}.yaml"))
+    if found:
+        group = os.path.basename(os.path.dirname(found[0]))
+        return f"configs/{group}/{name}.yaml"
     return f"configs/{name}.yaml"
 
 

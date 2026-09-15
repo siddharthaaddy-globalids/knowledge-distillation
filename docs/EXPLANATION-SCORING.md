@@ -2,7 +2,8 @@
 
 **Status:** design, not implemented. Nothing in `src/kd/` does any of this yet.
 
-The arena scores three players on a held-out multiple-choice set and reports
+The arena scores the players - base, distilled, teacher-base when known, and
+teacher - on a held-out multiple-choice set and reports
 accuracy, Elo, and one similarity table. This document is about that table — why
 it cannot be read as it stands, and what to replace it with.
 

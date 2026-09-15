@@ -1,20 +1,50 @@
 """
-The gated pipeline: every level of verification, in order, in one command.
+The gated pipelines: training, and - separately - evaluation.
 
-    kd pipeline --config configs/finance.yaml
+    kd pipeline --config configs/enlibra/enlibraQ25-3B.yaml
+    kd eval     --config configs/enlibra/enlibraQ25-3B.yaml --adapter s3://.../final_adapter
 
-walks the stages listed under `pipeline:` in the config and stops at the first
-failed gate:
+TRAINING walks the stages listed under `pipeline:` in the config and stops at
+the first failed gate:
 
     preflight      resolve config and hardware, fetch remote inputs
     teacher-check  teacher only - missing weights, NaN scan, coherence
     smoke          2 real steps; measures s/step and projects the full run
     train
-    evaluate
-    arena          skipped unless evaluation.arena_file names a held-out set
-    report
+    evaluation     skipped unless evaluation.after_training - see below
     publish        skipped unless publish.enabled
     upload         skipped unless s3.enabled; also runs after a failure
+
+EVALUATION walks the stages under `evaluation.stages` against an adapter that
+already exists - this checkout's newest, or one named by path or s3:// URI:
+
+    preflight      fetch the teacher and the adapter, say what will be scored
+    evaluate       fidelity and capability, token by token, against the teacher
+    arena          skipped unless evaluation.arena_file names a held-out set
+    report
+    upload         skipped unless s3.enabled
+
+The two are separate because they have different lives. Training happens once,
+on the machine with the GPU, and the adapter it produces is the thing worth
+keeping - so it leaves the machine as soon as it exists. Evaluation happens as
+many times as there are questions to ask of that adapter: a quick look, the
+full held-out set, a re-score after the answer parser was fixed, on whatever
+machine is to hand. Each evaluation is a directory of its own INSIDE the
+adapter's bundle:
+
+    runs/<train-run>/
+        final_adapter/
+        evaluation/
+            quick-2026-09-15-1030/     evaluation.json, arena.json, report.html, ...
+            full-2026-09-15-1412/
+
+and the bucket copy of the bundle has the same shape, so a listing of it shows
+every time the adapter was scored, whichever machine did it.
+
+`evaluation.after_training: true` puts the evaluation back inside the training
+run, as the `evaluation` stage - the pod already has the teacher resident and
+paid for. It writes into the same evaluation/ layout, so nothing downstream
+can tell the difference.
 
 A GATE stage that fails aborts the run. A non-gate stage that fails is reported
 and the pipeline carries on, so a broken report never destroys a good adapter.
@@ -24,12 +54,12 @@ profile can say what a run of that profile means. Narrowing a single run is a
 command-line matter instead:
 
     --only train           just that stage
-    --from evaluate        that stage and everything after it
+    --from arena           that stage and everything after it
     --skip smoke           everything except that
 
 A stage is a function taking one Context and returning a dict of things later
 stages may want. That is the whole contract - there is no base class and no
-registration decorator, because eight stages do not need either.
+registration decorator, because a dozen stages do not need either.
 """
 
 import os
@@ -58,12 +88,19 @@ class StageRefused(StageFailed):
 class Context:
     """What every stage is handed, and where stages leave things for each other."""
 
-    def __init__(self, config, hardware, run, budget, options=None):
+    def __init__(self, config, hardware, run, budget, options=None, bundle=None,
+                 evaluation=False):
         self.config = config
         self.hardware = hardware
         self.run = run
         self.budget = budget
         self.options = options or {}
+        # The directory holding the adapter this run is about. For a training
+        # run that is the run directory itself; for an evaluation it is the
+        # bundle the adapter came from, and `run` is a directory inside its
+        # evaluation/. Stages that look for earlier output start here.
+        self.bundle = bundle or run.dir
+        self.evaluation = evaluation
         # Filled in as the run proceeds: seconds_per_step by smoke, adapter by
         # train, evaluation by evaluate. Stages read what earlier ones left.
         self.results = {}
@@ -74,7 +111,7 @@ class Context:
 
     # --- inputs a stage needs that an earlier stage may not have produced ---- #
     #
-    # `--from evaluate` and `--only report` open a NEW run directory, because every
+    # `--from arena` and `--only report` open a NEW directory, because every
     # invocation is its own run. The stages they start with therefore have to be
     # able to pick up where the last run left off, or those flags would only ever
     # work in a pipeline that had already run the earlier stages in the same
@@ -88,29 +125,16 @@ class Context:
         produce a report about the wrong weights - the worst kind of wrong,
         since every number in it would look perfectly reasonable.
         """
-        from . import paths
-
         named = self.options.get("adapter")
         if named:
-            # adapter_dir_of first: a path copied out of a bucket listing names
-            # adapter_config.json, and the directory is what loads.
-            named = paths.adapter_dir_of(named)
-            # The URI as typed survives the rewrite below, because the report
-            # says where the adapter lives in the bucket and the local path
-            # alone cannot say that.
-            if paths.is_remote(named):
-                self.options.setdefault("adapter_source", named)
+            local, source = locate_adapter(named, self.config, log=self.log)
+            if source:
+                self.options.setdefault("adapter_source", source)
             # Written back so the next stage to ask sees a local path: localise
             # is a no-op on one, so evaluate and arena share the one download
             # without either needing to know the other ran.
-            named = paths.localise(named, self.config, log=self.log,
-                                   label="adapter")
-            self.options["adapter"] = named
-            if not runlog.is_adapter(named):
-                raise StageFailed(
-                    f"--adapter {named} is not a LoRA adapter directory: no "
-                    f"adapter_config.json in it.")
-            return named
+            self.options["adapter"] = local
+            return local
         if runlog.is_adapter(self.results.get("adapter")):
             return self.results["adapter"]
         if runlog.is_adapter(self.run.adapter_dir):
@@ -126,9 +150,13 @@ class Context:
         """This run's `filename`, else the newest any run produced, else None.
 
         The rule that makes `--only report` and `--from report` mean anything:
-        those open a NEW run directory, so the file a later stage wants was
-        written by an earlier invocation and has to be found rather than
-        assumed.
+        those open a NEW directory, so the file a later stage wants was written
+        by an earlier invocation and has to be found rather than assumed.
+
+        Looked for, in order: this run; the other evaluations of the same
+        bundle; every evaluation of every bundle under runs_dir; and finally a
+        bundle's top level, which is where evaluations were written before they
+        moved into evaluation/.
         """
         import glob
 
@@ -136,22 +164,29 @@ class Context:
         if os.path.isfile(candidate):
             return candidate
         runs_dir = self.config["project"].get("runs_dir") or "./runs"
-        # Skip the `latest` pointer for the same reason discovery does: where the
-        # platform makes it a real symlink it matches this glob as well, and
-        # naming an alias instead of a run id makes the log say something that
-        # will not be true tomorrow.
-        found = sorted(
-            (p for p in glob.glob(os.path.join(runs_dir, "*", filename))
-             if not runlog.is_latest_alias(p, runs_dir)),
-            key=os.path.getmtime, reverse=True)
-        if found:
-            newest = os.path.normpath(found[0]).replace("\\", "/")
-            self.log.info(f"      using the newest {what} found: {newest}")
-            return newest
+        patterns = [
+            os.path.join(self.bundle, runlog.EVALUATION_DIR, "*", filename),
+            os.path.join(runs_dir, "*", runlog.EVALUATION_DIR, "*", filename),
+            os.path.join(runs_dir, "*", filename),
+        ]
+        for pattern in patterns:
+            # Skip the `latest` pointer for the same reason discovery does: where
+            # the platform makes it a real symlink it matches this glob as well,
+            # and naming an alias instead of a run id makes the log say
+            # something that will not be true tomorrow.
+            found = sorted(
+                (p for p in glob.glob(pattern)
+                 if not runlog.is_latest_alias(p, runs_dir)
+                 and os.path.abspath(p) != os.path.abspath(candidate)),
+                key=os.path.getmtime, reverse=True)
+            if found:
+                newest = os.path.normpath(found[0]).replace("\\", "/")
+                self.log.info(f"      using the newest {what} found: {newest}")
+                return newest
         return None
 
     def ensure_inputs(self):
-        """Fetch any s3:// input that preflight has not already fetched.
+        """Fetch any s3:// input preflight has not fetched, and settle the teacher.
 
         preflight is where remote inputs are normally resolved, and every stage
         after it inherits a config whose paths are local. But `--from arena` and
@@ -159,6 +194,11 @@ class Context:
         `s3://...` string to from_pretrained and get "Repo id must be in the form
         namespace/repo_name" - a message about the Hub, for a problem that has
         nothing to do with the Hub.
+
+        Settling the teacher means: a models.teacher that is really a LoRA
+        adapter is split into base + adapter, and an adapter in MLX format is
+        converted once. Both are what preflight does, repeated here for the
+        same reason.
 
         Called by the stages that load a model, not by the pipeline, and that
         distinction is the point: `--only report` must not trigger a multi-
@@ -169,10 +209,15 @@ class Context:
         """
         from . import paths
 
-        if not paths.remote_values(self.config):
-            return
         try:
-            paths.resolve_inputs(self.config, self.log)
+            if paths.remote_values(self.config):
+                paths.resolve_inputs(self.config, self.log)
+            paths.normalise_teacher(self.config, log=self.log)
+            adapter = self.config["models"].get("teacher_adapter")
+            # A local PEFT directory needs no conversion, and checking a Hub
+            # id costs a file listing - once, in preflight, is enough.
+            if adapter and not paths.is_adapter_dir(adapter):
+                paths.ensure_peft_adapter(self.config, self.log)
         except Exception as exc:
             raise StageFailed(str(exc)) from exc
 
@@ -189,8 +234,36 @@ class Context:
         return self._newest("arena", "arena.json", "arena score")
 
 
+def locate_adapter(named, config, log=None):
+    """(local directory, s3:// source or None) for an adapter someone named.
+
+    Tolerant of a path that names a file inside the adapter, which is what
+    copying out of a bucket listing gives you; an s3:// URI is fetched into
+    the shared cache. Raises StageFailed when what is there is not an adapter,
+    because a report about weights that were never read is worse than no
+    report.
+    """
+    from . import paths
+
+    # adapter_dir_of first: a path copied out of a bucket listing names
+    # adapter_config.json, and the directory is what loads.
+    named = paths.adapter_dir_of(named)
+    # The URI as typed survives the rewrite below, because the report says
+    # where the adapter lives in the bucket and the local path alone cannot.
+    source = named if paths.is_remote(named) else None
+    try:
+        local = paths.localise(named, config, log=log, label="adapter")
+    except RuntimeError as exc:
+        raise StageFailed(str(exc)) from exc
+    if not runlog.is_adapter(local):
+        raise StageFailed(
+            f"--adapter {local} is not a LoRA adapter directory: no "
+            f"adapter_config.json in it.")
+    return local, source
+
+
 # --------------------------------------------------------------------------- #
-# Stages
+# Training stages
 # --------------------------------------------------------------------------- #
 def stage_preflight(ctx):
     """Resolve everything and prove the inputs are reachable. Costs seconds."""
@@ -213,6 +286,18 @@ def stage_preflight(ctx):
         ctx.run.event("preflight", "inputs_resolved", **{
             key: value["uri"] for key, value in fetched.items()})
 
+    # A models.teacher that is really a LoRA adapter - a fine-tune stored as
+    # just its deltas - is split here into the base it records plus the
+    # adapter, so that the teacher is merged from the canonical base rather
+    # than failing to load as a whole model. The base is remembered as
+    # models.teacher_base, which is what lets the evaluation score it.
+    try:
+        split = paths.normalise_teacher(config, log=ctx.log)
+    except Exception as exc:
+        raise StageFailed(str(exc)) from exc
+    if split:
+        ctx.run.event("preflight", "teacher_split", **split)
+
     # A teacher adapter that PEFT cannot load only fails once the base model is in
     # memory - for a 2B teacher, several gigabytes of download away. It is checked
     # here instead, from a file listing, and an MLX one is converted on the spot:
@@ -227,6 +312,7 @@ def stage_preflight(ctx):
         if converted:
             ctx.run.event("preflight", "adapter_converted", **converted)
         ctx.log.info(f"  teacher lora: {config['models']['teacher_adapter']}")
+        ctx.log.info(f"  teacher base: {config['models']['teacher']}")
 
     # Both models are resident at once. Weights that do not comfortably fit make
     # the allocator spill to swap rather than fail, so the symptom is a run that
@@ -331,11 +417,166 @@ def stage_train(ctx):
     return summary
 
 
+def stage_evaluation(ctx):
+    """Score this run's adapter, inside the run, as one stage of the training.
+
+    The whole evaluation pipeline - evaluate, arena, report - run into
+    <run>/evaluation/<name>-<date>/ exactly as `kd eval` would run it later,
+    so the bundle looks the same whichever way it was scored. The upload is
+    left out: the training run's own upload stage ships evaluation/** with
+    everything else.
+
+    Off unless evaluation.after_training says otherwise. On by choice for a
+    pod run where the teacher is already resident, and for the smoke and flow
+    profiles whose job is to prove every stage runs.
+    """
+    adapter = ctx.resolve_adapter()
+    if not adapter:
+        raise StageFailed(
+            f"nothing to evaluate: no adapter in this run, and none found under "
+            f"{ctx.config['project'].get('runs_dir')}.")
+
+    code, outcome = run_evaluation(
+        ctx.config, adapter=adapter, hardware=ctx.hardware,
+        options={"allow_bad_teacher": ctx.options.get("allow_bad_teacher", False),
+                 "adapter_source": ctx.options.get("adapter_source")},
+        nested=True, argv=ctx.run.argv, quiet=ctx.run.quiet)
+
+    # What the evaluation measured, summarised into the training run's own
+    # metrics.json - the numbers a bucket listing of the bundle is opened for.
+    if outcome.get("metrics"):
+        ctx.run.write_metrics(outcome["metrics"])
+    results = {"evaluation_dir": outcome.get("dir")}
+    for key in ("evaluation", "arena", "report", "no_improvement"):
+        if outcome.get(key):
+            results[key] = outcome[key]
+    if code == 3:
+        results["no_improvement"] = True
+    elif code != 0:
+        raise StageFailed(f"the evaluation failed (exit {code}); see "
+                          f"{outcome.get('dir')}")
+    return results
+
+
+def stage_publish(ctx):
+    """Push the adapter and a merged model to the Hugging Face Hub."""
+    import argparse
+
+    from . import publish
+
+    settings = ctx.config.get("publish") or {}
+    args = argparse.Namespace(
+        repo=settings.get("repo"),
+        config=ctx.config["_meta"].get("source"),
+        adapter=ctx.results.get("adapter") or ctx.run.adapter_dir,
+        private=bool(settings.get("private", True)),
+        dry_run=False,
+        adapter_only=False,
+        dtype=None,
+    )
+    code = publish.main(args)
+    if code != 0:
+        raise StageFailed(f"publish exited {code}")
+    return {"published": settings.get("repo")}
+
+
+def stage_upload(ctx, groups=None):
+    """Sync the finished run bundle to object storage.
+
+    The manifest is rewritten first so the uploaded copy reflects the run that is
+    ending, rather than the state it was in several stages ago.
+    """
+    from .remote import s3
+
+    ctx.run.write_manifest()
+    summary = s3.upload_bundle(ctx.config, ctx.run.dir, ctx.run.run_id,
+                               groups=groups, log=ctx.log)
+    ctx.run.event("upload", "bundle", **summary)
+    return {"uploaded": summary["uri"]}
+
+
+# --------------------------------------------------------------------------- #
+# Evaluation stages
+# --------------------------------------------------------------------------- #
+def stage_eval_preflight(ctx):
+    """Fetch what the evaluation needs and say what it is about to score."""
+    from . import arena, paths
+
+    ctx.log.info(f"  profile   : {ctx.config['_meta'].get('profile')}")
+    ctx.log.info(f"  device    : {ctx.hardware['device']} ({ctx.hardware['dtype_name']})")
+
+    adapter = ctx.resolve_adapter()
+    if not adapter:
+        raise StageFailed(
+            f"nothing to evaluate: no adapter named, and none found under "
+            f"{ctx.config['project'].get('runs_dir')}.\n"
+            f"Name one with --adapter <dir or s3://...>, or set evaluation.adapter.")
+    ctx.results["adapter"] = adapter
+    ctx.log.info(f"  adapter   : {adapter}")
+    if ctx.options.get("adapter_source"):
+        ctx.log.info(f"  fetched   : {ctx.options['adapter_source']}")
+    recorded = paths.adapter_base(adapter)
+    if recorded:
+        ctx.log.info(f"  trained on: {recorded}")
+    ctx.log.info(f"  writes to : {ctx.run.dir}")
+
+    # The players, validated before anything loads: a misspelt one would
+    # otherwise be discovered after the first model had been scored.
+    try:
+        players = arena.chosen_players(ctx.config)
+    except ValueError as exc:
+        raise StageFailed(str(exc)) from exc
+    needs_teacher = "teacher" in players or "teacher-base" in players
+    if needs_teacher:
+        ctx.ensure_inputs()
+    teacher_base = paths.teacher_base_of(ctx.config)
+    if "teacher-base" in players and not teacher_base:
+        ctx.log.info("  !! teacher-base is in evaluation.players but the teacher "
+                     "is a merged checkpoint and models.teacher_base is not set; "
+                     "that player is skipped")
+        players = tuple(p for p in players if p != "teacher-base")
+    ctx.log.info(f"  players   : {', '.join(players)}")
+    ctx.log.info(f"  teacher   : {ctx.config['models']['teacher']}"
+                 + (f" + {ctx.config['models']['teacher_adapter']}"
+                    if ctx.config["models"].get("teacher_adapter") else ""))
+    if teacher_base and "teacher-base" in players:
+        ctx.log.info(f"  its base  : {teacher_base}")
+    ctx.log.info(f"  student   : {ctx.config['models']['student']}")
+
+    # The held-out set, when the arena will run: a missing file is found
+    # here, in seconds, rather than after the fidelity pass.
+    settings = ctx.config.get("evaluation") or {}
+    arena_file = settings.get("arena_file")
+    if arena_file:
+        try:
+            arena_file = paths.localise(arena_file, ctx.config, log=ctx.log,
+                                        label="held-out set")
+        except RuntimeError as exc:
+            raise StageFailed(str(exc)) from exc
+        if not os.path.isfile(arena_file):
+            raise StageFailed(f"evaluation.arena_file points at {arena_file}, "
+                              f"which does not exist")
+        settings["arena_file"] = arena_file
+        ctx.log.info(f"  answer key: {arena_file}")
+
+    destination = None
+    if (ctx.config.get("s3") or {}).get("enabled"):
+        try:
+            bucket, key = evaluation_destination(ctx)
+            destination = f"s3://{bucket}/{key}"
+            ctx.log.info(f"  uploads to: {destination}")
+        except Exception as exc:  # noqa: BLE001 - said now, enforced at upload
+            ctx.log.warning(f"  !! cannot work out where to upload: {exc}")
+    ctx.run.event("preflight", "evaluation", adapter=adapter, players=list(players),
+                  bundle=ctx.bundle, destination=destination)
+    return {"players": list(players), "destination": destination}
+
+
 def stage_evaluate(ctx):
     """Score the adapter against the teacher on the held-out split."""
     import argparse
 
-    from . import evaluate
+    from . import evaluate, paths
 
     ctx.ensure_inputs()
 
@@ -344,9 +585,11 @@ def stage_evaluate(ctx):
         raise StageFailed(
             f"nothing to evaluate: no adapter in this run, and none found under "
             f"{ctx.config['project'].get('runs_dir')}.\n"
-            f"Train one first, or name it with --set project.output_dir=<dir>.")
+            f"Train one first, or name it with --adapter.")
 
     settings = ctx.config.get("evaluation") or {}
+    players = list(settings.get("players") or ["base", "distilled", "teacher-base",
+                                                "teacher"])
     payload_path = ctx.run.path("evaluation.json")
     args = argparse.Namespace(
         config=ctx.config["_meta"].get("source"),
@@ -354,6 +597,9 @@ def stage_evaluate(ctx):
         teacher=ctx.config["models"]["teacher"],
         student=ctx.config["models"]["student"],
         teacher_adapter=ctx.config["models"].get("teacher_adapter"),
+        teacher_base=paths.teacher_base_of(ctx.config)
+        if "teacher-base" in players else None,
+        no_teacher_base="teacher-base" not in players,
         samples=int(settings.get("samples") or 50),
         device=ctx.hardware["device"],
         dtype="auto",
@@ -382,12 +628,7 @@ def stage_evaluate(ctx):
 
 
 def stage_arena(ctx):
-    """Score base, distilled and teacher on the held-out set, and rate them.
-
-    Runs here, on the pod, rather than being left for later, because the teacher
-    is already resident and already paid for. Doing it afterwards on another
-    machine means downloading 8B of weights again to answer a question this
-    machine could answer in a few minutes.
+    """Score every player on the held-out set, and rate them.
 
     Not a gate: a student that scores badly is a result worth keeping, not a
     reason to throw away the adapter and the report.
@@ -396,7 +637,6 @@ def stage_arena(ctx):
 
     from . import arena
 
-    ctx.ensure_inputs()
     settings = ctx.config.get("evaluation") or {}
     path = settings.get("arena_file")
     questions, skipped = arena.load_questions(path)
@@ -414,11 +654,21 @@ def stage_arena(ctx):
             "nothing to score: no adapter in this run, and none found under "
             f"{ctx.config['project'].get('runs_dir')}")
 
+    try:
+        players = arena.chosen_players(ctx.config)
+    except ValueError as exc:
+        raise StageFailed(str(exc)) from exc
+    # The teacher is fetched only when a player needs it: `players: [base,
+    # distilled]` must not pull eight gigabytes it will never load.
+    if "teacher" in players or "teacher-base" in players:
+        ctx.ensure_inputs()
+
     ctx.log.info(f"      {len(questions)} held-out questions from {path}")
+    ctx.log.info(f"      players: {', '.join(players)}")
     predictions, formats, unanswered, completions = arena.play(
         ctx.config, ctx.hardware, adapter, questions,
         max_new_tokens=int(settings.get("arena_max_new_tokens") or 512),
-        log=ctx.log)
+        log=ctx.log, players=players)
 
     payload = arena.summarise(
         predictions, [q["gold"] for q in questions],
@@ -493,11 +743,14 @@ def stage_report(ctx):
     else:
         # An arena score with no evaluation beside it is a smaller report, not a
         # missing one - and refusing to write it would mean a run that scored
-        # three models on a held-out set ends with nothing a person can read.
+        # the players on a held-out set ends with nothing a person can read.
+        from . import paths
+
         payload = {
             "student": ctx.config["models"].get("student"),
             "teacher": ctx.config["models"].get("teacher"),
             "teacher_adapter": ctx.config["models"].get("teacher_adapter"),
+            "teacher_base": paths.teacher_base_of(ctx.config),
             "device": ctx.hardware["device"],
             "dtype": ctx.hardware.get("dtype_name"),
         }
@@ -522,10 +775,14 @@ def stage_report(ctx):
     from . import paths
 
     adapter = payload.get("adapter") or (payload.get("arena") or {}).get("adapter")
+    # An evaluation does not upload the adapter, so it is not told it is the
+    # run that will: the adapter is wherever it was fetched from or wherever
+    # its own run recorded sending it.
+    own = {} if ctx.evaluation else {"run_id": ctx.run.run_id, "run_dir": ctx.run.dir}
     payload["adapter_locations"] = paths.adapter_locations(
-        adapter, ctx.config, source=ctx.options.get("adapter_source"),
-        run_id=ctx.run.run_id, run_dir=ctx.run.dir) if adapter else None
+        adapter, ctx.config, source=ctx.options.get("adapter_source"), **own)         if adapter else None
     payload["profile"] = ctx.config["_meta"].get("source")
+    payload["evaluation_id"] = ctx.run.run_id if ctx.evaluation else None
     # From the config this stage runs with, not from evaluation.json: `--only
     # report` may be re-rendering an old run, and the section explains the
     # settings as they stand, honouring evaluation.report_training either way.
@@ -543,39 +800,48 @@ def stage_report(ctx):
     return {"report": str(written)}
 
 
-def stage_publish(ctx):
-    """Push the adapter and a merged model to the Hugging Face Hub."""
-    import argparse
+def evaluation_destination(ctx):
+    """(bucket, key) an evaluation uploads to: beside the adapter it scored.
 
-    from . import publish
-
-    settings = ctx.config.get("publish") or {}
-    args = argparse.Namespace(
-        repo=settings.get("repo"),
-        config=ctx.config["_meta"].get("source"),
-        adapter=ctx.results.get("adapter") or ctx.run.adapter_dir,
-        private=bool(settings.get("private", True)),
-        dry_run=False,
-        adapter_only=False,
-        dtype=None,
-    )
-    code = publish.main(args)
-    if code != 0:
-        raise StageFailed(f"publish exited {code}")
-    return {"published": settings.get("repo")}
-
-
-def stage_upload(ctx, groups=None):
-    """Sync the finished run bundle to object storage.
-
-    The manifest is rewritten first so the uploaded copy reflects the run that is
-    ending, rather than the state it was in several stages ago.
+    The adapter's own bucket address decides it - the URI it was fetched from,
+    or the upload an earlier run of this checkout recorded - and the evaluation
+    goes under that bundle's evaluation/. An adapter with no known copy in the
+    bucket goes where a run of this profile would have put its bundle, so the
+    two ways of scoring one adapter still land in one place.
     """
+    from . import paths
+    from .remote import s3
+
+    adapter = ctx.results.get("adapter") or ctx.options.get("adapter")
+    bundle_id = os.path.basename(os.path.normpath(ctx.bundle))
+    # No run_dir hint: that would make adapter_locations answer "where this
+    # run WILL upload", which for an evaluation is nowhere. What is wanted is
+    # where the adapter already IS - fetched from, or recorded by its run.
+    where = paths.adapter_locations(adapter, ctx.config,
+                                    source=ctx.options.get("adapter_source"))
+    uri = where.get("s3")
+    if uri:
+        # Strip the adapter's path inside the bundle off its URI, so that an
+        # adapter at checkpoints/checkpoint-50 resolves to the bundle too.
+        relative = os.path.relpath(os.path.abspath(str(adapter)),
+                                   os.path.abspath(ctx.bundle)).replace(os.sep, "/")
+        uri = uri.rstrip("/")
+        bundle_uri = (uri[: -len(relative) - 1] if uri.endswith("/" + relative)
+                      else uri.rsplit("/", 1)[0])
+    else:
+        bundle_uri = s3.uri_of(s3.bucket_or_die(ctx.config),
+                               s3.run_prefix(ctx.config, bundle_id))
+    return s3.evaluation_prefix(bundle_uri, ctx.run.run_id)
+
+
+def stage_eval_upload(ctx):
+    """Ship this evaluation to the bucket, into the bundle of the adapter it scored."""
     from .remote import s3
 
     ctx.run.write_manifest()
+    destination = evaluation_destination(ctx)
     summary = s3.upload_bundle(ctx.config, ctx.run.dir, ctx.run.run_id,
-                               groups=groups, log=ctx.log)
+                               log=ctx.log, destination=destination)
     ctx.run.event("upload", "bundle", **summary)
     return {"uploaded": summary["uri"]}
 
@@ -585,11 +851,17 @@ STAGES = {
     "teacher-check": stage_teacher_check,
     "smoke": stage_smoke,
     "train": stage_train,
+    "evaluation": stage_evaluation,
+    "publish": stage_publish,
+    "upload": stage_upload,
+}
+
+EVAL_STAGES = {
+    "preflight": stage_eval_preflight,
     "evaluate": stage_evaluate,
     "arena": stage_arena,
     "report": stage_report,
-    "publish": stage_publish,
-    "upload": stage_upload,
+    "upload": stage_eval_upload,
 }
 
 # Stages that only make sense when a feature is switched on. Returning a reason
@@ -599,6 +871,12 @@ STAGES = {
 # itself: a profile that names no held-out set has nothing to score.
 CONDITIONAL = {
     "publish": ("publish", "enabled", "publish.enabled is false"),
+    "upload": ("s3", "enabled", "s3.enabled is false"),
+    "evaluation": ("evaluation", "after_training",
+                   "evaluation.after_training is false - score it later with kd eval"),
+}
+
+EVAL_CONDITIONAL = {
     "upload": ("s3", "enabled", "s3.enabled is false"),
     "arena": ("evaluation", "arena_file", "evaluation.arena_file is not set"),
 }
@@ -610,14 +888,17 @@ ALWAYS_RUN = {"upload"}
 # --------------------------------------------------------------------------- #
 # Selection
 # --------------------------------------------------------------------------- #
-def planned_stages(config, only=None, start_from=None, skip=()):
+def planned_stages(config, only=None, start_from=None, skip=(), section="pipeline"):
     """The stage list for this run: [(name, is_gate), ...].
+
+    `section` is the config block whose `stages` list is walked: `pipeline`
+    for training, `evaluation` for scoring an adapter.
 
     Raises ValueError on a stage name that does not exist, because silently running
     a shorter pipeline than asked for is the kind of thing nobody notices until the
     evaluation they expected is missing.
     """
-    declared = (config.get("pipeline") or {}).get("stages") or []
+    declared = (config.get(section) or {}).get("stages") or []
     plan = [(str(entry["name"]), bool(entry.get("gate", False))) for entry in declared]
     known = {name for name, _ in plan}
 
@@ -638,9 +919,9 @@ def planned_stages(config, only=None, start_from=None, skip=()):
     return [(name, gate) for name, gate in plan if name not in (skip or ())]
 
 
-def _skip_reason(ctx, name):
+def _skip_reason(ctx, name, conditional):
     """Why this stage should not run at all, or None."""
-    section, key, reason = CONDITIONAL.get(name, (None, None, None))
+    section, key, reason = conditional.get(name, (None, None, None))
     if section and not (ctx.config.get(section) or {}).get(key):
         return reason
     return None
@@ -660,7 +941,7 @@ def _fmt_duration(seconds):
 # --------------------------------------------------------------------------- #
 def run_pipeline(config, run, only=None, start_from=None, skip=(), options=None,
                  price_per_hour=None):
-    """Walk the stages. Returns the process exit code.
+    """Walk the training stages. Returns the process exit code.
 
     0  everything that ran, worked
     1  a gate failed
@@ -673,22 +954,44 @@ def run_pipeline(config, run, only=None, start_from=None, skip=(), options=None,
     ctx = Context(config, hardware, run, budget, options)
 
     plan = planned_stages(config, only, start_from, skip)
-    total = len(plan)
+    unknown = [name for name, _ in plan if name not in STAGES]
+    if unknown:
+        raise ValueError(
+            f"pipeline.stages names stages this version does not have: {unknown}.\n"
+            f"  evaluate, arena and report now belong to evaluation.stages; put "
+            f"`evaluation` in pipeline.stages and set evaluation.after_training "
+            f"to score inside the training run, or run `kd eval` afterwards.")
 
     run.log.info(describe(config, hardware, run_id=run.run_id))
     run.log.info(f"  stages     : {' -> '.join(name for name, _ in plan)}")
     run.log.info("")
 
+    failure, stopped = _walk(ctx, plan, STAGES, CONDITIONAL)
+    if stopped is not None:
+        return stopped
+    return _finish(ctx, failure)
+
+
+def _walk(ctx, plan, stages, conditional, indent=""):
+    """Run `plan` against the `stages` table. Returns (failure, exit_or_None).
+
+    The loop both pipelines share. `failure` is (stage, exception) for the
+    gate that stopped the run, or None; an exit code is returned only for the
+    two outcomes that end a run on the spot - a limit breached, a projection
+    refused - because those have already written their own ending.
+    """
+    run = ctx.run
+    total = len(plan)
     failure = None
     for index, (name, is_gate) in enumerate(plan, start=1):
-        label = f"[{index}/{total}] {name}"
+        label = f"{indent}[{index}/{total}] {name}"
 
         if failure and name not in ALWAYS_RUN:
             run.skip_stage(name, f"an earlier gate failed ({failure[0]})")
             run.log.info(f"{label:<26} SKIPPED (earlier failure)")
             continue
 
-        reason = _skip_reason(ctx, name)
+        reason = _skip_reason(ctx, name, conditional)
         if reason:
             run.skip_stage(name, reason)
             run.log.info(f"{label:<26} skipped - {reason}")
@@ -698,7 +1001,7 @@ def run_pipeline(config, run, only=None, start_from=None, skip=(), options=None,
         run.log.info(f"{label:<26} ...")
         try:
             with run.stage(name):
-                ctx.results.update(STAGES[name](ctx) or {})
+                ctx.results.update(stages[name](ctx) or {})
         except LimitExceeded as exc:
             # A hard stop. No further stage runs - the point of the ceiling is that
             # crossing it ends the spending - with one exception below.
@@ -708,7 +1011,7 @@ def run_pipeline(config, run, only=None, start_from=None, skip=(), options=None,
                           f"what survives")
             run.finish("stopped", str(exc))
             _rescue_upload(ctx)
-            return 4
+            return failure, 4
         except StageRefused as exc:
             # Declined before spending anything. Nothing is broken, nothing was
             # trained, and the message already says how to proceed - so this
@@ -722,7 +1025,7 @@ def run_pipeline(config, run, only=None, start_from=None, skip=(), options=None,
             run.log.info(f"  REFUSED at {name} - nothing was trained and nothing "
                          f"was spent.")
             run.log.info(f"  run bundle : {run.dir}")
-            return 4
+            return failure, 4
         except (Exception, SystemExit) as exc:  # noqa: BLE001
             elapsed = _fmt_duration(time.time() - started)
             if is_gate:
@@ -738,8 +1041,7 @@ def run_pipeline(config, run, only=None, start_from=None, skip=(), options=None,
         else:
             run.log.info(f"{label:<26} OK       "
                          f"{_fmt_duration(time.time() - started)}")
-
-    return _finish(ctx, failure)
+    return failure, None
 
 
 def _rescue_upload(ctx):
@@ -780,8 +1082,176 @@ def _finish(ctx, failure):
     run.log.info(f"  run bundle : {run.dir}")
     if ctx.results.get("adapter"):
         run.log.info(f"  adapter    : {ctx.results['adapter']}")
+    if ctx.results.get("evaluation_dir"):
+        run.log.info(f"  evaluation : {ctx.results['evaluation_dir']}")
     if ctx.results.get("report"):
         run.log.info(f"  report     : {ctx.results['report']}")
+    if ctx.results.get("no_improvement"):
+        run.log.warning("  the adapter did not improve on the base student")
+        return 3
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Evaluating an adapter
+# --------------------------------------------------------------------------- #
+def evaluation_home(adapter, config, source=None):
+    """(bundle on disk, directory the evaluation is written into) for an adapter.
+
+    The bundle is the directory holding the adapter. For one fetched from the
+    bucket that is a cache directory, and nobody looks for results in a cache
+    - so the evaluation is written under project.runs_dir instead, in a
+    directory named after the bundle in the bucket, which mirrors where the
+    upload puts it: runs/<train-run>/evaluation/<eval-id>/ here, and
+    <prefix>/runs/<train-run>/evaluation/<eval-id>/ there.
+    """
+    from . import paths
+
+    bundle = runlog.bundle_of(adapter)
+    fetched = source or paths.cached_source(adapter)
+    if fetched:
+        runs_dir = os.path.expanduser(config["project"].get("runs_dir") or "./runs")
+        bundle = os.path.abspath(os.path.join(runs_dir, os.path.basename(bundle)))
+    return bundle, os.path.join(bundle, runlog.EVALUATION_DIR)
+
+
+def describe_evaluation(config, hardware, run, adapter, bundle):
+    """The startup banner for an evaluation: what is scored, and where it goes."""
+    from . import arena
+
+    meta = config.get("_meta", {})
+    try:
+        players = ", ".join(arena.chosen_players(config))
+    except ValueError as exc:
+        players = f"!! {exc}"
+    lines = [
+        "=" * 78,
+        f" {config['project']['name']} - evaluation",
+        "=" * 78,
+        f" evaluation    : {run.run_id}",
+        f" config        : {meta.get('source')}",
+        f" adapter       : {adapter}",
+        f" bundle        : {bundle}",
+        f" writes to     : {run.dir}",
+        f" players       : {players}",
+        f" teacher       : {config['models']['teacher']}"
+        + (f" + {config['models']['teacher_adapter']}"
+           if config["models"].get("teacher_adapter") else ""),
+        f" student       : {config['models']['student']}",
+        f" device        : {hardware['device']} ({hardware['dtype_name']})",
+    ]
+    for note in hardware["notes"]:
+        lines.append(f"   - {note}")
+    lines.append("=" * 78)
+    return "\n".join(lines)
+
+
+def run_evaluation(config, adapter=None, only=None, start_from=None, skip=(),
+                   options=None, hardware=None, nested=False, argv=None, quiet=False):
+    """Score an adapter into <bundle>/evaluation/<name>-<date>/.
+
+    `adapter` is a directory, a file inside one, or an s3:// URI; None means
+    evaluation.adapter from the config, else the newest adapter under
+    project.runs_dir. `nested` is the training pipeline's `evaluation` stage
+    calling in: the upload is left to the training run, and the banner is
+    shorter.
+
+    Returns (exit code, outcome). The exit code follows run_pipeline: 0 for a
+    clean scoring, 1 for a failed gate, 3 when the adapter did not improve on
+    the base student. `outcome` carries the evaluation directory and what the
+    stages produced.
+    """
+    from . import paths
+
+    hardware = hardware or resolve_device(config)
+    options = dict(options or {})
+    settings = config.setdefault("evaluation", {})
+
+    # Which adapter. Named on the command line, named in the config, or the
+    # newest one this checkout trained - in that order, because each is a
+    # more deliberate statement than the next.
+    named = adapter or options.get("adapter") or settings.get("adapter")
+    if named:
+        local, source = locate_adapter(named, config)
+        source = source or options.get("adapter_source")
+    else:
+        found = runlog.discover_adapters(config["project"].get("runs_dir") or "./runs")
+        if not found:
+            raise StageFailed(
+                f"nothing to evaluate: no adapter named, and none found under "
+                f"{config['project'].get('runs_dir')}.\n"
+                f"Name one with --adapter <dir or s3://...>, or set evaluation.adapter.")
+        local, source = found[0], paths.cached_source(found[0])
+    options.update(adapter=local, adapter_source=source)
+
+    bundle, home = evaluation_home(local, config, source=source)
+    eval_id = runlog.make_eval_id(settings.get("name") or config["_meta"].get("profile"))
+    run = runlog.Run(config, argv=argv, run_id=eval_id, parent=home,
+                     checkpoints=False, latest=False, quiet=quiet)
+    outcome = {"dir": run.dir, "id": run.run_id}
+    with run:
+        budget = Budget(config, started=run.started)
+        ctx = Context(config, hardware, run, budget, options, bundle=bundle,
+                      evaluation=True)
+        ctx.results["adapter"] = local
+
+        plan = planned_stages(config, only, start_from, skip, section="evaluation")
+        if nested:
+            # The training run's own upload stage ships evaluation/** along
+            # with the adapter; a second upload here would send it twice.
+            plan = [(name, gate) for name, gate in plan if name != "upload"]
+        unknown = [name for name, _ in plan if name not in EVAL_STAGES]
+        if unknown:
+            raise ValueError(
+                f"evaluation.stages names stages this version does not have: "
+                f"{unknown}. Available: {', '.join(EVAL_STAGES)}")
+
+        if nested:
+            run.log.info(f"      evaluation {run.run_id} -> {run.dir}")
+        else:
+            run.log.info(describe_evaluation(config, hardware, run, local, bundle))
+        run.log.info(f"{'      ' if nested else '  '}stages     : "
+                     f"{' -> '.join(name for name, _ in plan)}")
+        run.log.info("")
+
+        failure, stopped = _walk(ctx, plan, EVAL_STAGES, EVAL_CONDITIONAL,
+                                 indent="      " if nested else "")
+        code = stopped if stopped is not None else _finish_evaluation(ctx, failure)
+
+        outcome.update({k: v for k, v in ctx.results.items()
+                        if k in ("evaluation", "arena", "arena_transcript", "report",
+                                 "uploaded", "no_improvement", "players")})
+        outcome["metrics"] = _metrics_of(run)
+    return code, outcome
+
+
+def _metrics_of(run):
+    """What the evaluation wrote to its metrics.json, for the training run's copy."""
+    import json
+
+    try:
+        with open(run.path(runlog.METRICS), encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def _finish_evaluation(ctx, failure):
+    run = ctx.run
+    run.log.info("")
+    if failure:
+        name, exc = failure
+        run.finish("failed", f"{name}: {exc}")
+        run.log.error(f"  FAILED at {name}")
+        run.log.error(f"  evaluation : {run.dir}")
+        return 1
+
+    run.finish("ok")
+    run.log.info(f"  evaluation : {run.dir}")
+    if ctx.results.get("report"):
+        run.log.info(f"  report     : {ctx.results['report']}")
+    if ctx.results.get("uploaded"):
+        run.log.info(f"  uploaded   : {ctx.results['uploaded']}")
     if ctx.results.get("no_improvement"):
         run.log.warning("  the adapter did not improve on the base student")
         return 3

@@ -72,7 +72,7 @@ ARENA_ONLY = {"arena": ARENA, "student": "Qwen/Qwen2.5-1.5B-Instruct",
                   "local": "/cache/final_adapter",
                   "s3": "s3://bucket/kd/runs/run-1/final_adapter",
                   "s3_status": "the copy it was fetched from", "note": None},
-              "profile": "configs/enlibraQ25-flow.yaml",
+              "profile": "configs/enlibra/enlibraQ25-flow.yaml",
               "device": "mps", "dtype": "bfloat16"}
 
 FULL = dict(ARENA_ONLY, **{
@@ -208,11 +208,11 @@ def test_the_adapter_section_names_both_copies_and_the_eval_command():
     assert "The adapter" in html
     assert "s3://bucket/kd/runs/run-1/final_adapter" in html
     assert "/cache/final_adapter" in html
-    assert ("./run.sh --config configs/enlibraQ25-flow.yaml --from evaluate "
+    assert ("./run.sh --config configs/enlibra/enlibraQ25-flow.yaml eval "
             "--adapter s3://bucket/kd/runs/run-1/final_adapter") in html, "no re-run command"
     assert "arena --adapter s3://bucket/kd/runs/run-1/final_adapter" in html
     md = render(ARENA_ONLY, ".md", scratch())
-    assert "## The adapter" in md and "--from evaluate --adapter s3://" in md
+    assert "## The adapter" in md and "eval --adapter s3://" in md
 
 
 def test_the_adapter_section_says_why_there_is_no_s3_copy():
@@ -222,7 +222,7 @@ def test_the_adapter_section_says_why_there_is_no_s3_copy():
     html = render(payload, ".html", scratch())
     assert "not there - s3.enabled is false" in html, "the reason is missing"
     # With no S3 copy, the re-run command names the local path.
-    assert "--from evaluate --adapter runs/r1/final_adapter" in html
+    assert "eval --adapter runs/r1/final_adapter" in html
 
 
 TRAINING = {"gkd": {"beta": 0.5, "lmbda": 0.0, "temperature": 0.7,
@@ -343,6 +343,82 @@ def test_nothing_is_double_escaped():
     html = render(ARENA_ONLY, ".html", scratch())
     assert "&amp;mdash;" not in html and "&amp;rarr;" not in html
     assert "<th></th>" not in html, "empty header cell"
+
+
+def test_the_teachers_base_is_a_column_only_when_it_played():
+    """Four players make four model columns; three make three - never a column of dashes."""
+    arena = {
+        "questions": 4, "random_baseline": 0.25, "elo_rounds": 1,
+        "players": {
+            "base": {"answered": 4, "correct": 1, "accuracy": 0.25,
+                     "accuracy_when_answered": 0.25, "elo": 980, "elo_spread": 1},
+            "distilled": {"answered": 4, "correct": 3, "accuracy": 0.75,
+                          "accuracy_when_answered": 0.75, "elo": 1020, "elo_spread": 1},
+            "teacher-base": {"answered": 4, "correct": 2, "accuracy": 0.5,
+                             "accuracy_when_answered": 0.5, "elo": 1000, "elo_spread": 1},
+            "teacher": {"answered": 4, "correct": 4, "accuracy": 1.0,
+                        "accuracy_when_answered": 1.0, "elo": 1040, "elo_spread": 1},
+        },
+        "agreement": {"base vs teacher": {"same": 1, "of": 4, "pct": 0.25},
+                      "distilled vs teacher": {"same": 3, "of": 4, "pct": 0.75},
+                      "teacher vs teacher-base": {"same": 2, "of": 4, "pct": 0.5}},
+        "head_to_head": {},
+    }
+    sections = _sections({"arena": arena, "student": "s", "teacher": "t"})
+    for title, rows, headers in sections:
+        assert headers[:1] == ("Metric",) or headers[0] == "Reasoning depth", headers
+        for row in rows:
+            assert len(row) == len(headers), (title, headers, row)
+    headers = sections[0][2]
+    assert headers == ("Metric", "Base student", "Distilled", "Teacher base", "Teacher"), headers
+    closeness = dict((r[0], r) for r in sections[0][1])
+    assert closeness["Gave the teacher's answer"][3] == "2 / 4  (50.0%)", closeness
+    assert closeness["Gave the teacher's answer"][4] == "4 / 4  (100.0%)", closeness
+    summary = " ".join(plain_summary({"arena": arena}))
+    assert "fine-tune took it from 50.0%" in summary, summary
+
+    # The same arena without the fourth player: three columns, as before.
+    del arena["players"]["teacher-base"]
+    del arena["agreement"]["teacher vs teacher-base"]
+    sections = _sections({"arena": arena, "student": "s", "teacher": "t"})
+    assert sections[0][2] == ("Metric", "Base student", "Distilled", "Teacher"), sections[0][2]
+    assert "Teacher base" not in render({"arena": arena, "student": "s", "teacher": "t"},
+                                        ".html", scratch())
+
+
+def test_evaluate_payload_with_a_teacher_base_column():
+    payload = {
+        "student": "s", "teacher": "t", "teacher_base": "tb",
+        "fidelity": {"top1_agreement_base_pct": 40.0, "top1_agreement_distilled_pct": 55.0,
+                     "top1_agreement_teacher_base_pct": 48.0, "agreement_lift_pts": 15.0,
+                     "kl_base": 1.0, "kl_distilled": 0.5, "kl_teacher_base": 0.7},
+        "capability": {"perplexity_teacher": 2.0, "perplexity_base": 4.0,
+                       "perplexity_distilled": 3.0, "perplexity_teacher_base": 2.5,
+                       "gap_recovered_pct": 50.0},
+        "closeness_to_teacher": {"prediction_agreement_base_pct": 40.0,
+                                 "prediction_agreement_distilled_pct": 55.0,
+                                 "prediction_agreement_teacher_base_pct": 48.0,
+                                 "perplexity_retention_base_pct": 50.0,
+                                 "perplexity_retention_distilled_pct": 66.7,
+                                 "perplexity_retention_teacher_base_pct": 80.0,
+                                 "gap_recovered_pct": 50.0},
+        "efficiency": {"teacher_params": 3e9, "student_params": 1.5e9,
+                       "adapter_params": 1e7, "teacher_base_params": 3e9,
+                       "teacher_tok_per_s": 10.0, "distilled_tok_per_s": 20.0},
+        "generations": {},
+    }
+    sections = _sections(payload)
+    for title, rows, headers in sections:
+        assert headers == ("Metric", "Base student", "Distilled", "Teacher base", "Teacher"), \
+            (title, headers)
+        for row in rows:
+            assert len(row) == 5, (title, row)
+    fidelity = {r[0]: r for s in sections for r in s[1]}
+    assert fidelity["Top-1 agreement with teacher"][3] == "48.00%", fidelity
+    assert fidelity["Held-out perplexity (lower is better)"][3] == "2.500", fidelity
+    assert fidelity["Parameters"][3] == "3.000B", fidelity
+    text = render(payload, ".md", scratch())
+    assert "| Teacher base |" in text and "| 48.00% |" in text, text
 
 
 for _name, _fn in sorted(list(globals().items())):

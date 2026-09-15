@@ -1,7 +1,7 @@
 # ===========================================================================
 #  Flow test - Qwen2.5-1.5B -> Qwen2.5-0.5B, entirely from the Hub
 #
-#    ./run.sh --config configs/enlibraQ25-flow.yaml
+#    ./run.sh --config configs/enlibra/enlibraQ25-flow.yaml
 #
 #  Does the pipeline work, on this machine, from end to end? That is the only
 #  question this profile answers, and it answers it in minutes for free.
@@ -9,7 +9,7 @@
 #  Every stage runs for real: the corpus is built, the teacher is checked, two
 #  models are loaded together, the trainer takes real steps, the adapter is
 #  saved, the arena scores it, the report is written, and the bundle is uploaded
-#  to S3. If all nine stages say OK, nothing about the plumbing is broken and
+#  to S3. If every stage says OK, nothing about the plumbing is broken and
 #  what remains is a question about models and hardware.
 #
 #  WHAT MAKES IT CHEAP
@@ -17,7 +17,7 @@
 #  Both models come from the Hub, so nothing is downloaded from S3. 1.54B plus
 #  0.49B is 3.8 GB of bfloat16 weights against the ~9.6 GB kd.paths treats as
 #  the budget on a 16 GB machine - a third of it, with room to spare, where
-#  configs/enlibraQ25-3B-smoke.yaml sits at 8.6 GB and leaves almost none.
+#  configs/enlibra/enlibraQ25-3B-smoke.yaml sits at 8.6 GB and leaves almost none.
 #
 #  The upload still runs against the real bucket. That is deliberate: it is the
 #  permission most likely to be missing (s3:PutObject is a separate grant from
@@ -31,7 +31,7 @@
 #  the problem the real profiles solve, and its accuracy means nothing. Read the
 #  fact that the stages finished, not the numbers they printed.
 #
-#  Once this passes, go to configs/enlibraQ25-3B.yaml on a GPU.
+#  Once this passes, go to configs/enlibra/enlibraQ25-3B.yaml on a GPU.
 #
 #  TO PROVE THE EVAL-ONLY PATH TOO
 #  -------------------------------
@@ -40,10 +40,12 @@
 #  evaluation against it - no training. Run that command as the second half of
 #  the smoke test; it is what scoring an adapter trained elsewhere looks like:
 #
-#    ./run.sh --config configs/enlibraQ25-flow.yaml --from evaluate #        --adapter s3://enlibra/dss/dev/runs/9eb5db9e-.../outputs/gkd/runs/<run-id>/final_adapter
+#    ./run.sh --config configs/enlibra/enlibraQ25-flow.yaml eval \
+#        --adapter s3://enlibra/dss/dev/runs/9eb5db9e-.../outputs/gkd/runs/<run-id>/final_adapter
 #
-#  That runs evaluate -> arena -> report -> upload into a new run directory.
-#  Add --skip upload to keep it off S3.
+#  That runs evaluate -> arena -> report -> upload into that bundle's own
+#  evaluation/ directory, here and in the bucket. Add --skip upload to keep it
+#  off S3.
 # ===========================================================================
 extends: enlibraQ25-3B.yaml
 
@@ -58,6 +60,9 @@ models:
   teacher: Qwen/Qwen2.5-1.5B-Instruct
   student: Qwen/Qwen2.5-0.5B-Instruct
   teacher_adapter: null
+  # A stock teacher was fine-tuned from nothing, so there is no `teacher-base`
+  # to score; the parent's must not be inherited against the wrong teacher.
+  teacher_base: null
   # Both are Qwen2.5 and share one vocabulary, so this only picks the chat
   # template. Note that unlike the real teacher, these are stock and pad
   # vocab_size to 151936 - so kd.train.align_vocab has nothing to trim here.
@@ -91,6 +96,11 @@ training:
   benchmark_max_new_tokens: 256
 
 evaluation:
+  # Scored INSIDE the run, as the `evaluation` stage. This profile exists to
+  # prove every stage runs end to end, and the evaluation is a stage. The
+  # output lands in <run>/evaluation/<name>-<date>/, exactly where `kd eval`
+  # would put it later.
+  after_training: true
   samples: 16
   # Six questions across three players is eighteen generations - enough to prove
   # the arena loads each model in turn, finds the <Answer> tag and produces

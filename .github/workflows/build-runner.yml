@@ -106,7 +106,7 @@ jobs:
           uv run python - <<'PY'
           from kd.config import load_config
           from kd.remote import s3
-          config = load_config("configs/smoke.yaml", use_env=False)
+          config = load_config("configs/smollm/smoke.yaml", use_env=False)
           config["s3"].update(enabled=True, bucket="b",
                               endpoint_url="http://localhost:9000")
           client = s3.client(config)
@@ -124,8 +124,7 @@ jobs:
 
       - name: Every profile resolves
         run: |
-          for cfg in configs/*.yaml; do
-            case "$cfg" in */_base.yaml) continue ;; esac
+          for cfg in configs/*/*.yaml; do
             echo "--- $cfg"
             uv run python -m kd check --config "$cfg" >/dev/null \
               || { echo "FAILED to resolve $cfg"; exit 1; }
@@ -138,18 +137,20 @@ jobs:
         run: |
           uv run python - <<'PY'
           import sys, yaml
-          from kd.pipeline import STAGES
-          declared = [s["name"] for s in
-                      yaml.safe_load(open("configs/_base.yaml", encoding="utf-8"))
-                      ["pipeline"]["stages"]]
-          missing = [n for n in declared if n not in STAGES]
-          unused = [n for n in STAGES if n not in declared]
-          if missing:
-              print(f"declared in _base.yaml but not implemented: {missing}")
-          if unused:
-              print(f"implemented but not in _base.yaml: {unused}")
-          print(f"{len(declared)} stages: {', '.join(declared)}")
-          sys.exit(1 if missing or unused else 0)
+          from kd.pipeline import EVAL_STAGES, STAGES
+          base = yaml.safe_load(open("configs/_base.yaml", encoding="utf-8"))
+          bad = False
+          for section, table in (("pipeline", STAGES), ("evaluation", EVAL_STAGES)):
+              declared = [s["name"] for s in base[section]["stages"]]
+              missing = [n for n in declared if n not in table]
+              unused = [n for n in table if n not in declared]
+              if missing:
+                  print(f"declared in _base.yaml {section}.stages but not implemented: {missing}")
+              if unused:
+                  print(f"implemented but not in _base.yaml {section}.stages: {unused}")
+              print(f"{section}: {len(declared)} stages: {', '.join(declared)}")
+              bad = bad or bool(missing or unused)
+          sys.exit(1 if bad else 0)
           PY
 
       - name: Override precedence holds
@@ -161,7 +162,7 @@ jobs:
           from kd.config import load_config
 
           def steps(**kwargs):
-              return load_config("configs/smoke.yaml", **kwargs)["training"]["max_steps"]
+              return load_config("configs/smollm/smoke.yaml", **kwargs)["training"]["max_steps"]
 
           checks = []
           os.environ["KD_MAX_STEPS"] = "111"
@@ -217,7 +218,7 @@ jobs:
           uv run python -m kd ui --compare --list-adapters >/dev/null \
             || { echo "FAILED: kd ui --compare --list-adapters"; exit 1; }
           uv run python -m kd --help >/dev/null
-          uv run python -m kd doctor --config configs/smoke.yaml >/dev/null
+          uv run python -m kd doctor --config configs/smollm/smoke.yaml >/dev/null
 
   # ---------------------------------------------------------------------------
   # Build both runners from the templates and prove they parse and dispatch.
@@ -301,7 +302,7 @@ jobs:
             echo "  ok  ./distill.sh $* -> $got"
           }
           expect "pipeline"                                    # bare
-          expect "pipeline --config configs/smoke.yaml"        --config configs/smoke.yaml
+          expect "pipeline --config configs/smollm/smoke.yaml"        --config configs/smollm/smoke.yaml
           expect "pipeline --config x.yaml --set a.b=1"        --config x.yaml --set a.b=1
           expect "pipeline --only train"                       --only train
           expect "train --config x.yaml"                       train --config x.yaml
@@ -355,7 +356,7 @@ jobs:
             echo "  ok  distill.ps1 $* -> $got"
           }
           expect "pipeline"                                    # bare
-          expect "pipeline --config configs/smoke.yaml"        -Config configs/smoke.yaml
+          expect "pipeline --config configs/smollm/smoke.yaml"        -Config configs/smollm/smoke.yaml
           expect "pipeline --config x.yaml --set a.b=1"        --set a.b=1 -Config x.yaml
           expect "pipeline --only train"                       --only train
           expect "train --config x.yaml"                       train -Config x.yaml
@@ -392,7 +393,7 @@ jobs:
             echo "| Windows | \`distill.ps1\` |"
             echo
             echo '```'
-            echo './distill.sh --config configs/finance.yaml'
+            echo './distill.sh --config configs/qwen/finance.yaml'
             echo '.\distill.ps1 -Config configs\finance.yaml'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

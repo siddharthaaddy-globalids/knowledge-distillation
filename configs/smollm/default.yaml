@@ -1,8 +1,8 @@
 # ---------------------------------------------------------------------------
 # Default profile - SmolLM2 360M -> 135M, runs anywhere (Windows / Linux / Mac).
 #
-#   kd pipeline --config configs/default.yaml
-#   ./distill.sh --config configs/default.yaml
+#   kd pipeline --config configs/smollm/default.yaml
+#   ./distill.sh --config configs/smollm/default.yaml
 #
 # This profile is deliberately almost empty. Everything it would say is already
 # the default in _base.yaml, so listing it again would create two places to

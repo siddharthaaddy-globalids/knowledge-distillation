@@ -82,7 +82,7 @@ def install(fake):
 
 
 def make_config(**runpod_settings):
-    config = kdc.load_config(os.path.join(CONFIGS, "smoke.yaml"), use_env=False)
+    config = kdc.load_config(os.path.join(CONFIGS, "smollm", "smoke.yaml"), use_env=False)
     config["runpod"].update({"enabled": True, "gpu_type": "RTX A4000",
                              "max_price_per_hour": 0.60, "spot": True,
                              "image": "ghcr.io/x/kd:test"})
@@ -268,7 +268,7 @@ def test_expensive_run_non_interactive_refuses():
 def test_launch_terminates_on_success():
     fake = install(FakeSdk(states=["RUNNING", "EXITED"]))
     log = Log()
-    code = rp.launch(make_config(gpu_type="RTX A5000"), "configs/smoke.yaml", log,
+    code = rp.launch(make_config(gpu_type="RTX A5000"), "configs/smollm/smoke.yaml", log,
                      poll_seconds=0)
     assert code == 0, code
     assert fake.created, "no pod was created"
@@ -281,7 +281,7 @@ def test_launch_terminates_when_watching_raises():
     original = rp.watch
     rp.watch = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("network gone"))
     try:
-        rp.launch(make_config(gpu_type="RTX A5000"), "configs/smoke.yaml", Log(),
+        rp.launch(make_config(gpu_type="RTX A5000"), "configs/smollm/smoke.yaml", Log(),
                   poll_seconds=0)
     except RuntimeError:
         pass
@@ -293,15 +293,15 @@ def test_launch_terminates_when_watching_raises():
 
 def test_bid_never_exceeds_the_agreed_price():
     fake = install(FakeSdk(states=["EXITED"]))
-    rp.launch(make_config(gpu_type="RTX A5000"), "configs/smoke.yaml", Log(),
+    rp.launch(make_config(gpu_type="RTX A5000"), "configs/smollm/smoke.yaml", Log(),
               poll_seconds=0)
     assert fake.created[0]["bid_per_gpu"] == 0.28, fake.created[0]
 
 
 def test_pod_command_and_environment():
     config = make_config()
-    command = rp.pod_command(config, "configs/finance.yaml", ["--only", "train"])
-    assert command == "python -m kd pipeline --config configs/finance.yaml --only train"
+    command = rp.pod_command(config, "configs/qwen/finance.yaml", ["--only", "train"])
+    assert command == "python -m kd pipeline --config configs/qwen/finance.yaml --only train"
     env = rp.pod_env(config, {"name": "x", "price": 0.28, "spot": True})
     # The agreed rate travels with the pod so it can enforce the cost cap itself.
     assert env["KD_PRICE_PER_HOUR"] == "0.28", env
@@ -322,7 +322,7 @@ def test_missing_image_is_reported():
 def test_disabled_runpod_refuses_to_launch():
     install(FakeSdk())
     try:
-        rp.launch(make_config(enabled=False), "configs/smoke.yaml", Log())
+        rp.launch(make_config(enabled=False), "configs/smollm/smoke.yaml", Log())
     except rp.RunPodError as exc:
         assert "runpod.enabled is false" in str(exc), exc
     else:

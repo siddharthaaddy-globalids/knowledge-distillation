@@ -1,6 +1,15 @@
 # Design notes: post-training quantization and early S3 upload
 
-Status: research only, nothing implemented. Written 2026-09-14.
+Status: research only for part 1. Written 2026-09-14.
+
+Update 2026-09-15: the separation part 2 argues for is done, by a different
+route. Evaluation is now its own pipeline (`kd eval`, `evaluation.stages`),
+off the training pipeline by default, and every evaluation lands inside the
+adapter's bundle under `evaluation/<name>-<date>/` on disk and in the bucket.
+The training pipeline ends at `upload`, so the adapter leaves the machine as
+soon as the run does; the "early upload" below is now only about shipping it
+before a same-run evaluation (`evaluation.after_training: true`) and is still
+open. The `--from evaluate` spelling below is `kd eval` now.
 
 Two related changes to the pipeline, both optional and both switched by config:
 

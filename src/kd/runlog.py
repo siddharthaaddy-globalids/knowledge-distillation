@@ -9,12 +9,19 @@ Every invocation creates one directory holding everything that run produced:
         run.log                full detail - everything the terminal showed
         events.jsonl           one JSON object per event, for machines
         metrics.json           the final numbers
-        report.html
         final_adapter/
         checkpoints/
+        evaluation/            one directory per scoring of the adapter
+            full-2026-09-15-1030/
+                config.resolved.yaml, manifest.json, run.log, events.jsonl
+                evaluation.json, arena.json, arena-transcript.jsonl
+                report.html
 
 That directory is also the unit that gets uploaded to S3, so a run is either
-entirely recoverable or entirely absent - never half of each.
+entirely recoverable or entirely absent - never half of each. An evaluation is
+a Run of its own, created inside the bundle's evaluation/ (see `parent`), so it
+carries its own config, log and manifest, and the bucket copy of the bundle
+has exactly the same shape as the one on disk.
 
 Two log streams exist because they have different readers. The console gets a
 short human line. run.log gets everything, including the output of the training
@@ -44,6 +51,13 @@ RESOLVED_CONFIG = "config.resolved.yaml"
 METRICS = "metrics.json"
 ADAPTER_DIR = "final_adapter"
 CHECKPOINT_DIR = "checkpoints"
+# Where a bundle keeps the evaluations of its adapter, one directory each:
+#     <bundle>/evaluation/<name>-<YYYY-MM-DD>-<HHMM>/
+# An adapter is trained once and scored any number of times - on a different
+# machine, with a different held-out set, after a fix to the parser - so the
+# evaluations live beside it rather than in a run of their own, and the bundle
+# in the bucket has the same shape as the one on disk.
+EVALUATION_DIR = "evaluation"
 
 # Packages whose version changes the numbers a run produces. Recorded so a result
 # that cannot be reproduced can at least be explained.
@@ -98,6 +112,43 @@ def make_run_id(profile, when=None):
     """
     when = when or datetime.now(timezone.utc)
     return f"{profile}-{when.strftime('%Y-%m-%d-%H%M')}"
+
+
+def make_eval_id(name, when=None):
+    """<name>-<YYYY-MM-DD>-<HHMM>: the same shape as a run id, for the same reasons.
+
+    `name` is evaluation.name, or the profile when that is null - so a bundle's
+    evaluation/ directory lists what each scoring was FOR (`full`, `quick`,
+    `parser-fix`) and when, and two evaluations of one adapter never share a
+    directory.
+    """
+    return make_run_id(name, when)
+
+
+def bundle_of(adapter_dir):
+    """The bundle an adapter belongs to: the directory holding it.
+
+    runs/<id>/final_adapter and runs/<id>/checkpoints/checkpoint-50 both belong
+    to runs/<id>, which is where that adapter's evaluation/ goes. A bare
+    adapter directory that is not inside a bundle is its own bundle - the
+    evaluations then sit beside it, which is the nearest thing to "with it".
+    """
+    path = os.path.abspath(os.path.normpath(str(adapter_dir)))
+    parent = os.path.dirname(path)
+    if os.path.basename(parent) == CHECKPOINT_DIR:
+        return os.path.dirname(parent)
+    return parent
+
+
+def discover_evaluations(bundle):
+    """Every evaluation directory a bundle holds, newest first."""
+    import glob
+
+    root = os.path.join(str(bundle), EVALUATION_DIR)
+    found = [p for p in glob.glob(os.path.join(root, "*"))
+             if os.path.isdir(p) and not os.path.islink(p)
+             and os.path.basename(p) != "latest"]
+    return sorted(found, key=os.path.getmtime, reverse=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -294,32 +345,48 @@ class Run:
             run.log.info("...")
     """
 
-    def __init__(self, config, argv=None, run_id=None, quiet=False):
+    def __init__(self, config, argv=None, run_id=None, quiet=False, parent=None,
+                 checkpoints=True, latest=True):
+        """
+        parent       where the run directory is created: <parent>/<run_id>. None
+                     means project.runs_dir (or project.output_dir, used as-is).
+                     An evaluation passes <bundle>/evaluation, so that it lands
+                     beside the adapter it scores rather than in a run of its own.
+        checkpoints  whether to create checkpoints/. An evaluation has none.
+        latest       whether finishing updates the `latest` pointer next to the
+                     directory. Off for an evaluation, whose parent is a
+                     bundle's evaluation/ and gets uploaded as a whole - a
+                     symlink there would ship every file twice.
+        """
         self.config = config
         self.meta = config.get("_meta", {})
         self.profile = self.meta.get("profile", "run")
         self.run_id = run_id or make_run_id(self.profile)
         self.argv = list(argv or sys.argv)
         self.quiet = quiet
+        self.latest = latest
 
         project = config.get("project", {})
         pinned = project.get("output_dir")
-        if pinned:
+        if pinned and parent is None:
             # An explicitly pinned directory is used exactly as given, so a caller
             # that needs a predictable path gets one.
             self.dir = os.path.abspath(os.path.expanduser(pinned))
         else:
-            runs_dir = os.path.expanduser(project.get("runs_dir") or "./runs")
-            if not run_id:
+            runs_dir = os.path.expanduser(
+                parent if parent is not None else (project.get("runs_dir") or "./runs"))
+            if not run_id or parent is not None:
                 # A generated id is only as fine-grained as a minute, so the
                 # second run of a profile inside one gets a suffix rather than
-                # the first run's directory.
+                # the first run's directory. The same goes for an evaluation
+                # named by hand: a second `full` must not overwrite the first.
                 base, extra = self.run_id, 2
                 while os.path.exists(os.path.join(runs_dir, self.run_id)):
                     self.run_id, extra = f"{base}-{extra}", extra + 1
             self.dir = os.path.abspath(os.path.join(runs_dir, self.run_id))
         os.makedirs(self.dir, exist_ok=True)
-        os.makedirs(os.path.join(self.dir, CHECKPOINT_DIR), exist_ok=True)
+        if checkpoints:
+            os.makedirs(os.path.join(self.dir, CHECKPOINT_DIR), exist_ok=True)
 
         self.started = time.time()
         self.stages = []
@@ -529,7 +596,8 @@ class Run:
         self.event("run", "end", status=status, stopped_reason=stopped_reason,
                    seconds=round(time.time() - self.started, 2))
         self.write_manifest()
-        self.point_latest_here()
+        if self.latest:
+            self.point_latest_here()
 
     def close(self):
         sys.stdout = self._stdout

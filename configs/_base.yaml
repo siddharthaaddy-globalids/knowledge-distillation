@@ -9,7 +9,14 @@
 #  and lists only what it changes. That makes the YAML you point at the whole
 #  truth about a run, and lets --set reach any key below by dotted path:
 #
-#      kd pipeline --config configs/finance.yaml --set training.max_steps=500
+#      kd pipeline --config configs/qwen/finance.yaml --set training.max_steps=500
+#
+#  Profiles are grouped by what they distil:
+#      configs/enlibra/   the enLibra space curriculum (Qwen2.5 and Qwen3 pairs)
+#      configs/smollm/    SmolLM2 - the starter pair that runs anywhere
+#      configs/qwen/      stock Qwen3.5 pairs, finance
+#  One profile describes both halves of a pair's life: `kd pipeline` trains
+#  from it, `kd eval` scores from its `evaluation:` section.
 #
 #  Precedence, lowest to highest:
 #      _base.yaml  <  profile  <  KD_* env vars  <  --set  <  explicit flag
@@ -34,12 +41,28 @@ models:
   # Swap these two lines to retarget the whole run.
   # Student and teacher MUST share a tokenizer vocabulary for standard GKD.
   student: HuggingFaceTB/SmolLM2-135M-Instruct
+  # The teacher, in any of three forms:
+  #   * a merged checkpoint - a Hub id, a directory, or an s3:// prefix;
+  #   * a base model here plus a LoRA adapter in teacher_adapter below;
+  #   * a LoRA adapter ALONE - a directory, s3:// prefix or Hub repo holding
+  #     adapter_config.json. Preflight notices, reads the base the adapter
+  #     records, and rewrites this into the base + adapter form before
+  #     anything loads. Nothing else needs to change.
+  # The base + adapter forms are the safer ones: merged exports written by
+  # other frameworks often keep that framework's key layout, which plain
+  # transformers may not map back onto the architecture, and the teacher-check
+  # stage exists to catch exactly that.
   teacher: HuggingFaceTB/SmolLM2-360M-Instruct
-  # A LoRA adapter merged into the teacher at load time. Use when the teacher is
-  # a base model plus an adapter rather than a merged checkpoint: merged exports
-  # written by other frameworks often keep that framework's key layout, which
-  # plain transformers may not map back onto the architecture.
+  # A LoRA adapter merged into the teacher at load time. See above.
   teacher_adapter: null
+  # The stock model the teacher was fine-tuned FROM. The evaluation scores it
+  # as a fourth player, `teacher-base`: how far the fine-tune moved the teacher
+  # is the most there was to distil, and a student no closer to the teacher
+  # than the stock model was has learned nothing new. Filled in automatically
+  # when the teacher is base + adapter (it is the base). A merged checkpoint
+  # cannot say what it was built from, so name it here - or leave null and the
+  # player is skipped with a note.
+  teacher_base: null
   # Tokenizer source: "teacher", "student", or an explicit path / hub id.
   tokenizer: teacher
 
@@ -175,7 +198,52 @@ gkd:
   # generation per sample.
   seq_kd: false
 
+# ---------------------------------------------------------------------------
+#  Evaluation. Separate from training: an adapter is trained once and scored
+#  as many times as there are questions to ask of it, on whatever machine is
+#  to hand. `kd eval` walks the `stages` below against an adapter and writes
+#  everything into a directory of its own INSIDE the adapter's bundle -
+#
+#      runs/<train-run>/evaluation/<name>-<YYYY-MM-DD>-<HHMM>/
+#
+#  and to the same path beside the adapter in the bucket. A second scoring
+#  makes a second directory; nothing is ever overwritten.
+# ---------------------------------------------------------------------------
 evaluation:
+  # What `kd eval` scores: an adapter directory, a file inside one, or an
+  # s3:// URI. null means --adapter on the command line, else the newest
+  # adapter under project.runs_dir.
+  adapter: null
+  # What this evaluation is FOR - `full`, `quick`, `after-parser-fix`. It
+  # leads the directory name, so a bundle's evaluation/ listing says why each
+  # scoring was done. null uses the profile name.
+  name: null
+  # true scores the adapter INSIDE the training run, as its `evaluation` stage,
+  # right after training - the teacher is resident and already paid for on a
+  # pod. Off by default: training ends with the adapter in the bucket, and the
+  # scoring happens when and where it is wanted. The output layout is the same
+  # either way.
+  after_training: false
+  # Who is scored. Four models, each answering a question the others cannot:
+  #   base          the stock student, no adapter - the control
+  #   distilled     the student plus the trained adapter - the result
+  #   teacher-base  the stock model the teacher was fine-tuned from - what
+  #                 the fine-tune bought the TEACHER; skipped when unknown
+  #   teacher       the fine-tuned teacher - the ceiling, and the reference
+  #                 every closeness figure is measured against
+  # Drop `teacher` and `teacher-base` to score base against distilled without
+  # loading eight gigabytes of weights.
+  players: [base, distilled, teacher-base, teacher]
+  # The stages `kd eval` walks, in order. A gate that fails stops the
+  # evaluation; a non-gate failure is reported and the rest still runs. The
+  # arena runs only when arena_file names a held-out set; upload only when
+  # s3.enabled. --only / --from / --skip narrow a single run.
+  stages:
+    - {name: preflight, gate: true}    # fetch the teacher and the adapter; say what is scored
+    - {name: evaluate,  gate: false}   # fidelity and perplexity against the teacher
+    - {name: arena,     gate: false}   # accuracy and Elo on the answer key
+    - {name: report,    gate: false}   # report.html in the evaluation directory
+    - {name: upload,    gate: false}   # to <bundle>/evaluation/<id>/ in the bucket
   samples: 50           # held-out samples scored for fidelity and perplexity
   tasks: null           # lm-eval task list, e.g. "ifeval,arc_easy"; null = skip
   limit: null           # per-task example cap for a quick look
@@ -225,6 +293,10 @@ benchmark_prompts:
 #  A gate stage that fails aborts the pipeline. A non-gate stage that fails is
 #  reported and the run continues, so a broken report never destroys a good
 #  adapter.
+#
+#  Training ends with the adapter in the bucket. Scoring it is a separate
+#  pipeline (`kd eval`, evaluation.stages above) unless evaluation.after_training
+#  is true, which runs it here as the `evaluation` stage.
 # ---------------------------------------------------------------------------
 pipeline:
   stages:
@@ -232,9 +304,7 @@ pipeline:
     - {name: teacher-check, gate: true}   # teacher only: missing weights, NaN scan, coherence
     - {name: smoke,         gate: true}   # 2 real steps; measures s/step and projects the run
     - {name: train,         gate: true}
-    - {name: evaluate,      gate: false}
-    - {name: arena,         gate: false}  # skipped unless evaluation.arena_file is set
-    - {name: report,        gate: false}
+    - {name: evaluation,    gate: false}  # skipped unless evaluation.after_training
     - {name: publish,       gate: false}  # skipped unless publish.enabled
     - {name: upload,        gate: false}  # skipped unless s3.enabled; also runs after a failure
 
@@ -292,11 +362,15 @@ s3:
   # Which parts of the run bundle to ship. manifest.json and config.resolved.yaml
   # always go, whatever is listed here, because without them the uploaded bundle
   # cannot say what produced it.
-  #   adapter  logs  report  metrics  checkpoints
+  #   adapter  logs  report  metrics  evaluation  checkpoints
+  # evaluation is every scoring of the adapter that happened inside the run
+  # (evaluation.after_training). A scoring done later with `kd eval` uploads
+  # its own directory to the same place in the bucket, so the bundle there
+  # always holds every evaluation whichever machine produced it.
   # checkpoints is off by default: it is optimizer state, hundreds of megabytes,
   # that only a resumed run reads. A run stopped by a limit adds it automatically,
   # since the checkpoint is then the only artifact that exists.
-  upload: [adapter, logs, report, metrics]
+  upload: [adapter, logs, report, metrics, evaluation]
 
 # ---------------------------------------------------------------------------
 #  RunPod. Entirely optional - nothing in the local pipeline imports it, and a

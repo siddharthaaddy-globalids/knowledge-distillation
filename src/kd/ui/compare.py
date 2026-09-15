@@ -30,8 +30,8 @@ RUNS_DIR = os.environ.get("KD_RUNS_DIR", "./runs")
 
 LEGACY_ADAPTER_CANDIDATES = [
     "./distilled_output/final_adapter",         # old distill.sh default
-    "./distilled_smollm_mac/final_adapter",     # configs/mac.yaml
-    "./distilled_smollm_scaled/final_adapter",  # configs/default.yaml
+    "./distilled_smollm_mac/final_adapter",     # configs/smollm/mac.yaml
+    "./distilled_smollm_scaled/final_adapter",  # configs/smollm/default.yaml
     "./distilled_smollm_poc/final_adapter",     # original 50-step PoC
 ]
 
@@ -516,7 +516,7 @@ def main():
 
     if not _is_adapter(ADAPTER_PATH):
         print(f" !! No adapter at '{ADAPTER_PATH}'. The distilled column will show an error.")
-        print("    Train one with:  kd train --config configs/default.yaml")
+        print("    Train one with:  kd train --config configs/smollm/default.yaml")
         print("    Or point at one: kd ui --compare --adapter ./path/to/final_adapter\n")
 
     load_all_models()

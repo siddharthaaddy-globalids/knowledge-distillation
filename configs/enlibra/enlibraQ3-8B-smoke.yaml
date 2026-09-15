@@ -1,7 +1,7 @@
 # ===========================================================================
 #  enLibra curriculum - the same run, small enough for a 16 GB Mac mini.
 #
-#    kd pipeline --config configs/enlibraQ3-8B-smoke.yaml
+#    kd pipeline --config configs/enlibra/enlibraQ3-8B-smoke.yaml
 #
 #  This exists to answer the questions that do NOT need the real models, before
 #  a pod is rented:
@@ -37,6 +37,9 @@ models:
   teacher: Qwen/Qwen3-1.7B
   student: Qwen/Qwen3-0.6B
   teacher_adapter: null
+  # A stock stand-in has no fine-tune behind it, so no `teacher-base` player;
+  # the parent's Qwen3-8B must not be inherited against a 1.7B teacher.
+  teacher_base: null
 
 hardware:
   device: mps
@@ -95,6 +98,9 @@ training:
   benchmark_every: 2
 
 evaluation:
+  # Scored inside the run, as the `evaluation` stage: this profile exists to
+  # prove every stage runs. Same layout as `kd eval` writes later.
+  after_training: true
   samples: 8
   # The arena stage runs here too, on four questions instead of 137. That is
   # enough to prove the stage works end to end - the file parses, three models
