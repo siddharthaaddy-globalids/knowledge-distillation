@@ -458,6 +458,24 @@ def test_every_profile_scores_through_vllm():
             f"{name} sets evaluation.engine itself; it belongs to _base.yaml")
 
 
+def test_a_profile_that_packs_a_student_also_ships_it():
+    """s3.upload is a REPLACEMENT, not an addition, so a profile that names its
+    own list silently loses anything added to the base one later.
+
+    That is exactly how this was wrong when the group was introduced: ten of
+    fifteen profiles overrode the list, so the one profile that actually
+    quantised was the one that would have left the packed student on the pod.
+    """
+    for path in shipped_profiles():
+        name = os.path.basename(path)
+        cfg = profile(name[:-5])
+        if not (cfg.get("quantization") or {}).get("enabled"):
+            continue
+        assert "quantized" in cfg["s3"]["upload"], (
+            f"{name} packs a student but s3.upload does not ship it: "
+            f"{cfg['s3']['upload']}")
+
+
 for _name, _fn in sorted(list(globals().items())):
     if _name.startswith("test_") and callable(_fn):
         check(_name, _fn)

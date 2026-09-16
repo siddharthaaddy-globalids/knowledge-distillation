@@ -1066,6 +1066,82 @@ def test_preflight_splits_the_teacher_and_records_it(workspace):
         run.close()
 
 
+# --------------------------------------------------------------------------- #
+# The bf16 merge is an intermediate
+# --------------------------------------------------------------------------- #
+def merged_in(run_dir):
+    """A directory shaped like the dense merge, inside a run bundle."""
+    where = os.path.join(run_dir, "merged")
+    os.makedirs(where, exist_ok=True)
+    with open(os.path.join(where, "model.safetensors"), "w") as handle:
+        handle.write("dense weights")
+    return where
+
+
+def test_the_merge_is_dropped_at_the_end_of_the_run(workspace):
+    """The largest artifact a run produces, and the only large one that rebuilds
+    cheaply from what survives."""
+    record = []
+    fake_stages(record)
+    config = make_config(workspace)
+    with runlog.Run(config, quiet=True) as run:
+        merged = merged_in(run.dir)
+        pipeline.run_pipeline(config, run)
+        assert not os.path.isdir(merged), "the merge survived the run"
+
+
+def test_keep_merged_keeps_it(workspace):
+    record = []
+    fake_stages(record)
+    config = make_config(workspace, **{"quantization.keep_merged": True})
+    with runlog.Run(config, quiet=True) as run:
+        merged = merged_in(run.dir)
+        pipeline.run_pipeline(config, run)
+        assert os.path.isdir(merged), "quantization.keep_merged did not keep it"
+
+
+def test_the_merge_survives_every_stage_that_might_want_it(workspace):
+    """Dropping it in the quantize stage would make the arena - whose dense
+    `distilled` player is generated from it under vllm - rebuild it minutes
+    later. So every stage sees it, and only the end of the run does not."""
+    seen = []
+    config = make_config(workspace)
+    with runlog.Run(config, quiet=True) as run:
+        merged = merged_in(run.dir)
+
+        def watcher(name):
+            def stage(ctx):
+                seen.append((name, os.path.isdir(merged)))
+                return {}
+            return stage
+
+        names = ["preflight", "teacher-check", "smoke", "train", "quantize",
+                 "evaluation", "publish", "upload"]
+        pipeline.STAGES.clear()
+        pipeline.STAGES.update({n: watcher(n) for n in names})
+        pipeline.run_pipeline(config, run)
+
+    assert seen, "no stage ran"
+    absent = [name for name, present in seen if not present]
+    assert not absent, f"the merge was already gone by {absent}"
+    assert not os.path.isdir(merged), "but it should be gone once the run ends"
+
+
+def test_a_merge_outside_the_run_directory_is_left_alone(workspace):
+    """An adapter handed over as a bare directory merges into the shared cache,
+    which belongs to whoever put it there."""
+    record = []
+    fake_stages(record)
+    config = make_config(workspace)
+    elsewhere = os.path.join(workspace, "not-a-run", "merged")
+    os.makedirs(elsewhere, exist_ok=True)
+    with open(os.path.join(elsewhere, "model.safetensors"), "w") as handle:
+        handle.write("someone else's")
+    with runlog.Run(config, quiet=True) as run:
+        pipeline.run_pipeline(config, run)
+    assert os.path.isdir(elsewhere), "tidied a directory outside the run"
+
+
 for _name, _fn in sorted(list(globals().items())):
     if _name.startswith("test_") and callable(_fn):
         check(_name, _fn)

@@ -220,10 +220,28 @@ def test_nothing_packed_means_no_packed_player():
                                    "/runs/x/final_adapter") is None
 
 
+def test_derived_checkpoints_land_beside_the_adapter_in_a_bundle():
+    """runs/<id>/quantized/ next to runs/<id>/final_adapter/, which is what gets
+    it uploaded and what lets a later `kd eval` find it unprompted."""
+    bundle = os.path.join("runs", "x", "final_adapter")
+    assert paths.quantized_dir({}, bundle).endswith(
+        os.path.join("runs", "x", "quantized"))
+    assert paths.merged_dir({}, bundle).endswith(os.path.join("runs", "x", "merged"))
+
+
+def test_a_bare_adapter_falls_back_to_the_cache():
+    """An adapter someone handed you has no bundle to live beside."""
+    loose = os.path.join(tempfile.mkdtemp(prefix="kd-loose-"), "some-adapter")
+    where = paths.quantized_dir({}, loose)
+    assert "quantized" in where
+    assert not where.startswith(os.path.dirname(loose)), where
+
+
 def test_the_cache_path_carries_the_scheme():
     """W4A16 and W8A8 are different artifacts and must not overwrite each other."""
-    four = paths.quantized_cache({}, "/runs/x/final_adapter", "W4A16")
-    eight = paths.quantized_cache({}, "/runs/x/final_adapter", "W8A8")
+    loose = "/somewhere/an-adapter"
+    four = paths.quantized_dir({}, loose, "W4A16")
+    eight = paths.quantized_dir({}, loose, "W8A8")
     assert four != eight, four
     assert four.endswith("-w4a16"), four
 

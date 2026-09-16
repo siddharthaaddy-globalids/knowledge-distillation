@@ -457,11 +457,11 @@ def stage_quantize(ctx):
     # vLLM and GPTQ both want a dense checkpoint, and this is the same merge the
     # arena's distilled player uses - so the model that gets packed is exactly
     # the model the dense column scores.
-    dense = merge.materialise(paths.merged_cache(ctx.config, adapter), base_id,
+    dense = merge.materialise(paths.merged_dir(ctx.config, adapter), base_id,
                               adapter, config=ctx.config, tokenizer=tokenizer,
                               log=ctx.log)
     scheme = settings.get("scheme") or "W4A16"
-    out = settings.get("output_dir") or paths.quantized_cache(ctx.config, adapter,
+    out = settings.get("output_dir") or paths.quantized_dir(ctx.config, adapter,
                                                               scheme)
     try:
         written = quantize.quantize(
@@ -480,6 +480,10 @@ def stage_quantize(ctx):
         ctx.log.info(f"      {facts['dense_bytes'] / 1e9:.2f} GB -> "
                      f"{facts['bytes'] / 1e9:.2f} GB "
                      f"({facts['compression']:.1f}x smaller)")
+
+    # The sizes are measured into `facts` HERE, while both directories still
+    # exist, so the report can still state the compression ratio after the dense
+    # copy is dropped at the end of the run. See _drop_merge.
     ctx.run.write_metrics({"quantization": facts})
     return {"quantized_model": written, "quantization": facts}
 
@@ -1151,8 +1155,50 @@ def _rescue_upload(ctx):
         ctx.log.error(f"      it remains on disk at {ctx.run.dir}")
 
 
+def _drop_merge(ctx):
+    """Delete the dense bf16 merge, unless quantization.keep_merged says not to.
+
+    AT THE VERY END OF THE RUN, after upload, because everything before it may
+    still want the thing: the quantiser packs from it, and the arena's dense
+    `distilled` player is generated from it under the vllm engine. Deleting it
+    in the quantize stage would simply make the arena rebuild it ten minutes
+    later.
+
+    Worth deleting at all because it is the largest artifact a run produces - 15
+    GiB against the packed 5.7 for an 8B student - and the only large one that
+    is cheaply regenerable: the adapter and the base survive, and remaking it is
+    a couple of CPU-minutes. On a pod with a 40 GB volume, holding it alongside
+    the packed copy and the teacher is what runs the disk out.
+
+    Only ever inside this run's own directory. An adapter handed over as a bare
+    directory merges into the shared cache, which belongs to whoever put it
+    there and is not this run's to tidy.
+    """
+    import shutil
+
+    from . import paths
+
+    if (ctx.config.get("quantization") or {}).get("keep_merged"):
+        return
+    adapter = ctx.results.get("adapter") or ctx.run.adapter_dir
+    merged = paths.merged_dir(ctx.config, adapter)
+    if not (os.path.isdir(merged)
+            and os.path.abspath(merged).startswith(os.path.abspath(ctx.run.dir))):
+        return
+    size = sum(os.path.getsize(os.path.join(merged, name))
+               for name in os.listdir(merged)
+               if name.endswith(".safetensors"))
+    shutil.rmtree(merged, ignore_errors=True)
+    ctx.log.info(f"  dropped the bf16 merge ({size / 1e9:.1f} GB) - it rebuilds "
+                 f"from the adapter. quantization.keep_merged keeps it.")
+
+
 def _finish(ctx, failure):
     run = ctx.run
+    try:
+        _drop_merge(ctx)
+    except Exception as exc:  # noqa: BLE001 - tidying must never fail a good run
+        run.log.warning(f"  !! could not drop the bf16 merge: {exc}")
     run.log.info("")
     if failure:
         name, exc = failure

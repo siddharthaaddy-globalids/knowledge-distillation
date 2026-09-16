@@ -286,7 +286,7 @@ s3:
   # The identity that runs this needs s3:GetObject on the teacher prefix AND
   # s3:ListBucket on the bucket: kd.remote.s3.download resolves a prefix by
   # listing it and then fetching each key, so GetObject alone is not enough.
-  upload: [adapter, logs, report, metrics]
+  upload: [adapter, logs, report, metrics, quantized]
 
 runpod:
   # Only read by `kd runpod launch`, which rents the pod for you. The by-hand

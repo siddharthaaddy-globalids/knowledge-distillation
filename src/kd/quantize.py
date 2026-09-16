@@ -379,7 +379,7 @@ def main(argv=None):
         tokenizer = AutoTokenizer.from_pretrained(
             adapter if os.path.isfile(
                 os.path.join(str(adapter), "tokenizer_config.json")) else base_id)
-        model = merge.materialise(paths.merged_cache(config, adapter), base_id,
+        model = merge.materialise(paths.merged_dir(config, adapter), base_id,
                                   adapter, config=config, tokenizer=tokenizer,
                                   log=log)
 

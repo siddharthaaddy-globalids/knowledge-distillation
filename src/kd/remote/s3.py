@@ -41,6 +41,20 @@ UPLOAD_GROUPS = {
                 # surprising, which is exactly when the pod is already gone.
                 "arena-transcript.jsonl"],
     "checkpoints": ["checkpoints/**"],
+    # THE ARTIFACT THAT ACTUALLY GETS DEPLOYED. Several gigabytes, and in the
+    # default list anyway: everything else in this bundle describes the model,
+    # and this IS the model. Leaving it behind means a rented pod is destroyed
+    # with the expensive thing still on it, and re-packing is not free - it is
+    # minutes of GPU and a checkpoint that is only bit-identical if the
+    # calibration sample came out the same way.
+    "quantized": ["quantized/**"],
+    # The dense bf16 merge the packing was made from. NOT in the default list:
+    # it is the largest thing here - 15 GiB against the packed 5.7 - and unlike
+    # the packed copy it is fully regenerable from the adapter and the base in a
+    # couple of CPU-minutes. Name it when you want a checkpoint that loads
+    # without PEFT and without a 4-bit kernel; see quantization.keep_merged,
+    # which is what stops the stage deleting it.
+    "merged": ["merged/**"],
     # Every scoring of the adapter, each in its own directory under
     # evaluation/. Small - numbers, transcripts and a report - and the reason
     # the bundle is worth opening a week later, so it ships by default. An

@@ -391,7 +391,8 @@ quantization:
 | `max_seq_length` | `2048` | Calibration sequences are truncated here. Lower it if the Hessian pass runs out of memory. |
 | `dampening` | `0.01` | Added to the Hessian diagonal before inverting. Raise it if the pass fails on a singular matrix. |
 | `calibration_file` | `null` | **The training `.jsonl`.** `null` falls back to `evaluation.arena_file`. |
-| `output_dir` | `null` | `null` uses `~/.cache/kd/quantized/`, keyed by adapter and scheme. |
+| `output_dir` | `null` | `null` puts it in the run bundle, beside the adapter — `runs/<id>/quantized/`. |
+| `keep_merged` | `false` | Keep the dense bf16 merge the packing was made from. See below. |
 
 Three things worth knowing:
 
@@ -418,6 +419,39 @@ three short, quantization cost nothing". The report's *What W4A16 cost* table is
 the subtraction, measured on identical tokens and identical questions in one run.
 
 Needs `llmcompressor`, a CUDA-only optional extra for the same reason vLLM is.
+
+### Where the derived checkpoints live, and what ships
+
+A run that quantises produces two checkpoints beside the adapter that made them:
+
+```
+runs/<id>/
+  final_adapter/     the LoRA                    MB
+  merged/            the dense bf16 student      15 GiB     dropped at the end
+  quantized/         the packed W4A16 student    5.7 GiB    uploaded
+```
+
+`quantized` is in the default `s3.upload` list. Everything else in a bundle
+*describes* the model; this one **is** the model, and leaving it out means a
+rented pod is destroyed with the expensive thing still on it — re-packing costs
+GPU minutes and only reproduces the same checkpoint if the calibration sample
+came out the same way.
+
+`merged` is not, and is deleted at the end of the run unless
+`quantization.keep_merged` is set. It is the largest artifact a run produces and
+the only large one that rebuilds cheaply — the adapter and the base survive, and
+remaking it is a couple of CPU-minutes. On a pod with a 40 GB volume, holding it
+alongside the packed copy and the teacher is what runs the disk out. To ship it,
+set `keep_merged: true` **and** add `merged` to `s3.upload`; both, because
+either alone does nothing.
+
+The deletion happens **after the last stage**, not in `quantize` — the arena's
+dense `distilled` player is generated from that merge under the vLLM engine, so
+dropping it earlier would just make the arena rebuild it minutes later.
+
+`s3.upload` is a **replacement, not an addition**. A profile that names its own
+list does not inherit anything added to the base one later, so a profile with
+`quantization.enabled: true` must name `quantized` in its own list.
 
 ## `publish`
 

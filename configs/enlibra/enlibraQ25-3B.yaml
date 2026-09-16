@@ -249,7 +249,7 @@ s3:
   # needs s3:ListBucket on the bucket plus s3:GetObject on the teacher prefix to
   # READ, and s3:PutObject on the prefix above to WRITE - three grants, and the
   # last one is the one people forget until a pod is already terminated.
-  upload: [adapter, logs, report, metrics]
+  upload: [adapter, logs, report, metrics, quantized]
 
 runpod:
   # Only read by `kd runpod launch`. The by-hand path - ./run.sh on a pod you

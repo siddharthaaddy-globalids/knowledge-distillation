@@ -374,10 +374,23 @@ quantization:
   # optimises for a distribution this model will never be asked to produce.
   # null falls back to evaluation.arena_file.
   calibration_file: null
-  # Where the packed checkpoint goes. null uses ~/.cache/kd/quantized/, keyed by
-  # adapter and scheme, so two runs on one adapter pack it once and the run
-  # bundle - which is uploaded wholesale - does not carry a second copy.
+  # Where the packed checkpoint goes. null puts it in the run bundle, beside the
+  # adapter that produced it - runs/<id>/quantized/ next to final_adapter/ -
+  # which is what gets it uploaded and what lets a later `kd eval` on the same
+  # adapter find it without being told. An adapter that is a bare directory
+  # rather than one inside a bundle falls back to ~/.cache/kd/quantized/.
   output_dir: null
+  # Keep the dense bf16 merge the packing was made FROM, in runs/<id>/merged/.
+  #
+  # Off, because it is the largest thing a run produces - 15 GiB against the
+  # packed 5.7 for an 8B student - and it is fully regenerable from the adapter
+  # and the base in a couple of CPU-minutes, which the packed copy is not. On a
+  # pod with a 40 GB volume, holding both plus the teacher is what runs it out
+  # of disk.
+  #
+  # Turn it on, and add `merged` to s3.upload, when you want a checkpoint that
+  # loads with plain transformers and no 4-bit kernel.
+  keep_merged: false
 
 benchmark_prompts:
   - List three states of matter. Use a numbered list.
@@ -462,15 +475,23 @@ s3:
   # Which parts of the run bundle to ship. manifest.json and config.resolved.yaml
   # always go, whatever is listed here, because without them the uploaded bundle
   # cannot say what produced it.
-  #   adapter  logs  report  metrics  evaluation  checkpoints
+  #   adapter  logs  report  metrics  evaluation  quantized  merged  checkpoints
   # evaluation is every scoring of the adapter that happened inside the run
   # (evaluation.after_training). A scoring done later with `kd eval` uploads
   # its own directory to the same place in the bucket, so the bundle there
   # always holds every evaluation whichever machine produced it.
+  # quantized is the packed student - the artifact that actually gets deployed.
+  # Several gigabytes, and in the list anyway: everything else here DESCRIBES
+  # the model and this one IS it, so leaving it out means a rented pod is
+  # destroyed with the expensive thing still on it.
+  # merged is off by default: the dense bf16 checkpoint the packing was made
+  # from, the largest thing in the bundle, and unlike the packed copy fully
+  # regenerable from the adapter and the base in a couple of CPU-minutes. Add it
+  # here AND set quantization.keep_merged to ship it.
   # checkpoints is off by default: it is optimizer state, hundreds of megabytes,
   # that only a resumed run reads. A run stopped by a limit adds it automatically,
   # since the checkpoint is then the only artifact that exists.
-  upload: [adapter, logs, report, metrics, evaluation]
+  upload: [adapter, logs, report, metrics, evaluation, quantized]
 
 # ---------------------------------------------------------------------------
 #  RunPod. Entirely optional - nothing in the local pipeline imports it, and a

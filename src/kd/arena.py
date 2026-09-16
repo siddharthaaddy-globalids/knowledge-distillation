@@ -901,7 +901,7 @@ def resolve_quantized(config, adapter, explicit=None, log=None):
                          f"{QUANTIZED} player is skipped")
             return None
     if adapter and settings.get("enabled"):
-        cached = paths.quantized_cache(config, adapter,
+        cached = paths.quantized_dir(config, adapter,
                                        settings.get("scheme") or "W4A16")
         if quantize.is_quantized(cached):
             return cached
@@ -1049,7 +1049,7 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
 
         run("distilled", build_distilled,
             lambda: merge.materialise(
-                paths.merged_cache(config, adapter), base_id, adapter,
+                paths.merged_dir(config, adapter), base_id, adapter,
                 config=config, tokenizer=tokenizer, dtype=dtype, log=log))
 
     if QUANTIZED in players:
@@ -1094,7 +1094,7 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
 
         run("teacher", build_teacher,
             lambda: merge.materialise(
-                paths.merged_cache(config, teacher_adapter or teacher_id),
+                paths.merged_dir(config, teacher_adapter or teacher_id),
                 teacher_id, teacher_adapter, config=config, tokenizer=tokenizer,
                 dtype=dtype, log=log))
 

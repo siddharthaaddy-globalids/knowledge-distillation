@@ -654,34 +654,49 @@ def adapter_cache(config, source):
     return os.path.join(root, safe)
 
 
-def merged_cache(config, source):
-    """Where a merged, dense copy of `source` is kept, so it is merged once.
+def derived_dir(config, adapter, kind, scheme=None):
+    """Where a checkpoint DERIVED from `adapter` lives: merged, or packed.
 
     vLLM and the quantiser cannot be handed base + adapter; they want an
-    ordinary checkpoint on disk. Building one costs several gigabytes of write,
-    so it goes beside the other caches rather than into the run bundle - a run
-    directory is uploaded wholesale, and nobody wants an extra copy of the
-    student in the bucket next to the adapter that produced it.
+    ordinary checkpoint on disk. Two get built - the dense bf16 merge, and the
+    4-bit packing of it - and both are worth keeping rather than rebuilding.
 
-    Keyed the same way as adapter_cache, so two runs scoring the same adapter
-    share the merge instead of each paying for it.
+    IN THE RUN BUNDLE, beside the adapter that produced them:
+
+        runs/<id>/final_adapter/     the adapter
+        runs/<id>/merged/           the dense student
+        runs/<id>/quantized/        the packed student
+
+    which is the whole point. The bundle is what gets uploaded, and the packed
+    student is the artifact that actually gets deployed - leaving it outside the
+    bundle means a rented pod is destroyed with the expensive thing still on it.
+    It also means a later `kd eval` against the same adapter finds both without
+    being told where they are.
+
+    In the shared cache otherwise, keyed like adapter_cache, for an adapter that
+    is a bare directory someone handed you rather than one sitting in a bundle.
+
+    The scheme is in the packed directory's cache name because a W4A16
+    checkpoint and a W8A8 one are different artifacts that must not overwrite
+    each other. Inside a bundle they do not collide: one run packs one way.
     """
-    root = os.path.join(os.path.dirname(cache_dir(config)), "merged")
-    safe = str(source).replace("\\", "/").strip("./").replace("/", "__")
-    return os.path.join(root, safe)
+    suffix = f"-{str(scheme).lower()}" if scheme else ""
+    parent = os.path.dirname(os.path.abspath(str(adapter)))
+    if os.path.basename(str(adapter).rstrip("/\\")) == "final_adapter":
+        return os.path.join(parent, kind)
+    root = os.path.join(os.path.dirname(cache_dir(config)), kind)
+    safe = str(adapter).replace("\\", "/").strip("./").replace("/", "__")
+    return os.path.join(root, f"{safe}{suffix}")
 
 
-def quantized_cache(config, source, scheme="W4A16"):
-    """Where the packed copy of `source` is kept, so it is packed once.
+def merged_dir(config, adapter):
+    """The dense bf16 merge of `adapter`. See derived_dir."""
+    return derived_dir(config, adapter, "merged")
 
-    Beside the merged cache and keyed the same way, with the scheme in the name:
-    a W4A16 checkpoint and a W8A8 one are different artifacts and must not
-    overwrite each other. Packing an 8B student is minutes on a rented GPU, and
-    an arena that re-ran the stage every time would pay them every time.
-    """
-    root = os.path.join(os.path.dirname(cache_dir(config)), "quantized")
-    safe = str(source).replace("\\", "/").strip("./").replace("/", "__")
-    return os.path.join(root, f"{safe}-{str(scheme).lower()}")
+
+def quantized_dir(config, adapter, scheme="W4A16"):
+    """The packed copy of `adapter`. See derived_dir."""
+    return derived_dir(config, adapter, "quantized", scheme=scheme)
 
 
 def ensure_peft_adapter(config, log=None):

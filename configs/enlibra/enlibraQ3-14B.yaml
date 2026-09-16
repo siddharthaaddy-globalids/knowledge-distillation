@@ -339,7 +339,7 @@ s3:
   #
   # A run stopped by a limit adds this group by itself (pipeline.py:1061), so
   # the rescue path is covered either way.
-  upload: [adapter, logs, report, metrics, evaluation, checkpoints]
+  upload: [adapter, logs, report, metrics, evaluation, quantized, checkpoints]
 
 runpod:
   # Only read by `kd runpod launch`. The by-hand path - a pod you started

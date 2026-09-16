@@ -40,6 +40,7 @@ stopping at the first failure, and ends with the adapter in the bucket:
 | `train` | ✓ | |
 | `evaluation` | | The whole evaluation pipeline below, inside the run. **Off by default**; `evaluation.after_training: true` turns it on. |
 | `publish` | | To the Hugging Face Hub. Off by default. |
+| `quantize` | | Pack the student to W4A16 for deployment. Off by default; `quantization.enabled: true` turns it on. |
 | `upload` | | To S3. Off by default; also runs after a failure, so logs survive. |
 
 **Evaluation** — `kd eval` — scores an adapter that already exists: this

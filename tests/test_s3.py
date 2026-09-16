@@ -237,6 +237,9 @@ def seed_bundle(workspace, config):
             (run.path("report.html"), "<html></html>"),
             (run.path("evaluation.json"), "{}"),
             (os.path.join(run.checkpoint_dir, "checkpoint-2", "optimizer.pt"), "state"),
+            (run.path("quantized", "model.safetensors"), "packed"),
+            (run.path("quantized", "kd-quant.json"), "{}"),
+            (run.path("merged", "model.safetensors"), "dense"),
         ]:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as handle:
@@ -268,6 +271,39 @@ def test_manifest_and_config_always_go(workspace):
     s3.upload_bundle(config, run_dir, run_id)
     keys = {key.split(f"runs/{run_id}/")[-1] for key in fake.uploaded}
     assert "manifest.json" in keys and "config.resolved.yaml" in keys, keys
+
+
+def test_the_packed_student_ships_by_default(workspace):
+    """Everything else in the bundle DESCRIBES the model; this one is it.
+
+    Leaving it behind means a rented pod is destroyed with the expensive thing
+    still on it, and re-packing costs GPU minutes for a checkpoint that is only
+    bit-identical if the calibration sample came out the same way.
+    """
+    config = make_config(workspace)          # the shipped s3.upload list
+    run_dir, run_id = seed_bundle(workspace, config)
+    fake = install_fake()
+    s3.upload_bundle(config, run_dir, run_id)
+    keys = {key.split(f"runs/{run_id}/")[-1] for key in fake.uploaded}
+    assert "quantized/model.safetensors" in keys, keys
+    assert "quantized/kd-quant.json" in keys, keys
+
+
+def test_the_bf16_merge_does_not_ship_by_default(workspace):
+    """The largest thing in the bundle, and the only large one that rebuilds
+    from what survives - the adapter plus the base, a couple of CPU-minutes."""
+    config = make_config(workspace)
+    run_dir, run_id = seed_bundle(workspace, config)
+    fake = install_fake()
+    s3.upload_bundle(config, run_dir, run_id)
+    keys = {key.split(f"runs/{run_id}/")[-1] for key in fake.uploaded}
+    assert not any(k.startswith("merged/") for k in keys), keys
+
+    # ...and goes when it is named, so turning it on is one word.
+    fake = install_fake()
+    s3.upload_bundle(config, run_dir, run_id, groups=["merged"])
+    keys = {key.split(f"runs/{run_id}/")[-1] for key in fake.uploaded}
+    assert "merged/model.safetensors" in keys, keys
 
 
 def test_checkpoints_upload_when_asked_for(workspace):
