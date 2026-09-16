@@ -190,7 +190,12 @@ ensure_uv() {
 setup() {
   if [ "$MODE" = "pod" ]; then
     step "Installing (keeping the pod's CUDA build of torch)"
-    "$ROOT/scripts/runpod.sh" --setup-only
+    # The config goes with it so the installer can read which optional groups
+    # this run needs - `engine: vllm` wants vLLM, `quantization.enabled` wants
+    # llm-compressor - instead of leaving that to a flag someone has to
+    # remember. Without it, `doctor` installs the core set, and every later
+    # command is told "dependencies already present" and gets no vLLM.
+    "$ROOT/scripts/runpod.sh" --setup-only --config "$CONFIG"
     return
   fi
   ensure_uv

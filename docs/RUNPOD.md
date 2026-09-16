@@ -87,9 +87,19 @@ minutes of paid GPU time. It writes `/workspace/kd-env.sh` so a second SSH
 session is one `source` away from a working shell.
 
 Everything it does not recognise is passed through, so it is also how you run the
-checks below. `--setup-only` stops after the install; `--extra serve` adds vLLM
-and `--extra quantize` adds llm-compressor; `KD_DISPATCH_ONLY=1` prints the
-command it would run and exits.
+checks below. `--setup-only` stops after the install; `KD_DISPATCH_ONLY=1`
+prints the command it would run and exits.
+
+**The optional groups install themselves.** Given `--config`, the script reads
+it and adds what the run needs: `evaluation.engine: vllm` pulls in vLLM,
+`quantization.enabled: true` pulls in llm-compressor. `--extra serve` and
+`--extra quantize` still work and are still the way to add a group the config
+does not imply, but forgetting them is no longer a way to reach preflight on a
+rented machine and be refused there.
+
+Note that those two pin their own torch, so unlike the core install they *can*
+replace the template's build. The replacement is a CUDA wheel, so the run still
+uses the GPU — it costs the download, not the run.
 
 ### Rehearsing it before you rent anything
 

@@ -70,7 +70,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --setup-only) SETUP_ONLY=1; shift ;;
     --rehearse)   REHEARSE=1; shift ;;
-    --extra)      [ $# -ge 2 ] || die "--extra needs a name: eval or remote"
+    --extra)      [ $# -ge 2 ] || die "--extra needs a name: remote, serve or quantize"
                   EXTRAS="$EXTRAS $2"; shift 2 ;;
     --extra=*)    EXTRAS="$EXTRAS ${1#*=}"; shift ;;
     --no-extras)  EXTRAS=""; shift ;;
@@ -181,6 +181,70 @@ block() {
 #            has hit, not a hypothetical.
 SKIP='^(torch|gradio|runpod)([<>=!~[]|$)'
 
+# What proves each optional group is present. The satisfied-check below walks
+# this rather than testing one package for all of them: it used to check boto3
+# alone, which meant a run that asked for `serve` after `remote` was already
+# installed was told "dependencies already present" and got no vLLM - then
+# refused in preflight, on a pod, having paid to get that far.
+probe_for() {
+  case "$1" in
+    remote)   printf 'boto3' ;;
+    serve)    printf 'vllm' ;;
+    quantize) printf 'llmcompressor' ;;
+    *)        printf '' ;;
+  esac
+}
+
+# The config says which optional groups this run needs - `engine: vllm` needs
+# serve, `quantization.enabled` needs quantize - so nobody has to remember a
+# flag that the YAML already implies. Forgetting it is not a small mistake here:
+# it is discovered in preflight, on rented hardware.
+#
+# Best effort, and called TWICE for that reason. Before the install, pyyaml may
+# not be importable yet and this returns nothing; after the core install it
+# always works, and the second pass picks up whatever the first could not see.
+CONFIG_PATH=""
+for i in "${!ARGS[@]}"; do
+  case "${ARGS[$i]}" in
+    --config)   CONFIG_PATH="${ARGS[$((i + 1))]:-}" ;;
+    --config=*) CONFIG_PATH="${ARGS[$i]#*=}" ;;
+  esac
+done
+
+config_extras() {
+  [ -n "$CONFIG_PATH" ] || return 0
+  PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" "$PY" - "$CONFIG_PATH" <<'PYEOF' 2>/dev/null || true
+import sys
+
+try:
+    from kd.config import load_config
+    cfg = load_config(sys.argv[1], use_env=False)
+except Exception:
+    raise SystemExit(0)          # pyyaml not installed yet; the second pass gets it
+
+groups = []
+if str((cfg.get("evaluation") or {}).get("engine") or "").lower() == "vllm":
+    groups.append("serve")
+if (cfg.get("quantization") or {}).get("enabled"):
+    groups.append("quantize")
+print(" ".join(groups))
+PYEOF
+}
+
+add_config_extras() {
+  local wanted
+  wanted="$(config_extras)"
+  for extra in $wanted; do
+    case " $EXTRAS " in
+      *" $extra "*) ;;
+      *) EXTRAS="$EXTRAS $extra"
+         log "$CONFIG_PATH needs the '$extra' extra - adding it" ;;
+    esac
+  done
+}
+
+add_config_extras
+
 # An array, not a string: a requirement like `pkg[extra]>=1.0` carries glob
 # characters, and a word-split string would let the shell try to expand them.
 REQS=()
@@ -206,11 +270,23 @@ done
 
 # Skip the install when it is already satisfied. Reconnecting to a pod, or a
 # second run in the same shell, should not repeat ninety seconds of pip.
-# boto3 stands in for the whole `remote` extra, because runpod is in SKIP:
+#
+# EVERY requested extra is probed, not one standing in for all of them. The
+# `remote` probe is boto3 rather than runpod, because runpod is in SKIP and
 # checking for a package this script deliberately does not install would fail
 # forever and reinstall everything on every invocation.
-if "$PY" -c 'import transformers, trl, peft, accelerate, datasets, yaml' 2>/dev/null \
-   && { [ -z "$EXTRAS" ] || "$PY" -c 'import boto3' 2>/dev/null; }; then
+satisfied() {
+  "$PY" -c 'import transformers, trl, peft, accelerate, datasets, yaml' 2>/dev/null \
+    || return 1
+  for extra in $EXTRAS; do
+    probe="$(probe_for "$extra")"
+    [ -n "$probe" ] || continue
+    "$PY" -c "import $probe" 2>/dev/null || return 1
+  done
+  return 0
+}
+
+if satisfied; then
   log "Dependencies already present - skipping install"
 else
   log "Installing dependencies (the template's torch build is kept)"
@@ -229,6 +305,35 @@ else
     warn "  --ignore-installed, which installs alongside rather than over it"
     "$PY" -m pip install --quiet --no-cache-dir --disable-pip-version-check \
       --ignore-installed "${REQS[@]}" || die "pip install failed"
+  fi
+fi
+
+# Second pass. Before the install, config_extras could not read the config -
+# pyyaml may not have been importable - so whatever it could not see then is
+# added now and installed on its own. A no-op in the ordinary case where the
+# first pass already resolved everything.
+add_config_extras
+if ! satisfied; then
+  EXTRA_REQS=()
+  for extra in $EXTRAS; do
+    probe="$(probe_for "$extra")"
+    [ -n "$probe" ] || continue
+    "$PY" -c "import $probe" 2>/dev/null && continue
+    while IFS= read -r req; do
+      [ -n "$req" ] || continue
+      printf '%s' "$req" | grep -Eq "$SKIP" || EXTRA_REQS+=("$req")
+    done < <(block "$extra")
+  done
+  if [ "${#EXTRA_REQS[@]}" -gt 0 ]; then
+    # vLLM and llm-compressor pin their own torch, so this one CAN replace the
+    # template's build - unlike the core install above, which is why that one
+    # skips torch and this one cannot. The replacement is a CUDA wheel, so the
+    # run still uses the GPU; it costs the download rather than the run.
+    log "Installing optional groups: $EXTRAS"
+    printf '      %s\n' "${EXTRA_REQS[@]}"
+    "$PY" -m pip install --quiet --no-cache-dir --disable-pip-version-check \
+      "${EXTRA_REQS[@]}" \
+      || die "could not install the optional groups this config needs: $EXTRAS"
   fi
 fi
 

@@ -149,8 +149,12 @@ def test_optional_extras_reachable_from_both():
         text = template(kind)
         assert "--extra" in text, f"distill.{kind} cannot install an optional extra"
         assert "KD_EXTRAS" in text, f"distill.{kind} ignores KD_EXTRAS"
-        for group in ("eval", "remote"):
-            assert group in text, f"distill.{kind} does not mention the {group} extra"
+        # Named groups are NOT asserted here: the runners pass whatever they are
+        # given straight through to uv, which is what keeps them working when a
+        # group is added or renamed. An earlier version checked for "eval" and
+        # went on passing after that group was deleted, because "eval" is a
+        # substring of "evaluation".
+        assert "remote" in text, f"distill.{kind} never mentions an extra at all"
 
 
 def test_ref_override_exists_and_warns_in_both():
@@ -225,6 +229,54 @@ def test_documented_subcommands_exist():
         named = {word.strip(" .,\n") for word in listed.group(1).replace("\n", " ").split(",")}
         unknown = {name for name in named if name and name not in parser_commands}
         assert not unknown, f"distill.{kind} advertises commands that do not exist: {unknown}"
+
+
+# --------------------------------------------------------------------------- #
+# The pod installer works out what a config needs
+# --------------------------------------------------------------------------- #
+def runpod_sh():
+    with open(os.path.join(ROOT, "scripts", "runpod.sh"), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_the_installer_derives_its_extras_from_the_config():
+    """`engine: vllm` and `quantization.enabled` are in the YAML already.
+
+    Leaving them to a --extra flag means the flag gets forgotten, and it is
+    forgotten expensively: the failure lands in preflight, on rented hardware.
+    """
+    text = runpod_sh()
+    assert "config_extras" in text, "the installer never reads the config"
+    assert "add_config_extras" in text
+    assert '"serve"' in text or "'serve'" in text or "serve" in text
+    assert "quantize" in text
+    # Twice: before the install the config may not be readable - pyyaml is part
+    # of what is being installed - so whatever the first pass missed is picked
+    # up by the second.
+    assert text.count("add_config_extras") >= 3, (
+        "add_config_extras must be defined and called twice, before and after "
+        "the core install")
+
+
+def test_every_requested_extra_is_probed_not_just_one():
+    """The regression: boto3 stood in for all of them, so a run that asked for
+    `serve` after `remote` was already installed was told 'dependencies already
+    present' and got no vLLM."""
+    text = runpod_sh()
+    assert "probe_for" in text, "no per-extra probe"
+    for group, module in (("remote", "boto3"), ("serve", "vllm"),
+                          ("quantize", "llmcompressor")):
+        assert module in text, f"the {group} extra has no import probe"
+    assert "satisfied()" in text, "the skip-check was not made a function"
+
+
+def test_run_sh_hands_the_config_to_the_installer():
+    """Without it the installer cannot know which groups the run needs, and
+    `doctor` silently primes the skip-check for every later command."""
+    with open(os.path.join(ROOT, "run.sh"), encoding="utf-8") as fh:
+        text = fh.read()
+    assert '--setup-only --config "$CONFIG"' in text, (
+        "run.sh calls the installer without the config")
 
 
 for _name, _fn in sorted(list(globals().items())):
