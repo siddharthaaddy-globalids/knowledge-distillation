@@ -170,3 +170,17 @@ s3:
 
 runpod:
   enabled: false
+
+# ---------------------------------------------------------------------------
+#  This profile exists to run on a 16 GB Mac mini, and neither of the packing
+#  libraries has a build for one - llm-compressor and vLLM are both CUDA-only.
+#  Left inherited from enlibraQ3-14B.yaml, the smoke run writes a full copy of
+#  the merged student and then fails on the next line, and the evaluation
+#  refuses at preflight.
+#
+#  So the laptop rehearsal answers the questions a laptop can answer, and the
+#  two that need a GPU are the pod's. The numbers a smoke run produces were
+#  never comparable to the real run's anyway.
+# ---------------------------------------------------------------------------
+quantization:
+  enabled: false

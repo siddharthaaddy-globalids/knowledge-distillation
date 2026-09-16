@@ -274,6 +274,43 @@ def test_the_quantization_cost_block_needs_both_students():
     assert cost["same_letter"] == 1, cost
 
 
+def test_a_machine_that_cannot_pack_is_told_before_anything_is_merged():
+    """The stage checks the packer FIRST, before the merge.
+
+    A real Mac smoke run wrote 1.19 GB of merged student and then failed on the
+    very next line. On the 8B profile that would be 15 GB spent to discover
+    something knowable in a millisecond.
+    """
+    import inspect
+
+    from kd import pipeline
+
+    body = inspect.getsource(pipeline.stage_quantize)
+    check_at = body.index("unavailable_reason")
+    merge_at = body.index("merge.materialise")
+    assert check_at < merge_at, (
+        "stage_quantize merges before checking whether it can pack at all")
+
+
+def test_the_advice_suits_the_machine_it_is_given_on():
+    """Telling a Mac to fetch CUDA wheels costs a download and fails the same
+    way. The platform check has to come before the install line."""
+    import kd.quantize as q
+    import kd.vllm_runner as v
+
+    for module in (q, v):
+        real = module.sys.platform
+        try:
+            for platform, name in (("darwin", "macOS"), ("win32", "Windows")):
+                module.sys.platform = platform
+                reason = module.unavailable_reason()
+                assert reason and name in reason, (module.__name__, platform, reason)
+                assert "cu128" not in reason, (
+                    f"{module.__name__} sends a {name} user to a CUDA index")
+        finally:
+            module.sys.platform = real
+
+
 for _name, _fn in sorted(list(globals().items())):
     if _name.startswith("test_") and callable(_fn):
         check(_name, _fn)

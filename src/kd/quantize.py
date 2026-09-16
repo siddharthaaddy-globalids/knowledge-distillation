@@ -97,13 +97,22 @@ def available():
 
 
 def unavailable_reason():
-    """Why quantization cannot run here, in a sentence, or None if it can."""
+    """Why quantization cannot run here, in a sentence, or None if it can.
+
+    The platform check comes first because the install line below is useless on
+    a machine that cannot run the result: telling a Mac to fetch CUDA wheels is
+    advice that costs a download and then fails the same way.
+    """
     if available():
         return None
-    if sys.platform == "win32":
-        return ("llm-compressor needs a CUDA machine, so quantization cannot run "
-                "on this one. Set quantization.enabled: false here and quantize "
-                "on the Linux pod (docker/Dockerfile.cuda).")
+    if sys.platform in ("win32", "darwin"):
+        where = "Windows" if sys.platform == "win32" else "macOS"
+        return (f"llm-compressor needs a CUDA machine and there is no {where} "
+                f"build, so quantization cannot run here.\n"
+                f"      Set quantization.enabled: false for this machine, or "
+                f"pass --skip quantize for one run.\n"
+                f"      The packing belongs on the Linux pod "
+                f"(docker/Dockerfile.cuda).")
     return ("llm-compressor is not installed. It is an optional extra, for the "
             "same reason vLLM is:\n"
             "      uv pip install --index-url "

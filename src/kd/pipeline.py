@@ -425,15 +425,25 @@ def stage_quantize(ctx):
     Not a gate: a failed quantization is a missing column, and throwing away a
     good adapter over it would be the wrong trade by a wide margin.
 
-    The output goes to the shared cache rather than into the run directory. The
-    run bundle is uploaded wholesale, and a 5 GB checkpoint that `kd publish`
-    ships separately does not also need to be in the run's own S3 prefix.
+    The output goes into the run bundle, beside the adapter that produced it, so
+    it uploads with the run - it is the artifact that actually gets deployed, and
+    leaving it outside means a rented pod is destroyed with it still on board.
     """
     from transformers import AutoTokenizer
 
     from . import merge, paths, quantize
 
     settings = ctx.config.get("quantization") or {}
+
+    # BEFORE anything expensive. Merging the student writes a full copy of it -
+    # 1.2 GB for a 0.6B smoke model, 15 GB for the real one - and discovering
+    # afterwards that the packer is not installed spends that for nothing. This
+    # check used to come after the merge, and a Mac smoke run wrote 1.19 GB and
+    # then failed on the very next line.
+    reason = quantize.unavailable_reason()
+    if reason:
+        raise StageFailed(reason)
+
     adapter = ctx.results.get("adapter") or ctx.resolve_adapter()
     if not adapter:
         raise StageFailed("nothing to quantize: this run produced no adapter")
@@ -606,6 +616,15 @@ def stage_eval_preflight(ctx):
                      "is a merged checkpoint and models.teacher_base is not set; "
                      "that player is skipped")
         players = tuple(p for p in players if p != "teacher-base")
+    # Same for the packed student: the quantize stage may have been skipped, or
+    # have failed, and announcing a player that the arena will then drop is the
+    # kind of small lie that costs someone ten minutes reading a transcript.
+    if arena.QUANTIZED in players and not arena.resolve_quantized(
+            ctx.config, adapter, log=ctx.log):
+        ctx.log.info(f"  !! {arena.QUANTIZED} is in evaluation.players but "
+                     f"nothing has been packed for this adapter; that player "
+                     f"is skipped")
+        players = tuple(p for p in players if p != arena.QUANTIZED)
     ctx.log.info(f"  players   : {', '.join(players)}")
     ctx.log.info(f"  teacher   : {ctx.config['models']['teacher']}"
                  + (f" + {ctx.config['models']['teacher_adapter']}"

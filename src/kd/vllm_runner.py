@@ -76,10 +76,19 @@ def unavailable_reason():
     """Why `--engine vllm` cannot run here, in a sentence, or None if it can."""
     if available():
         return None
-    if sys.platform == "win32":
-        return ("vLLM publishes no Windows wheel, so --engine vllm cannot run on "
-                "this machine. Use --engine hf here and vllm on the Linux pod "
-                "(docker/Dockerfile.cuda), which is where the long arenas run.")
+    if sys.platform in ("win32", "darwin"):
+        where = "Windows" if sys.platform == "win32" else "macOS"
+        return (f"vLLM publishes no {where} wheel, so engine `vllm` cannot run "
+                f"here.\n"
+                f"      Ask for the other engine explicitly - it is a visible "
+                f"choice, not a silent fallback:\n"
+                f"          ./run.sh --config <profile> --set "
+                f"evaluation.engine=hf ...\n"
+                f"          kd arena --engine hf ...\n"
+                f"      The two engines do not agree token for token, so a "
+                f"local score and a pod score\n"
+                f"      are not comparable - which is the reason you are asked "
+                f"rather than defaulted.")
     return ("vLLM is not installed. It is an optional extra because it pulls a "
             "CUDA build of torch that the default CPU pin would fight:\n"
             "      uv pip install --index-url https://download.pytorch.org/whl/cu128 "
