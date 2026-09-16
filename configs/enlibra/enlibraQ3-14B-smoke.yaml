@@ -1,0 +1,172 @@
+# ===========================================================================
+#  enLibra neuroscience curriculum - the same run, small enough for a 16 GB
+#  Mac mini.
+#
+#    ./run.sh --config configs/enlibra/enlibraQ3-14B-smoke.yaml
+#
+#  This exists to answer the questions that do NOT need the real models, before
+#  an 80 GB card is rented:
+#
+#    * does the prepared corpus load, and do the domains address the right files
+#    * do the token budgets actually admit the rows, or is every sample filtered
+#    * does the chat template render the exchange the way the collator expects
+#    * do the LoRA target modules attach to a real Qwen3
+#    * does a step run, and a checkpoint get written
+#    * does eval-1to5hop.jsonl parse, and is the <Answer> tag found
+#    * does the UPLOAD reach s3://enlibra/.../outputs/gkd/ - see the s3 note
+#
+#  It cannot tell you anything about memory, throughput or cost on the pod: the
+#  models are different sizes on a different backend. That is what the `smoke`
+#  STAGE inside the real run is for, which measures s/step on the hardware that
+#  will do the work and refuses the run if the projection does not fit.
+#
+#  It also cannot vouch for the real teacher. The 14B adapter cannot be loaded
+#  here, so teacher_base goes null and the `teacher-check` gate never exercises
+#  the thing it exists for - a merged export with a key layout transformers
+#  cannot map. Nor does it test kd.paths.normalise_teacher against the real
+#  checkpoint-epoch-3 prefix, since the stand-in teacher is a plain Hub id.
+#  To check that prefix without renting anything:
+#      kd doctor --config configs/enlibra/enlibraQ3-14B.yaml
+#  which probes reachability with one ListObjectsV2 and downloads nothing.
+#
+#  Everything not listed below is inherited from enlibraQ3-14B.yaml,
+#  deliberately: the dataset, the budgets, the LoRA target names, the arena file
+#  and the bucket layout are the things under test, so they must not be restated
+#  here where they could drift out of step with the profile they rehearse.
+# ===========================================================================
+extends: enlibraQ3-14B.yaml
+
+project:
+  name: enlibra-neuroscience-q3-14b-smoke
+
+models:
+  # Stand-ins, several sizes down. Same tokenizer as the real pair - every Qwen3
+  # shares the 151669-entry vocabulary - so the chat rendering and the
+  # prompt/completion split under test are byte-for-byte the ones the real run
+  # will see.
+  #
+  # Not the real teacher: it is a LoRA over Qwen3-14B, which is ~30 GB of base
+  # weights before the adapter, and this machine has no business fetching or
+  # loading it.
+  teacher: Qwen/Qwen3-1.7B
+  student: Qwen/Qwen3-0.6B
+  # Nothing to split here - the stand-in is a whole model, not an adapter - so
+  # normalise_teacher returns early and leaves this alone. Stated anyway,
+  # because the parent's value must not survive into a run with no adapter.
+  teacher_adapter: null
+  # A stock stand-in has no fine-tune behind it, so there is no `teacher-base`
+  # player: the parent's Qwen3-14B must not be inherited against a 1.7B teacher,
+  # where it would score a model unrelated to anything in the run. Null makes
+  # the evaluation skip that player with a note, leaving three.
+  teacher_base: null
+
+hardware:
+  device: mps
+  # 2.03B + 0.75B parameters at bfloat16 is ~5.6 GB, comfortably inside the 60%
+  # of 16 GB that kd.paths treats as the working budget. float32 would be 11 GB
+  # and would swap.
+  #
+  # transformers permits bfloat16 on MPS only from macOS 14.0; below that
+  # kd.config falls back to float32 and says so, and this will be slow rather
+  # than broken. On an Intel Mac mini set --set hardware.device=cpu.
+  dtype: bfloat16
+
+dataset:
+  # dataset.source is inherited: the corpus is committed, so it is the same
+  # directory here as on the pod and there is nothing to switch.
+  #
+  # THE WHOLE CORPUS. Not a sample of it - the same 1384 rows the real run
+  # builds, read and filtered identically. What that buys is every row being
+  # proved readable, parseable and inside the budget, on this machine, before a
+  # GPU is rented. A slice can only ever vouch for the rows it happened to touch.
+  #
+  # Training still consumes just 4 samples (2 steps x batch 1 x accum 2). Rows
+  # kept and rows trained on are different numbers, and it is the first one that
+  # says whether the corpus is sound.
+  #
+  # The domains are inherited from the parent, and that is load-bearing: this
+  # block REPLACES the parent's rather than merging with it, so a domain renamed
+  # upstream and not renamed here would rehearse a corpus the real run does not
+  # have. Not restating the list is what makes that impossible.
+  #
+  # The pass rate printed per domain is the number to read. Below 100% means the
+  # budgets are dropping rows, and the real run would silently train on part of
+  # the corpus.
+  validation_size: 8
+
+lora:
+  # A cheap adapter. The point is that the target names resolve against a real
+  # Qwen3, not that the adapter has any capacity - and it keeps the checkpoint
+  # small enough that the upload below is testing the path rather than the link.
+  r: 8
+  alpha: 16
+  target_modules:
+    - q_proj
+    - v_proj
+
+training:
+  max_steps: 2
+  gradient_accumulation_steps: 2
+  save_steps: 2
+  save_total_limit: 1
+  benchmark_every: 2
+
+evaluation:
+  # Scored inside the run, as the `evaluation` stage: this profile exists to
+  # prove every stage runs. Same layout as `kd eval` writes later - and doing it
+  # here is what puts an evaluation/ directory in the bundle, which is the only
+  # way to prove the `evaluation` upload group actually ships.
+  #
+  # The real profile keeps this false on purpose: there, an hours-long scoring
+  # stacked in front of a hand-run upload is how an adapter gets lost when the
+  # credential expires.
+  after_training: true
+  samples: 8
+  # arena_file is inherited - the real eval-1to5hop.jsonl, all 142 rows - but
+  # only four of them are scored. That is enough to prove the stage works end to
+  # end: the file parses, three models load one after another without exhausting
+  # the machine, the <Answer> tag is found, the ratings come out. It is nowhere
+  # near enough to mean anything. Elo from four questions is noise; read the
+  # fact that the stage finished, not the numbers.
+  arena_limit: 4
+  # A two-step student does not emit an end-of-turn token, so it runs to this
+  # ceiling on every question and the arena is slower than the rest of the smoke
+  # test combined. arena_limit above is what keeps that bounded - four
+  # questions, not 142.
+  arena_max_new_tokens: 2048
+
+limits:
+  # None, like every other smoke profile here. Most of the wall clock is the
+  # one-time model download, which is exactly the shape a fixed ceiling gets
+  # wrong. The parent's max_cost_usd would be inert anyway - nothing is rented -
+  # but leaving it set would mean a confirm prompt on a laptop.
+  max_runtime_minutes: null
+  max_cost_usd: null
+  confirm_above_usd: null
+
+s3:
+  # ON, to the same bucket, prefix and upload groups as the pod run - inherited,
+  # not restated, so the two cannot drift.
+  #
+  # This is what makes the smoke test worth running for S3: it exercises the
+  # UPLOAD path, which needs s3:PutObject - a different permission from reading
+  # the teacher, and the one that decides whether a finished pod run survives
+  # the pod. Proving it here costs nothing; discovering it is missing at the end
+  # of a paid run costs the run. It also proves the two groups this profile
+  # added - `evaluation` and `checkpoints` - actually match files and ship.
+  #
+  # Nothing here DOWNLOADS from S3: the stand-in models come from the Hub and
+  # the corpus is on disk, so models.teacher is no longer an s3:// URI and
+  # paths.resolve_inputs has nothing to fetch.
+  #
+  # The bundle lands in its own folder, runs/enlibra-neuroscience-q3-14b-smoke-
+  # <date>-<time>/, so it cannot overwrite a real run - but it does put a smoke
+  # bundle in the production prefix. Set `enabled: false` if you would rather it
+  # did not, at the cost of the one thing this block is here to prove.
+  #
+  # `upload` is a non-gate stage: on a machine with no credentials it reports
+  # the failure and the run still finishes.
+  enabled: true
+
+runpod:
+  enabled: false

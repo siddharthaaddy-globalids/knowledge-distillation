@@ -1,0 +1,365 @@
+# ===========================================================================
+#  enLibra neuroscience curriculum - Qwen3-14B (SFT LoRA) -> Qwen3-8B
+#
+#  A rented-GPU profile, and a big one: see the memory note under `hardware`.
+#  It will not run on a laptop and it will not run on a 48 GB card.
+#
+#  THE 15-MINUTE CREDENTIAL, AND WHY UPLOAD IS RUN BY HAND
+#  ------------------------------------------------------
+#  The AWS session token this project is run with expires every 15 minutes.
+#  Training and evaluation both take far longer than that, so the pipeline's
+#  own upload stage - which runs LAST - is guaranteed to fail with
+#  ExpiredToken. Skip it, and ship the bundle afterwards with a fresh token:
+#
+#    SESSION 1, training:
+#      ./run.sh --config configs/enlibra/enlibraQ3-14B.yaml --skip upload
+#      # ... re-export fresh AWS_* credentials ...
+#      ./run.sh --config configs/enlibra/enlibraQ3-14B.yaml upload <run-id>
+#
+#    SESSION 2, evaluation, on a fresh pod:
+#      ./run.sh --config configs/enlibra/enlibraQ3-14B.yaml eval --skip upload \
+#          --adapter s3://enlibra/dss/dev/runs/20260818_215840_neuroscience_8f33eb7cf609/outputs/gkd/runs/<run-id>/final_adapter
+#      # ... re-export fresh AWS_* credentials ...
+#      ./run.sh --config configs/enlibra/enlibraQ3-14B.yaml \
+#          upload runs/<run-id>/evaluation/<eval-id>
+#
+#  Name the run explicitly in both uploads. With no argument `kd upload` takes
+#  "the latest run", which resolves through runs/latest.txt and then falls back
+#  to the alphabetically largest directory name - and run ids now lead with the
+#  profile, not the timestamp, so that fallback is not chronological.
+#
+#  What still needs a LIVE token is preflight, which fetches the teacher
+#  adapter (a few hundred MB) at the start of each session. That fits inside a
+#  15-minute window; the ~46 GB of base weights come from the Hub, not S3, so
+#  they need HF_TOKEN rather than AWS credentials.
+#
+#  THE CORPUS IS COMMITTED, DELIBERATELY
+#  -------------------------------------
+#  data/enlibra-neuroscience/ is in the repository, so a pod gets it from
+#  `git clone` with no download and no credentials - which matters more here
+#  than elsewhere, because credentials are the scarce thing in this setup.
+#
+#  It is built from the two exports in object storage, which kd.data CANNOT
+#  read directly: they are the bespoke multiple-choice shape (`question`,
+#  `answer`, `explanation`) and the loader understands only chat turns or
+#  Alpaca triples. Regenerate it whenever the exports change - the converter is
+#  deterministic, so unchanged exports leave `git status` clean:
+#
+#      BASE=s3://enlibra/dss/dev/runs/20260818_215840_neuroscience_8f33eb7cf609/outputs
+#      aws s3 cp $BASE/curriculum_verified/curriculum_verified.json .
+#      aws s3 cp $BASE/sft_dataset/curriculum_sft.json .
+#      python scripts/prepare_curriculum.py --out data/enlibra-neuroscience \
+#          curriculum_verified.json curriculum_sft.json
+#
+#  ORDER MATTERS. curriculum_verified.json is the superset - 1940 rows, and the
+#  only one carrying `split: eval` - so it goes first and supplies sft, rl and
+#  the held-out set. curriculum_sft.json is passed only for the 15 persona rows
+#  it alone carries; the converter drops its other 1474 rows as duplicates of
+#  what verified already wrote. Passing sft alone produces no eval file at all,
+#  which is a profile that cannot be scored.
+#
+#  data/enlibra-neuroscience/manifest.json records the sha1 of each export it
+#  was built from, which is what lets a checkout say which exports it holds.
+# ===========================================================================
+extends: _base.yaml
+
+project:
+  name: enlibra-neuroscience-q3-14b-to-8b
+
+models:
+  # The SFT LoRA adapter, not a merged export. preflight fetches the prefix,
+  # recognises it as an adapter (adapter_config.json + adapter_model.safetensors,
+  # a few hundred MB rather than ~30 GB), and splits it into base + adapter -
+  # see kd.paths.normalise_teacher. That is the better form when you have the
+  # choice: a merged checkpoint written by another framework often keeps that
+  # framework's key layout, and transformers does not raise on keys it cannot
+  # map - it randomly initialises them and warns. The teacher-check stage is a
+  # gate precisely to catch that, before any budget is spent.
+  teacher: s3://enlibra/dss/dev/runs/20260818_215840_neuroscience_8f33eb7cf609/outputs/sft_checkpoints/checkpoint-epoch-3
+
+  # MUST stay null. normalise_teacher returns early when this is set, which
+  # would leave `teacher` above treated as a whole model rather than as the
+  # adapter it is.
+  teacher_adapter: null
+
+  # The stock base the SFT started from, and the `teacher-base` player in the
+  # evaluation: how far the SFT moved it is the most there was to distil.
+  #
+  # This WINS over whatever base the adapter recorded. PEFT writes
+  # base_model_name_or_path at training time, and an adapter trained elsewhere
+  # usually records a path that exists on no machine but that one.
+  teacher_base: Qwen/Qwen3-14B
+
+  student: Qwen/Qwen3-8B
+
+  # Taken from the STUDENT. Both models are Qwen3 and share a vocabulary, which
+  # standard GKD requires - the loss is a divergence between two distributions
+  # over the same index set, and a mismatch there is silently meaningless
+  # rather than an error. The student's copy is the canonical Qwen3 tokenizer;
+  # the teacher side is a custom export whose tokenizer files are the part
+  # least worth trusting.
+  #
+  # Not verified against the Hub while writing this file, unlike the 8B->1.7B
+  # profile. preflight compares the two vocabularies and says so if they differ.
+  tokenizer: student
+
+hardware:
+  device: auto
+  # 14.8B + 8.19B parameters, both resident - the teacher frozen, the student
+  # training - is 46.0 GB of weights at bfloat16 before a single activation:
+  # 29.6 for the teacher, 16.4 for the student. Add LoRA gradients, AdamW state
+  # and activations and the working set is ~55-60 GB.
+  #
+  # This needs an 80 GB card: H100 80GB, H200, or A100 80GB. A 48 GB L40S -
+  # which is what the 8B->1.7B profile runs on - does NOT fit this pair, and
+  # the allocator will not politely refuse; it fails partway through the first
+  # forward pass, after the pod is already rented and both models downloaded.
+  dtype: bfloat16
+
+dataset:
+  source: ./data/enlibra-neuroscience
+
+  # To pull the corpus from object storage instead of the repository, point
+  # this at a prefix holding the PREPARED .jsonl files - dataset.source is in
+  # kd.paths.RESOLVABLE, so an s3:// value here is fetched into s3.cache_dir
+  # and rewritten to the local copy before anything reads it:
+  #
+  #     source: s3://enlibra/dss/dev/runs/20260818_.../outputs/gkd/corpus/
+  #
+  # It cannot point at the raw curriculum_sft.json export. That file has no
+  # `messages` column, and `format: alpaca` cannot reconstruct the completion
+  # either: the assistant turn is <Explanation>...</Explanation> followed by
+  # <Answer>, assembled from two columns, and alpaca_to_turns reads one.
+  # Training on `explanation` alone would drop the <Answer> tag that the arena
+  # parses, which turns every correct answer into an unanswered one.
+
+  # NO CAP. These are the budgets kd.data filters every sample against, and a
+  # sample over either is dropped SILENTLY, so they sit at Qwen3's full native
+  # context where the filter can never fire. max_total_tokens also becomes the
+  # collator's max_length, which is a TRUNCATION ceiling and not an allocation -
+  # real batches pad to the longest sample in the batch - so the headroom is
+  # free.
+  max_prompt_tokens: 32768
+  max_total_tokens: 32768
+
+  validation_size: 48
+
+  # kd.data's built-in synthetic prompts are general-purpose calibration for a
+  # general-purpose student. This one is deliberately narrow.
+  include_synthetic: false
+
+  # One domain per curriculum stage, so the mix is a number in this file rather
+  # than an accident of how many rows each export happened to contain. `quota`
+  # is how many samples to keep, `pool` how many rows to scan for them; there is
+  # no length filtering to survive here beyond the budgets above, so pool sits
+  # just above quota.
+  #
+  # SFT ONLY. The converter also writes rl-1to2hop.jsonl - 429 rows, the same
+  # multiple-choice shape, differing only in which curriculum stage routed them
+  # - and this profile deliberately does not name it. A file the domains do not
+  # name is never read, so the rows sit in the corpus directory unused; add a
+  # `curriculum-rl` domain pointing at it to bring them in.
+  #
+  # WHAT IS NOT HERE, for a different reason: eval-1to5hop.jsonl. Those 142
+  # rows are the score, named by evaluation.arena_file below, and a held-out
+  # set the student trained on measures nothing. Adding it here would silently
+  # inflate every number the arena reports.
+  #
+  # The persona is 1.1% of the mix, which is probably too thin to survive two
+  # epochs against thirteen hundred neuroscience questions. There is no way to
+  # weight it up from here - repeating a row in the file changes nothing after
+  # deduplication - so if the persona matters, the fix is more of them, phrased
+  # differently, in the export.
+  domains:
+    - name: curriculum-sft
+      data_files: sft-1to3hop.jsonl     # hops 1/2/3 = 770 / 320 / 279
+      quota: 1369
+      pool: 1400
+    - name: identity
+      data_files: identity.jsonl
+      quota: 15
+      pool: 20
+
+lora:
+  # r and alpha inherited from _base.yaml (128 / 256). Qwen3 is a standard
+  # dense transformer - no hybrid attention, no vision tower, no MTP head - so
+  # the plain Llama-style projection list reaches every layer.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+training:
+  # 1384 training rows (1369 sft + 15 persona) at an effective batch of 8 is
+  # ~173 steps per epoch, so this is roughly two passes. More than that on a
+  # corpus this size starts memorising the explanations rather than learning to
+  # produce them.
+  max_steps: 350
+  batch_size: 1
+  # Real batching would be cheaper in wall clock, but with 46 GB of weights
+  # already resident there is no room for it. Accumulation buys the same
+  # effective batch out of the memory that is left.
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-4
+  warmup: 0.05
+  # Tight on purpose. A run stopped by a limit, a spot pre-emption, or a
+  # dropped SSH session keeps only the last checkpoint - and on this card that
+  # is an expensive thing to lose.
+  save_steps: 50
+  save_total_limit: 2
+  benchmark_every: 100
+
+gkd:
+  # OFF-POLICY, and this is the setting to understand before changing anything
+  # else in this file.
+  #
+  # lmbda is the fraction of batches for which the student generates its own
+  # completion before the teacher scores it. Qwen3's chat template renders a
+  # prompt ending at `<|im_start|>assistant`, but renders a complete exchange
+  # with an empty think block in front of the answer. So on-policy the student
+  # generates from a position where Qwen3 opens a real reasoning chain, gets
+  # cut off at max_new_tokens mid-thought, and the teacher scores a fragment.
+  # Passing enable_thinking=False fixes it, but TRL's ChatML collator does not
+  # accept it.
+  #
+  # 0.0 sidesteps that entirely - no generation at all - and is several times
+  # faster, which on an 80 GB card is most of the bill. It gives up the
+  # on-policy correction that makes GKD better than plain KD; worth revisiting
+  # once this has produced a student worth correcting.
+  lmbda: 0.0
+  # Inert while lmbda is 0.0, and a runaway guard rather than a length when it
+  # is not. Generation length dominates GKD's cost: each on-policy sample is
+  # this many SEQUENTIAL forward passes against one for a supervised batch.
+  max_new_tokens: 8192
+  seq_kd: false
+
+evaluation:
+  # NOT run inside the training pipeline. Two reasons here, and the second is
+  # the one that matters: the teacher is resident on the training pod, which
+  # argues for scoring there - but a 15-minute credential means the training
+  # bundle has to be uploaded by hand the moment training ends, and stacking an
+  # hours-long evaluation in front of that upload is how an adapter gets lost
+  # when a pod is reclaimed. Train, upload, then score in a second session.
+  after_training: false
+  samples: 48
+  report_format: html
+
+  # The 142 rows carrying `split: eval` in curriculum_verified.json, which the
+  # converter wrote to their own file and reported as HELD OUT. Scored by the
+  # `arena` stage; leaving this null skips that stage entirely and leaves only
+  # fidelity against the teacher, which says how CLOSE the student got and
+  # nothing about whether either model is right.
+  #
+  # Four players: the stock Qwen3-8B, the distilled student, the stock
+  # Qwen3-14B the teacher was tuned from, and the teacher. Accuracy says how
+  # often each is right; Elo says how often each is right WHERE THE OTHERS ARE
+  # NOT, which is the part accuracy cannot show when the models agree on most
+  # of the set.
+  #
+  # EXPECT A LOWER NUMBER than the training distribution would give. These
+  # questions run to 5 hops (1/2/3/4/5 = 9 / 4 / 49 / 44 / 36) where training
+  # tops out at 3, so 80 of the 142 ask for a reasoning chain a step or two
+  # longer than the student has ever been shown. That is a generalisation test,
+  # not a broken run.
+  arena_file: ./data/enlibra-neuroscience/eval-1to5hop.jsonl
+  # No practical cap. The answer sits AFTER a ~300-token explanation, so a
+  # tight ceiling scores a truncated response as "never answered" rather than
+  # as wrong, which understates the model for a reason that has nothing to do
+  # with what it learned. Generation stops at end-of-turn, so a model that
+  # answers properly never pays for the headroom. One that rambles does - and
+  # the `unanswered` column is where that shows, which is worth seeing rather
+  # than hiding.
+  arena_max_new_tokens: 8192
+  arena_elo_rounds: 25
+
+# Generated every benchmark_every steps to make drift visible during the run.
+# Short on purpose: kd.train's probe generates 48 tokens, so a prompt whose
+# correct answer is a 300-token explanation only ever shows its opening. These
+# two show what breaks first - the persona, and whether the student still
+# reaches for the answer format at all.
+benchmark_prompts:
+  - Who are you?
+  - Explain in two sentences what myelin does.
+
+limits:
+  # No wall-clock ceiling. A clock does not pause a run, it KILLS it mid-epoch,
+  # keeping only the last save_steps checkpoint - and the thing it would be
+  # sized against here is a ~46 GB download whose duration nobody can predict.
+  max_runtime_minutes: null
+  # INERT unless KD_PRICE_PER_HOUR is exported. The cost cap is computed from
+  # that rate, which `kd runpod launch` sets to the price it agreed to pay; on
+  # a pod started by hand nothing sets it, so export it yourself if you want
+  # this ceiling to mean anything:
+  #     export KD_PRICE_PER_HOUR=2.79
+  # An 80 GB card is roughly $2-3/hour, so this is ~15 hours of headroom. On
+  # breach the run stops hard and the pod is terminated, and what survives is
+  # the last checkpoint - which is why save_steps above is 50.
+  max_cost_usd: 40.00
+  confirm_above_usd: 10.00
+
+s3:
+  # Required, not optional: models.teacher is an s3:// URI and preflight
+  # refuses to fetch it while this is false.
+  enabled: true
+  bucket: enlibra
+  # Bundles land beside the SFT run they were distilled from, in that run's own
+  # outputs/ tree. kd.remote.s3.run_prefix appends `runs/<run-id>`, so a full
+  # bundle URI is
+  #   s3://enlibra/dss/dev/runs/20260818_215840_neuroscience_8f33eb7cf609/outputs/gkd/runs/<run-id>/
+  # and each run keeps its own folder rather than overwriting the last.
+  prefix: dss/dev/runs/20260818_215840_neuroscience_8f33eb7cf609/outputs/gkd
+  # Credentials come from the environment, never from this file. The identity
+  # needs s3:ListBucket on the bucket plus s3:GetObject on the SFT prefix to
+  # READ, and s3:PutObject on the prefix above to WRITE.
+  #
+  # Two entries here that the other enlibra profiles leave out.
+  #
+  # `evaluation` covers evaluation/**, where a scoring done inside a training
+  # run lands. Without it that whole tree is silently left behind. It costs
+  # nothing when the directory is absent, which is the case for a train-only
+  # bundle.
+  #
+  # `checkpoints` covers checkpoints/**, which is optimizer state - the only
+  # thing a resumed run reads, and normally not worth shipping. It is here
+  # because a 15-minute credential means every run is one expired token away
+  # from having produced nothing you can get at, and the last checkpoint is
+  # what survives a hard stop, a spot reclaim or a dropped SSH session.
+  #
+  # KNOW WHAT THIS COSTS. LoRA r=128 over seven projections of Qwen3-8B is
+  # ~349M trainable parameters: ~0.7 GB of adapter plus ~2.8 GB of fp32 AdamW
+  # state, so ~3.5 GB per checkpoint and ~7 GB at save_total_limit 2 - against
+  # ~0.7 GB for `adapter` alone. On a slow pod uplink that is the difference
+  # between an upload that fits inside the token window and one that does not.
+  # Drop `checkpoints` from this list and pass --with-checkpoints on the
+  # `kd upload` calls that want them, if you would rather decide per run.
+  #
+  # A run stopped by a limit adds this group by itself (pipeline.py:1061), so
+  # the rescue path is covered either way.
+  upload: [adapter, logs, report, metrics, evaluation, checkpoints]
+
+runpod:
+  # Only read by `kd runpod launch`. The by-hand path - a pod you started
+  # yourself - ignores this block and takes its cost ceiling from
+  # KD_PRICE_PER_HOUR instead.
+  #
+  # Note that `kd runpod launch` runs `kd pipeline` and nothing else: it cannot
+  # run the evaluation session, and it cannot pass --skip upload. For this
+  # profile's workflow, rent the pod and drive ./run.sh on it by hand.
+  enabled: true
+  # 46 GB of weights plus activations. `kd runpod gpus --config <this file>`
+  # prints the exact names this account can see; the launcher rents the one
+  # named here and no other, and never substitutes on your behalf.
+  gpu_type: H100 80GB PCIe
+  max_price_per_hour: 3.50
+  # Spot is cheaper and can be reclaimed mid-run. That is survivable here only
+  # because save_steps is 50 - and a reclaimed pod still loses everything not
+  # yet uploaded, which with a 15-minute token is everything.
+  spot: false
+  # Qwen3-14B (~30 GB) and Qwen3-8B (~16 GB) both land in HF_HOME on the
+  # volume, alongside the teacher adapter, the run bundle and its checkpoints.
+  volume_gb: 200
+  container_disk_gb: 40
