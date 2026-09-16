@@ -332,13 +332,22 @@ def main(args=None):
     workdir = pathlib.Path(args.keep) if args.keep else pathlib.Path(tempfile.mkdtemp())
     merged_dir = workdir / "merged"
     print(f"\n[2/3] Merging adapter into {info['base']} ({args.dtype})...")
-    from peft import PeftModel
-    base = AutoModelForCausalLM.from_pretrained(info["base"], dtype=dtype,
-                                                low_cpu_mem_usage=True)
-    model = PeftModel.from_pretrained(base, str(adapter_dir)).merge_and_unload()
+    # Through kd.merge, which trims the base's output layer to the width the
+    # adapter was built against first. This file used to merge directly, and an
+    # adapter trained against a vocabulary-trimmed teacher could not be
+    # published at all: PEFT refused the state dict on a shape mismatch that
+    # kd.arena had already solved two files away.
+    #
+    # No config is passed. Every adapter kd.train writes carries kd-meta.json,
+    # and the routes that read the adapter directory are the ones that work when
+    # publishing from a machine that never saw the training config.
+    from . import merge as kd_merge
+
+    model = kd_merge.merge_adapter(str(adapter_dir), info["base"],
+                                   tokenizer_length=len(tokenizer), dtype=dtype)
     model.save_pretrained(str(merged_dir))
     tokenizer.save_pretrained(str(merged_dir))
-    del model, base
+    del model
     size = sum(f.stat().st_size for f in merged_dir.glob("*.safetensors"))
     print(f"  -> {merged_dir} ({size / 1e9:.2f} GB)")
 

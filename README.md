@@ -143,7 +143,7 @@ kd eval        Score an adapter, into its bundle     kd doctor      Environment 
 kd train       Just training                         kd ui          Browser control panel
 kd evaluate    Fidelity vs the teacher, standalone   kd runpod      Rent a GPU (optional)
 kd arena       Accuracy + Elo on an answer key       kd upload      Re-ship a run or an evaluation to S3
-kd publish     To the Hugging Face Hub
+kd quantize    Pack the student to W4A16 for vLLM    kd publish     To the Hugging Face Hub
 
 kd check-teacher      Is this teacher fit to distil from?
 kd fix-teacher        Repair a checkpoint with mislabelled tensors
@@ -203,6 +203,8 @@ Full key-by-key reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 | `configs/enlibra/enlibraQ3-8B.yaml` | An RL-tuned Qwen3-8B → Qwen3-1.7B on the enLibra space curriculum. Needs a 48 GB GPU. |
 | `configs/enlibra/enlibraQ3-8B-smoke.yaml` | The same run with stand-in models, small enough for a 16 GB laptop. Two steps — proves the plumbing. |
 | `configs/enlibra/enlibraQ3-8B-mac.yaml` | Stand-in models again, but the **full** schedule and the whole evaluation. Hours, free, and it answers whether distillation works on this data. |
+| `configs/enlibra/enlibraQ3-14B.yaml` | The SFT-tuned Qwen3-14B → Qwen3-8B, on the neuroscience curriculum. The largest pair here; needs an 80 GB GPU. |
+| `configs/enlibra/enlibraQ3-14B-smoke.yaml` | The same pair with stand-in models, small enough to prove the plumbing on a laptop. |
 
 The training profiles end with the adapter in the bucket and do not evaluate;
 the smoke, flow and mac profiles set `evaluation.after_training: true` because
@@ -334,14 +336,15 @@ do not track each other:
 - **Fidelity** — does the student reproduce the *teacher's* predictions? Top-1
   agreement, KL divergence.
 - **Capability** — is the student actually better at the task? Held-out
-  perplexity, optionally lm-eval benchmarks.
+  perplexity.
 
-Four models are scored, each answering a question the others cannot:
+Five models are scored, each answering a question the others cannot:
 
 | Player | | What it tells you |
 |---|---|---|
 | `base` | the stock student, no adapter | The control. "The small model could already do this" lives here. |
 | `distilled` | the student plus the adapter | The result. |
+| `distilled-w4a16` | the same student, packed to 4 bits | What ships. Scored beside `distilled` because what quantization cost is a **difference**, and one column cannot carry one. Skipped when nothing has been packed. |
 | `teacher-base` | the stock model the teacher was fine-tuned from | What the fine-tune bought the **teacher** — the most there was to distil. Needs `models.teacher_base`, or a teacher given as base + adapter. |
 | `teacher` | the fine-tuned teacher | The ceiling, and the reference every closeness figure is measured against. |
 
@@ -349,7 +352,8 @@ Four models are scored, each answering a question the others cannot:
 base against distilled without loading eight gigabytes of weights.
 
 `kd evaluate` and `kd arena` remain as standalone tools for one measurement at
-a time. `--tasks ifeval` and `--gen-similarity 20` need `uv sync --extra eval`.
+a time. `kd evaluate --quantized DIR` scores a packed checkpoint on the same
+tokens as the dense one, which is what isolates the cost of quantization.
 
 ### The teacher can be a LoRA adapter
 
@@ -419,6 +423,9 @@ src/kd/
   data.py         dataset assembly
   train.py        GKD training
   evaluate.py     fidelity and capability
+  merge.py        adapter + base -> one dense checkpoint, vocabulary trap and all
+  quantize.py     W4A16 packing, for the checkpoint that actually ships
+  vllm_runner.py  the arena's generation batched through vLLM, in a subprocess
   report.py       Markdown and self-contained HTML
   teacher.py      loading and verifying a teacher
   teacher_fix.py  repairing a mislabelled checkpoint
@@ -442,8 +449,9 @@ for t in tests/*.py; do uv run python "$t"; done
 ```
 
 They cover config precedence and validation, run bundles and their failure paths,
-pipeline gating and limits, the runner templates, S3, and — with fake SDKs — GPU
-selection and the terminate guarantee.
+pipeline gating and limits, the answer parser, the merge helper's vocabulary
+routes, the vLLM engine's plumbing (without vLLM installed), the runner
+templates, S3, and — with fake SDKs — GPU selection and the terminate guarantee.
 
 ## Further reading
 

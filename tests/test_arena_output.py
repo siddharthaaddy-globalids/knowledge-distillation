@@ -54,11 +54,22 @@ SAID = {
 }
 GOLD = ["B", "C"]
 
+# Every player these runs actually produce. Not arena.PLAYERS: that also names
+# `distilled-w4a16`, and nothing here quantises anything, so the packed student
+# is correctly absent from the output.
+PLAYED = tuple(p for p in arena.PLAYERS if p != arena.QUANTIZED)
+
 
 def fake_play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
-              players=arena.PLAYERS, show=0):
-    """What play() returns, without loading anything."""
+              players=arena.PLAYERS, show=0, **engine_options):
+    """What play() returns, without loading anything.
+
+    **engine_options swallows `engine` and `vllm_options`: which generator ran is
+    not a fact about the output layout these tests cover, and pinning the exact
+    signature here means every new knob on play() breaks eleven unrelated tests.
+    """
     count = len(questions)
+    players = [p for p in players if p in SAID]
     completions = {name: SAID[name][:count] for name in players}
     predictions, formats, unanswered = {}, {}, {}
     for name in players:
@@ -79,18 +90,8 @@ def fake_load_questions(path):
             for i, gold in enumerate(GOLD, start=1)], 0
 
 
-def fake_similarity(completions, questions, model_name=None, log=None):
-    names = sorted(completions)
-    return {"model": "stub", "hops": ["2"],
-            "pairs": {f"{a} vs {b}": {
-                "overall": 0.8,
-                "by_hop": {"2": {"n": len(questions), "cosine": 0.8}}}
-                for i, a in enumerate(names) for b in names[i + 1:]}}
-
-
 arena.play = fake_play
 arena.load_questions = fake_load_questions
-arena.similarity = fake_similarity
 
 ROOT = tempfile.mkdtemp(prefix="kd-arena-output-")
 _counter = [0]
@@ -103,6 +104,10 @@ def run(**overrides):
     args = argparse.Namespace(
         config=None, adapter=None, file="./stub.jsonl", limit=None, show=0,
         skip=[], max_new_tokens=None, device="cpu",
+        # hf explicitly: the base config now defaults to vllm, which refuses to
+        # run where vLLM is absent rather than silently falling back - and every
+        # test in this file is about the OUTPUT, with play() stubbed out.
+        engine="hf", quantized=None,
         json=os.path.join(directory, "arena.json"), report=None, no_save=False)
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -157,19 +162,25 @@ def test_the_transcript_holds_every_word_of_every_player():
     first = lines[0]
     assert first["gold"] == "B", first
     assert "Q1?" in first["asked"], first
-    assert set(first["players"]) == set(arena.PLAYERS), first["players"]
+    assert set(first["players"]) == set(PLAYED), first["players"]
     # The full text, not a truncated sample: this file is the only record of it.
     assert first["players"]["base"]["completion"] == SAID["base"][0], first["players"]
     assert first["players"]["teacher"]["correct"] is True, first["players"]
     assert first["players"]["base"]["correct"] is False, first["players"]
 
 
-def test_the_report_carries_the_answer_key_and_the_similarity():
+def test_the_report_carries_the_answer_key_and_where_the_questions_went():
     _code, directory = run()
     with open(os.path.join(directory, "arena-report.html"), encoding="utf-8") as fh:
         html = fh.read()
     assert "Produced a parseable answer" in html
-    assert "alike are the explanations" in html
+    # Correct / wrong / never-committed, which is the table that separates a
+    # model that is ignorant from one that is merely reticent.
+    assert "Where the questions went" in html
+    assert "Never committed to a letter" in html
+    # The eval rows carry a hop depth, so the generalisation tables are there.
+    assert "Accuracy by reasoning depth" in html
+    assert "Answer rate by reasoning depth" in html
 
 
 def test_json_flag_moves_all_three():
@@ -192,35 +203,6 @@ def test_no_save_writes_nothing():
 # --------------------------------------------------------------------------- #
 # Nothing after generation may cost the run
 # --------------------------------------------------------------------------- #
-def test_a_failed_similarity_download_does_not_lose_the_run():
-    """It downloads an embedding model. It used to run before the first write."""
-    with raises(arena, "similarity", RuntimeError("connection reset by peer")):
-        code, directory = run()
-    assert code == 0, code
-    assert "arena.json" in files(directory), files(directory)
-    assert "arena-transcript.jsonl" in files(directory), files(directory)
-    assert "arena-report.html" in files(directory), files(directory)
-
-    payload = load(directory)
-    assert payload["similarity"] is None, payload["similarity"]
-    # The measurements themselves are untouched.
-    assert payload["players"]["teacher"]["accuracy"] == 1.0, payload["players"]
-
-
-def test_a_missing_similarity_omits_a_table_not_a_report():
-    """sentence-transformers absent returns None rather than raising."""
-    real = arena.similarity
-    arena.similarity = lambda *a, **k: None
-    try:
-        code, directory = run()
-    finally:
-        arena.similarity = real
-    assert code == 0, code
-    assert "arena-report.html" in files(directory), files(directory)
-    with open(os.path.join(directory, "arena-report.html"), encoding="utf-8") as fh:
-        assert "alike are the explanations" not in fh.read()
-
-
 def test_a_failed_transcript_still_leaves_the_numbers_and_the_report():
     with raises(arena, "write_transcript", OSError("no space left on device")):
         code, directory = run()
@@ -238,7 +220,7 @@ def test_a_failed_report_still_leaves_the_numbers_and_the_transcript():
 
 
 def test_the_payload_carries_closeness_to_the_teacher():
-    """The headline block, with the explanation column filled in after similarity."""
+    """The headline block: how often each student gave the teacher's letter."""
     code, directory = run()
     assert code == 0
     close = load(directory)["closeness"]
@@ -247,7 +229,6 @@ def test_the_payload_carries_closeness_to_the_teacher():
     # distilled matched the teacher's letter on both questions; base on one.
     assert close["players"]["distilled"]["same_answer"] == 2, close
     assert close["players"]["base"]["same_answer"] == 1, close
-    assert close["players"]["distilled"]["explanation_cosine"] == 0.8, close
     html = open(os.path.join(directory, "arena-report.html"), encoding="utf-8").read()
     assert ">100%<" in html and "gives the teacher's answer" in html
 
@@ -257,7 +238,7 @@ def test_the_payload_names_what_was_scored():
     payload = load(directory)
     assert payload["arena_file"] == "./stub.jsonl", payload["arena_file"]
     assert payload["questions"] == len(GOLD), payload["questions"]
-    assert set(payload["players"]) == set(arena.PLAYERS)
+    assert set(payload["players"]) == set(PLAYED)
 
 
 def test_players_come_from_the_config_and_skip_wins():

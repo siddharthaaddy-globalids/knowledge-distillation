@@ -417,6 +417,73 @@ def stage_train(ctx):
     return summary
 
 
+def stage_quantize(ctx):
+    """Pack the distilled student to 4-bit weights, as a checkpoint vLLM loads.
+
+    After training and before evaluation, so the arena can score the packed
+    student beside the dense one and the report can say what the packing cost.
+    Not a gate: a failed quantization is a missing column, and throwing away a
+    good adapter over it would be the wrong trade by a wide margin.
+
+    The output goes to the shared cache rather than into the run directory. The
+    run bundle is uploaded wholesale, and a 5 GB checkpoint that `kd publish`
+    ships separately does not also need to be in the run's own S3 prefix.
+    """
+    from transformers import AutoTokenizer
+
+    from . import merge, paths, quantize
+
+    settings = ctx.config.get("quantization") or {}
+    adapter = ctx.results.get("adapter") or ctx.resolve_adapter()
+    if not adapter:
+        raise StageFailed("nothing to quantize: this run produced no adapter")
+
+    calibration = settings.get("calibration_file") or ctx.config["dataset"].get("source")
+    calibration = (ctx.config.get("evaluation") or {}).get("arena_file") \
+        if not str(calibration or "").endswith(".jsonl") else calibration
+    if not calibration or not os.path.isfile(str(calibration)):
+        raise StageFailed(
+            "nothing to calibrate on. Set quantization.calibration_file to the "
+            "training .jsonl - GPTQ measures its rounding against the rows the "
+            "student will actually be asked to produce, and generic text tunes "
+            "it for a distribution this model never sees.")
+
+    base_id = paths.base_for_adapter(adapter, ctx.config["models"]["student"],
+                                     log=ctx.log)
+    source = adapter if os.path.isfile(
+        os.path.join(str(adapter), "tokenizer_config.json")) else base_id
+    tokenizer = AutoTokenizer.from_pretrained(source)
+
+    # vLLM and GPTQ both want a dense checkpoint, and this is the same merge the
+    # arena's distilled player uses - so the model that gets packed is exactly
+    # the model the dense column scores.
+    dense = merge.materialise(paths.merged_cache(ctx.config, adapter), base_id,
+                              adapter, config=ctx.config, tokenizer=tokenizer,
+                              log=ctx.log)
+    scheme = settings.get("scheme") or "W4A16"
+    out = settings.get("output_dir") or paths.quantized_cache(ctx.config, adapter,
+                                                              scheme)
+    try:
+        written = quantize.quantize(
+            dense, out, calibration, scheme=scheme,
+            group_size=int(settings.get("group_size") or 128),
+            ignore=settings.get("ignore"),
+            samples=int(settings.get("calibration_samples") or 128),
+            max_seq_length=int(settings.get("max_seq_length") or 2048),
+            dampening=float(settings.get("dampening") or 0.01),
+            log=ctx.log)
+    except RuntimeError as exc:
+        raise StageFailed(str(exc)) from exc
+
+    facts = quantize.summarise(written, source=dense)
+    if facts.get("compression"):
+        ctx.log.info(f"      {facts['dense_bytes'] / 1e9:.2f} GB -> "
+                     f"{facts['bytes'] / 1e9:.2f} GB "
+                     f"({facts['compression']:.1f}x smaller)")
+    ctx.run.write_metrics({"quantization": facts})
+    return {"quantized_model": written, "quantization": facts}
+
+
 def stage_evaluation(ctx):
     """Score this run's adapter, inside the run, as one stage of the training.
 
@@ -559,6 +626,21 @@ def stage_eval_preflight(ctx):
         settings["arena_file"] = arena_file
         ctx.log.info(f"  answer key: {arena_file}")
 
+        # The generation engine, checked here for the same reason the answer key
+        # is: `engine: vllm` on a machine with no vLLM is a failure worth having
+        # in seconds, not after the teacher has been pulled out of the bucket.
+        engine = str(settings.get("engine") or "hf").lower()
+        if engine not in arena.ENGINES:
+            raise StageFailed(f"unknown evaluation.engine {engine!r}; valid: "
+                              f"{', '.join(arena.ENGINES)}")
+        if engine == "vllm":
+            from . import vllm_runner
+
+            reason = vllm_runner.unavailable_reason()
+            if reason:
+                raise StageFailed(reason)
+        ctx.log.info(f"  engine    : {engine}")
+
     destination = None
     if (ctx.config.get("s3") or {}).get("enabled"):
         try:
@@ -576,7 +658,7 @@ def stage_evaluate(ctx):
     """Score the adapter against the teacher on the held-out split."""
     import argparse
 
-    from . import evaluate, paths
+    from . import arena, evaluate, paths
 
     ctx.ensure_inputs()
 
@@ -588,8 +670,7 @@ def stage_evaluate(ctx):
             f"Train one first, or name it with --adapter.")
 
     settings = ctx.config.get("evaluation") or {}
-    players = list(settings.get("players") or ["base", "distilled", "teacher-base",
-                                                "teacher"])
+    players = list(settings.get("players") or arena.PLAYERS)
     payload_path = ctx.run.path("evaluation.json")
     args = argparse.Namespace(
         config=ctx.config["_meta"].get("source"),
@@ -603,12 +684,9 @@ def stage_evaluate(ctx):
         samples=int(settings.get("samples") or 50),
         device=ctx.hardware["device"],
         dtype="auto",
-        tasks=settings.get("tasks"),
-        limit=settings.get("limit"),
         no_generations=False,
-        gen_similarity=int(settings.get("gen_similarity") or 0),
-        no_rescale=False,
-        similarity_model=settings.get("similarity_model") or "roberta-large",
+        quantized=(ctx.results.get("quantize") or {}).get("quantized_model")
+        or arena.resolve_quantized(ctx.config, adapter),
         json=payload_path,
         # The report is a stage of its own, so nothing is written here.
         report=None,
@@ -663,23 +741,42 @@ def stage_arena(ctx):
     if "teacher" in players or "teacher-base" in players:
         ctx.ensure_inputs()
 
+    engine = str(settings.get("engine") or "vllm").lower()
+    # The packed student, from this run's quantize stage when it ran, else from
+    # the cache a previous one wrote. Skipped, not failed, when nothing has been
+    # packed: four players is still an arena.
+    quantized = (ctx.results.get("quantize") or {}).get("quantized_model") \
+        or arena.resolve_quantized(ctx.config, adapter, log=ctx.log)
+    if arena.QUANTIZED in players and not quantized:
+        players = tuple(p for p in players if p != arena.QUANTIZED)
+        ctx.log.info(f"      {arena.QUANTIZED} skipped: nothing packed for this "
+                     f"adapter")
+
     ctx.log.info(f"      {len(questions)} held-out questions from {path}")
     ctx.log.info(f"      players: {', '.join(players)}")
     predictions, formats, unanswered, completions = arena.play(
         ctx.config, ctx.hardware, adapter, questions,
         max_new_tokens=int(settings.get("arena_max_new_tokens") or 512),
-        log=ctx.log, players=players)
+        log=ctx.log, players=players, engine=engine,
+        vllm_options=settings.get("vllm"), quantized=quantized)
 
     payload = arena.summarise(
         predictions, [q["gold"] for q in questions],
         formats=formats, unanswered=unanswered,
         rounds=int(settings.get("arena_elo_rounds") or 25),
-        seed=int(ctx.config["project"]["seed"]))
+        seed=int(ctx.config["project"]["seed"]),
+        questions=questions, completions=completions)
     payload["arena_file"] = str(path)
     payload["adapter"] = str(adapter)
-    # Present from the first write, so the file always says whether there is a
-    # similarity table rather than leaving a reader to infer it from absence.
-    payload["similarity"] = None
+    # Which engine generated these completions. Recorded because hf and vllm are
+    # not bit-identical (see arena.ENGINES), so a payload that does not say
+    # cannot be compared with another payload at all.
+    payload["engine"] = engine
+    payload["quantized"] = str(quantized) if quantized else None
+    if quantized:
+        from . import quantize as kd_quantize
+
+        payload["quantization_config"] = kd_quantize.summarise(quantized)
 
     # Written before the similarity table is computed, not after. Generation is
     # the hours-long unrepeatable part; similarity downloads an embedding model,
@@ -705,25 +802,9 @@ def stage_arena(ctx):
     except Exception as exc:  # noqa: BLE001 - the numbers are already on disk
         ctx.log.warning(f"      !! could not write the transcript: {exc}")
 
-    # Optional, and reported as absent rather than failing: the similarity table
-    # needs sentence-transformers, which is in the `eval` extra a pod install
-    # deliberately skips.
-    try:
-        payload["similarity"] = arena.similarity(completions, questions,
-                                                 log=ctx.log)
-    except Exception as exc:  # noqa: BLE001 - a download, an encode, a disk
-        payload["similarity"] = None
-        ctx.log.warning(f"      !! similarity skipped: {exc}")
-    if payload.get("similarity"):
-        payload["closeness"] = arena.closeness(payload)   # now with explanations
-        write_payload()
-
     ctx.log.info("")
     for line in arena.render(payload).splitlines():
         ctx.log.info(line)
-    if payload.get("similarity"):
-        for line in arena.render_similarity(payload["similarity"]).splitlines():
-            ctx.log.info(line)
     ctx.run.write_metrics({"arena": payload["players"],
                            "closeness": payload.get("closeness")})
     ctx.run.event("arena", "ratings", **payload["players"])
@@ -851,6 +932,7 @@ STAGES = {
     "teacher-check": stage_teacher_check,
     "smoke": stage_smoke,
     "train": stage_train,
+    "quantize": stage_quantize,
     "evaluation": stage_evaluation,
     "publish": stage_publish,
     "upload": stage_upload,
@@ -872,6 +954,7 @@ EVAL_STAGES = {
 CONDITIONAL = {
     "publish": ("publish", "enabled", "publish.enabled is false"),
     "upload": ("s3", "enabled", "s3.enabled is false"),
+    "quantize": ("quantization", "enabled", "quantization.enabled is false"),
     "evaluation": ("evaluation", "after_training",
                    "evaluation.after_training is false - score it later with kd eval"),
 }

@@ -87,8 +87,9 @@ minutes of paid GPU time. It writes `/workspace/kd-env.sh` so a second SSH
 session is one `source` away from a working shell.
 
 Everything it does not recognise is passed through, so it is also how you run the
-checks below. `--setup-only` stops after the install; `--extra eval` adds the
-benchmark group; `KD_DISPATCH_ONLY=1` prints the command it would run and exits.
+checks below. `--setup-only` stops after the install; `--extra serve` adds vLLM
+and `--extra quantize` adds llm-compressor; `KD_DISPATCH_ONLY=1` prints the
+command it would run and exits.
 
 ### Rehearsing it before you rent anything
 
@@ -223,10 +224,10 @@ Run `kd evaluate` on its own only when you want one measurement the pipeline
 does not produce by default:
 
 ```bash
-# benchmark tasks and generation similarity - needs `uv sync --extra eval`,
-# which the pod install deliberately skips
-kd evaluate --config configs/qwen/finance.yaml \
-  --adapter ./runs/<run-id>/final_adapter --tasks ...
+# score a packed checkpoint on the same tokens as the dense student, which
+# is what separates the cost of quantization from the cost of distillation
+kd evaluate --config configs/enlibra/enlibraQ3-14B.yaml \
+  --adapter ./runs/<run-id>/final_adapter --quantized ./packed
 ```
 
 If `scp` is awkward - a proxied SSH connection, or a pod with no public IP - the

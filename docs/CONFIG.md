@@ -160,7 +160,58 @@ A second, different measurement, for datasets that have a **correct answer**.
 | `arena_max_new_tokens` | `2048` | The answer sits *after* the explanation, so too small a value scores as "never answered" rather than as wrong. |
 | `arena_elo_rounds` | `25` | Shuffled orderings to average Elo over. Sequential Elo depends on match order; averaging removes that, and the reported spread is the noise floor. |
 | `arena_limit` | `null` | Score only the first N questions. For proving the stage runs, not for a real score. |
+| `engine` | `vllm` | How completions are generated: `vllm` (the whole set batched, CUDA and Linux only) or `hf` (transformers, one at a time, runs anywhere). **No profile overrides this** — see below. |
+| `vllm` | see below | Engine settings, used only when `engine: vllm`. |
 | `teacher_check_max_new_tokens` | `2048` | How much of the teacher's answer the `teacher-check` stage prints. Not a quality setting — the check reads the first token's distribution — but the text is what a person looks at, and an answer cut off mid-sentence tells them nothing. |
+
+#### `engine: vllm`
+
+The arena is the longest thing the pipeline does. Five players over ~140
+questions at `arena_max_new_tokens: 8192` is 700 sequential generations under
+`hf`, and one batch per player under `vllm` — which is the workload continuous
+batching exists for, since every prompt is known before the first token.
+
+```yaml
+evaluation:
+  engine: vllm
+  vllm:
+    gpu_memory_utilization: 0.85   # lower it if a player is killed during load
+    max_model_len: null            # null sizes it to the longest prompt + the ceiling
+    enforce_eager: true            # skip CUDA graph capture: less memory, less variance
+    tensor_parallel_size: 1        # cards per player
+```
+
+**Every profile uses it. None overrides it.** That uniformity is the point: the
+two engines are not bit-identical, so if the laptop profiles scored under `hf`
+and the real ones under `vllm`, a smoke run would stop being a rehearsal of the
+real run and become a rehearsal of a different measurement.
+
+Three things that follow from it:
+
+- **CUDA and Linux only.** vLLM publishes no Windows wheel, and it is an
+  optional extra (`serve`) rather than a dependency — it needs a CUDA build of
+  torch, which the project otherwise pins to the CPU index. `docker/Dockerfile.cuda`
+  installs it; build with `--build-arg WITH_VLLM=0` to leave it out. A machine
+  without it fails at **preflight**, before any weights are fetched, rather than
+  falling back — the same rule `run.sh` states for profiles.
+- **To score on a Mac or a Windows box, ask on the command line**, where it is a
+  visible choice rather than a hidden default:
+
+  ```bash
+  kd arena --engine hf --config configs/enlibra/enlibraQ3-8B-smoke.yaml
+  kd eval --set evaluation.engine=hf --config configs/smollm/smoke.yaml
+  ```
+
+  The engine is recorded in `arena.json` and shown in the report, so a run
+  scored that way says so. Do not compare it against one scored under `vllm`:
+  both decode greedily from identical token ids — prompts are rendered and
+  tokenised by the arena's own tokenizer and the *ids* are what reach vLLM, so a
+  chat template cannot drift between them — but not through the same kernels,
+  and two floating-point paths through an 8B model do not agree on every token.
+- **The distilled player gets merged first.** vLLM cannot be handed base +
+  adapter, so the merge lands in `~/.cache/kd/merged/` — outside the run bundle,
+  which is uploaded wholesale — and is reused by later runs against the same
+  adapter.
 
 The players (`evaluation.players`) are rated against each other question by
 question: the **base** student (no adapter, the control), the **distilled**
@@ -171,10 +222,11 @@ capability did not; teacher level with teacher-base means the fine-tune gave the
 teacher nothing to pass on.
 
 The headline is **closeness to the teacher**, not accuracy: how often each
-student gave the teacher's answer, and (when `sentence-transformers` is
-installed) how alike its explanations are. It is written to `arena.json` under
+student gave the teacher's answer. It is written to `arena.json` under
 `closeness` and to `metrics.json`, and it is the number the report leads with.
-Accuracy and Elo are reported beneath it as context.
+Accuracy and Elo are reported beneath it as context, and beneath those the
+breakdown by reasoning depth — three tables, because accuracy, answer rate and
+accuracy-when-answered fail apart and one table cannot show which moved.
 
 Whichever way it runs — as a stage of `kd eval` or as `kd arena` — it writes
 `arena.json` (the numbers, including the hop-wise cosine between the players'
@@ -248,13 +300,9 @@ number of evaluations and nothing is ever overwritten.
 | `adapter` | `null` | What `kd eval` scores: an adapter directory, a file inside one, or an `s3://` URI. `null` means `--adapter` on the command line, else the newest adapter under `project.runs_dir`. |
 | `name` | `null` | What the evaluation is for — `full`, `quick`, `after-parser-fix`. Leads the directory name. `null` uses the profile name. |
 | `after_training` | `false` | `true` runs the evaluation **inside** `kd pipeline`, as its `evaluation` stage, right after training — the pod already has the teacher resident. Same output layout either way. |
-| `players` | `[base, distilled, teacher-base, teacher]` | Who is scored. `teacher-base` is skipped with a note when the base is unknown; drop `teacher` and `teacher-base` to compare base against distilled without loading the teacher. |
+| `players` | `[base, distilled, distilled-w4a16, teacher-base, teacher]` | Who is scored. `distilled-w4a16` is skipped when nothing has been packed and `teacher-base` when the base is unknown; drop `teacher` and `teacher-base` to compare the students without loading the teacher. |
 | `stages` | preflight, evaluate, arena, report, upload | What `kd eval` walks; the same `{name, gate}` shape as `pipeline.stages`. |
 | `samples` | `50` | Held-out samples scored for fidelity and perplexity. |
-| `tasks` | `null` | lm-eval task list, e.g. `"ifeval,arc_easy"`. Needs `uv sync --extra eval`. Slow: every player is scored. |
-| `limit` | `null` | Per-task example cap, for a quick look. |
-| `gen_similarity` | `0` | Free-running BERTScore prompts. Unlike agreement and KL, this is not teacher-forced, so it sees the student's own drift. Slow. |
-| `similarity_model` | `roberta-large` | BERTScore encoder (~1.4 GB on first use). |
 | `report_format` | `html` | `html` or `md`. |
 | `report_training` | `true` | Include **How it was trained** in the report: each `gkd` knob with its value, what it does, and what it meant at that value, plus the loss formula, steps, batch, LR and LoRA shape. `false` hides the section. |
 
@@ -312,6 +360,64 @@ In flight, a breach is a **hard stop**: the process ends, a rented pod is
 terminated, and no evaluation or report is produced. The artifact you keep is the
 last checkpoint — so tighten `training.save_steps` when limits are tight. On a
 rented machine the bundle and its checkpoints are synced before the pod dies.
+
+## `quantization`
+
+Packs the distilled student's weights to 4 bits and writes a
+**compressed-tensors** checkpoint that vLLM loads natively — the artifact that
+actually gets deployed. Runs as the `quantize` stage, after `train` and before
+`evaluation`.
+
+```yaml
+quantization:
+  enabled: true
+  scheme: W4A16
+  group_size: 128
+  ignore: [lm_head]
+  calibration_samples: 128
+  max_seq_length: 2048
+  dampening: 0.01
+  calibration_file: ./data/enlibra-neuroscience/sft-1to3hop.jsonl
+  output_dir: null
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Off, and the whole stage reports "not configured". |
+| `scheme` | `W4A16` | INT4 weights, FP16 activations. |
+| `group_size` | `128` | Weights quantised in groups of this many, each with its own scale. Must divide the hidden size and the FFN width. |
+| `ignore` | `[lm_head]` | Modules left at full width. See below. |
+| `calibration_samples` | `128` | Sequences GPTQ measures activation statistics against. |
+| `max_seq_length` | `2048` | Calibration sequences are truncated here. Lower it if the Hessian pass runs out of memory. |
+| `dampening` | `0.01` | Added to the Hessian diagonal before inverting. Raise it if the pass fails on a singular matrix. |
+| `calibration_file` | `null` | **The training `.jsonl`.** `null` falls back to `evaluation.arena_file`. |
+| `output_dir` | `null` | `null` uses `~/.cache/kd/quantized/`, keyed by adapter and scheme. |
+
+Three things worth knowing:
+
+- **Why W4A16 and not W8A8.** Single-stream decode is memory-bandwidth bound —
+  the time goes into moving weights, not multiplying them — so at 8B the bytes
+  saved by 4-bit weights outweigh the cost of unpacking, and W4A16 decodes
+  *faster* than bf16. W8A8 wins at large batch, where the arithmetic dominates.
+  The arena is the large-batch case and would generate faster under W8A8; that
+  is the wrong thing to optimise, because what ships answers one person at a time.
+- **Why `lm_head` is left alone.** The output projection is vocabulary × hidden
+  — 151,669 × 4,096, about 1.2 GiB — and it is the one matrix whose error lands
+  straight on the logits with no later layer to absorb it. Keeping it at full
+  width is why the checkpoint comes out around **2.7× smaller** rather than the
+  ~3.5× four-bit weights would suggest.
+- **Calibrate on the training rows, not on generic text.** GPTQ tunes its
+  rounding for the distribution it is shown. Web text optimises the rounding for
+  a distribution this model will never be asked to produce.
+
+The packed student then plays the arena as `distilled-w4a16`, beside the dense
+`distilled`. Both play because **what quantization cost is a difference**, and
+one column cannot carry a difference: with only the packed student scored,
+"three points short of the teacher" cannot be told apart from "distillation fell
+three short, quantization cost nothing". The report's *What W4A16 cost* table is
+the subtraction, measured on identical tokens and identical questions in one run.
+
+Needs `llmcompressor`, a CUDA-only optional extra for the same reason vLLM is.
 
 ## `publish`
 

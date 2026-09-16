@@ -344,16 +344,17 @@ the teacher.
 The figure to look at is `gap recovered`: how much of the base-to-teacher
 distance the training closed.
 
-### Benchmark tasks (optional, slow)
+### Quantizing the student (optional, CUDA only)
 
-Needs the `eval` extra, which the runner installs on request:
+Packs the distilled student to 4-bit weights for deployment, and scores it
+beside the dense one so the report can say what that cost:
 
 ```bash
-./distill.sh --extra eval evaluate --config configs/smollm/default.yaml \
-  --tasks ifeval --limit 100
+./distill.sh --extra quantize --extra serve \
+  --config configs/enlibra/enlibraQ3-14B.yaml
 ```
 
-It scores every player, so budget accordingly.
+Minutes, not hours — and `--only quantize` re-runs just that stage.
 
 ### Exit codes
 

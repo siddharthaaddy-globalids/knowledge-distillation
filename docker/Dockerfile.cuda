@@ -11,6 +11,13 @@
 # H100, so one image serves every GPU in the price range this pipeline is for.
 
 ARG CUDA_VERSION=12.8.1
+# vLLM for the arena's batched generation (`evaluation.engine: vllm`) and
+# llm-compressor for W4A16 packing (`quantization.enabled`). On by default in the
+# image and off in the pipeline: the config decides whether they are used, and
+# baking them in costs image size rather than run time. Build with
+# --build-arg WITH_VLLM=0 for a smaller image that can only run `engine: hf` and
+# cannot quantize.
+ARG WITH_VLLM=1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -48,6 +55,19 @@ RUN mkdir -p src/kd && touch src/kd/__init__.py \
         torch \
     && uv pip install --system -r pyproject.toml --extra remote
 
+# Against the CUDA index, and in its own layer. vLLM wants a CUDA torch, and the
+# project pins torch to the CPU index for every other install path - so this
+# cannot go through `--extra serve` / `--extra quantize` without changing what a
+# CPU checkout resolves. Last of the dependency layers because it is the one
+# most likely to be turned off.
+ARG WITH_VLLM
+RUN if [ "$WITH_VLLM" = "1" ]; then \
+        uv pip install --system \
+            --index-url https://download.pytorch.org/whl/cu128 \
+            --extra-index-url https://pypi.org/simple \
+            vllm llmcompressor compressed-tensors ; \
+    fi
+
 COPY src/ ./src/
 COPY configs/ ./configs/
 RUN uv pip install --system --no-deps -e .
@@ -57,6 +77,9 @@ RUN uv pip install --system --no-deps -e .
 # find out.
 RUN python -c "import torch, kd; print('torch', torch.__version__)" \
     && python -m kd check --config configs/smollm/smoke.yaml > /dev/null \
+    && if [ "$WITH_VLLM" = "1" ]; then \
+           python -c "import vllm, llmcompressor; print('vllm', vllm.__version__)" ; \
+       fi \
     && echo "image ok"
 
 # No ENTRYPOINT: RunPod passes the command to run as docker_args, and the

@@ -1,6 +1,32 @@
 # Design notes: post-training quantization and early S3 upload
 
-Status: research only for part 1. Written 2026-09-14.
+Status: **part 1 is built, 2026-09-16.** Written 2026-09-14.
+
+Update 2026-09-16: post-training quantization shipped, by the route this
+document recommended and one it did not anticipate.
+
+  * The method is **W4A16 through llm-compressor**, writing `compressed-tensors`
+    — the "GPTQ or AWQ as the honest middle ground" recommendation below, except
+    that vLLM loads this format natively, so the extra `auto-gptq` / `autoawq`
+    branch the table assumed is not needed.
+  * The merge helper the "lifted into a shared helper" note asks for exists:
+    `src/kd/merge.py`, now used by the arena, `kd publish` and `scripts/merge.py`.
+    It fixed a real bug on the way — `publish.py` was not trimming the
+    vocabulary, so an adapter trained against a trimmed teacher could not be
+    published at all.
+  * **The two-variant loop was not built, and should not be.** This document
+    proposes running evaluate/arena/report twice and suffixing the outputs
+    (`arena-quantized.json`, `report-quantized.html`). What shipped instead is a
+    fifth PLAYER, `distilled-w4a16`, scored in the same arena run as the dense
+    student. That is strictly better for the question being asked: what
+    quantization cost is a *difference*, and two files scored in two runs cannot
+    carry one — only columns measured on the same questions, in the same run,
+    through the same engine can. The "reuse the base numbers" recommendation
+    below is the same instinct, taken further.
+  * The `quantize` stage sits where this document put it, gated on
+    `quantization.enabled`, and `--only quantize` works as predicted.
+
+Part 2, the early S3 upload, is still open.
 
 Update 2026-09-15: the separation part 2 argues for is done, by a different
 route. Evaluation is now its own pipeline (`kd eval`, `evaluation.stages`),

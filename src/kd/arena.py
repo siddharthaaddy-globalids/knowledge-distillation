@@ -326,9 +326,6 @@ def closeness(payload, reference=REFERENCE):
                            right or wrong. From `agreement`, so it is counted
                            over every question and an unanswered one never
                            agrees.
-      explanation_cosine   mean cosine between the player's explanations and
-                           the teacher's. From `similarity`, so None when
-                           sentence-transformers was absent.
 
     Returns {"reference": ..., "players": {name: {...}}} for every player that
     is not the reference, or {} when the teacher did not play - there is
@@ -341,7 +338,6 @@ def closeness(payload, reference=REFERENCE):
     if reference not in players:
         return {}
     agreement = payload.get("agreement") or {}
-    pairs = (payload.get("similarity") or {}).get("pairs") or {}
 
     def pair(table, name):
         return table.get(f"{name} vs {reference}") or table.get(f"{reference} vs {name}")
@@ -351,18 +347,109 @@ def closeness(payload, reference=REFERENCE):
         if name == reference:
             continue
         same = pair(agreement, name) or {}
-        alike = pair(pairs, name) or {}
         out[name] = {
             "same_answer": same.get("same"),
             "of": same.get("of"),
             "same_answer_pct": same.get("pct"),
-            "explanation_cosine": alike.get("overall"),
         }
     return {"reference": reference, "players": out}
 
 
+# --------------------------------------------------------------------------- #
+# What a completion did, beyond the letter it settled on
+# --------------------------------------------------------------------------- #
+# Qwen3 and its relatives reason inside these before answering. The block is
+# part of what the model produced and is kept in the transcript, but its LENGTH
+# is a number worth reporting on its own: a model that spends 1,200 tokens
+# thinking and never closes the tag has not failed to know the answer, it has
+# failed to stop - and that is the difference between "ignorant" and "reticent"
+# in every table below.
+THINK_OPEN = re.compile(r"<think>", re.I)
+THINK_CLOSE = re.compile(r"</think>", re.I)
+
+# A completion that repeats one line over and over has fallen into a loop.
+# Counted because a loop and a long answer look identical in a token count, and
+# only one of them is a bug.
+REPEAT_RUN = 6
+
+
+def think_tokens(text, tokenizer=None):
+    """Roughly how much was spent inside <think>, in tokens.
+
+    Words when no tokenizer is handy, which is within a few percent on English
+    prose and is a number used for comparison between players rather than for
+    billing. None when the model does not reason out loud at all.
+    """
+    if not text or not THINK_OPEN.search(text):
+        return None
+    start = THINK_OPEN.search(text).end()
+    close = THINK_CLOSE.search(text, start)
+    inner = text[start:close.start()] if close else text[start:]
+    if tokenizer is not None:
+        return len(tokenizer(inner).input_ids)
+    return len(inner.split())
+
+
+def unterminated_think(text):
+    """True when the model opened a reasoning block and never closed it.
+
+    The specific failure behind a base model scoring in the thirties: it was cut
+    off at the token ceiling mid-thought, so there is no answer to parse. Worth
+    separating from "answered in the wrong format", which needs a different fix.
+    """
+    if not text or not THINK_OPEN.search(text):
+        return False
+    return not THINK_CLOSE.search(text, THINK_OPEN.search(text).end())
+
+
+def repeated(text, run=REPEAT_RUN):
+    """True when some non-trivial line repeats `run` times in a row.
+
+    Greedy decoding on a small model falls into loops, and a looping completion
+    is a generation failure rather than a wrong answer. Consecutive rather than
+    total, because a list of options legitimately repeats a stem.
+    """
+    if not text:
+        return False
+    lines = [line.strip() for line in text.splitlines() if len(line.strip()) > 12]
+    streak, previous = 1, None
+    for line in lines:
+        streak = streak + 1 if line == previous else 1
+        if streak >= run:
+            return True
+        previous = line
+    return False
+
+
+def by_hop(picks, questions):
+    """Per reasoning depth: how many were asked, answered and got right.
+
+    The eval file is weighted toward depths the curriculum never taught, so a
+    single accuracy averages over the taught and the untaught and says nothing
+    about whether anything generalised. Split by depth, that is the whole
+    question. Omitted entirely for a corpus prepared before hop_count existed.
+    """
+    table = {}
+    for pick, question in zip(picks, questions):
+        hop = question.get("hop")
+        if hop is None:
+            continue
+        cell = table.setdefault(int(hop), {"n": 0, "answered": 0, "correct": 0})
+        cell["n"] += 1
+        if pick is not None:
+            cell["answered"] += 1
+            if pick == question["gold"]:
+                cell["correct"] += 1
+    for cell in table.values():
+        cell["accuracy"] = cell["correct"] / cell["n"] if cell["n"] else None
+        cell["answer_rate"] = cell["answered"] / cell["n"] if cell["n"] else None
+        cell["accuracy_when_answered"] = (
+            cell["correct"] / cell["answered"] if cell["answered"] else None)
+    return {str(hop): table[hop] for hop in sorted(table)}
+
+
 def summarise(predictions, golds, formats=None, unanswered=None,
-              rounds=25, seed=42):
+              rounds=25, seed=42, questions=None, completions=None):
     """The whole payload: what each player answered, how often it was right, Elo.
 
     Two accuracies, deliberately, because they answer different questions and a
@@ -382,11 +469,20 @@ def summarise(predictions, golds, formats=None, unanswered=None,
     ratings = elo(results, rounds=rounds, seed=seed)
     formats = formats or {}
     unanswered = unanswered or {}
+    questions = questions or []
+    completions = completions or {}
 
     players = {}
     for name, picks in predictions.items():
         answered = sum(1 for p in picks if p is not None)
         hits = sum(1 for p, g in zip(picks, golds) if p == g)
+        # What the completions DID, as distinct from what they concluded. A
+        # player that never commits is either out of budget or off-format, and
+        # only these three numbers tell those apart.
+        said = completions.get(name) or []
+        thinking = [t for t in (think_tokens(text) for text in said) if t is not None]
+        stalled = sum(1 for text in said if unterminated_think(text))
+        looping = sum(1 for text in said if repeated(text))
         # How each answer was written, counted. "tagged" is the curriculum's own
         # shape, so it is the one that says the FORMAT transferred - a student
         # answering correctly in prose has learned the content and not the form,
@@ -409,6 +505,14 @@ def summarise(predictions, golds, formats=None, unanswered=None,
             "unanswered_examples": unanswered.get(name) or [],
             "elo": round(ratings[name]["rating"], 1),
             "elo_spread": round(ratings[name]["spread"], 1),
+            # Answered-but-wrong, separated out, because the report's commitment
+            # bar needs three parts and two of them are already above.
+            "wrong": answered - hits,
+            "mean_think_tokens": (sum(thinking) / len(thinking)) if thinking else None,
+            "unterminated_think": stalled,
+            "repetition": looping,
+            "repetition_rate": (looping / len(said)) if said else None,
+            "by_hop": by_hop(picks, questions) if questions else {},
         }
     payload = {
         "questions": total,
@@ -420,10 +524,53 @@ def summarise(predictions, golds, formats=None, unanswered=None,
         "predictions": {name: list(picks) for name, picks in predictions.items()},
         "gold": list(golds),
     }
-    # The headline, from the agreement table. Recomputed by the caller once the
-    # similarity table exists, which adds the explanation column.
     payload["closeness"] = closeness(payload)
+    payload["quantization"] = quantization_cost(payload)
     return payload
+
+
+def quantization_cost(payload):
+    """What packing the student to 4 bits cost, measured on the answer key.
+
+    The reason both students play. This is a DIFFERENCE, and a difference needs
+    both terms measured on the same questions, in the same run, through the same
+    engine - which is exactly what is not true of two numbers from two reports.
+
+    `changed_answer` is the one to read first: accuracy can be unmoved while
+    every third letter changed, and that is a different kind of "no cost".
+    """
+    players = payload.get("players") or {}
+    dense, packed = players.get(DENSE), players.get(QUANTIZED)
+    if not (dense and packed):
+        return None
+
+    def delta(key):
+        a, b = dense.get(key), packed.get(key)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return b - a
+        return None
+
+    agreement = payload.get("agreement") or {}
+    same = (agreement.get(f"{DENSE} vs {QUANTIZED}")
+            or agreement.get(f"{QUANTIZED} vs {DENSE}") or {})
+    return {
+        "dense": DENSE,
+        "packed": QUANTIZED,
+        "questions": payload.get("questions"),
+        "accuracy_dense": dense.get("accuracy"),
+        "accuracy_packed": packed.get("accuracy"),
+        "accuracy_delta": delta("accuracy"),
+        "answered_dense": dense.get("answered"),
+        "answered_packed": packed.get("answered"),
+        "answered_delta": delta("answered"),
+        "elo_dense": dense.get("elo"),
+        "elo_packed": packed.get("elo"),
+        "elo_delta": delta("elo"),
+        "same_letter": same.get("same"),
+        "same_letter_pct": same.get("pct"),
+        "changed_answer": ((payload.get("questions") or 0) - same["same"])
+                          if same.get("same") is not None else None,
+    }
 
 
 def render(payload):
@@ -509,15 +656,10 @@ def render_closeness(close):
         return (f"{entry['same_answer']}/{entry['of']}"
                 + (f" ({pct * 100:.1f}%)" if isinstance(pct, float) else ""))
 
-    def alike(entry):
-        value = entry.get("explanation_cosine")
-        return f"{value:.3f}" if isinstance(value, float) else "-"
-
     lines = ["", f"  how close to the {close.get('reference', REFERENCE)} "
                  f"- the headline",
              "    " + "".ljust(32) + "".join(n.rjust(18) for n in names)]
-    for label, cell in (("gave the teacher's answer", same),
-                        ("explanations alike (cosine)", alike)):
+    for label, cell in (("gave the teacher's answer", same),):
         lines.append("    " + label.ljust(32) + "".join(
             cell(players[n]).rjust(18) for n in names))
     lines.append("    read distilled against base: the rise is what training "
@@ -593,142 +735,6 @@ def write_transcript(path, questions, predictions, formats, completions):
 
 
 # --------------------------------------------------------------------------- #
-# Semantic similarity
-# --------------------------------------------------------------------------- #
-# The model that turns a completion into a vector. Small (~90 MB), fast on CPU,
-# and trained for exactly this: cosine between two of its embeddings is a
-# similarity anyone would recognise as one.
-#
-# Deliberately NOT one of the models being scored. Embedding with a player would
-# measure similarity in that player's own representation space, which flatters
-# it and makes the three columns incomparable.
-SIMILARITY_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
-MISSING_SENTENCE_TRANSFORMERS = (
-    "sentence-transformers is needed for the similarity table and is not "
-    "installed.\n"
-    "  uv sync --extra eval        (or: pip install sentence-transformers)\n"
-    "It is optional: every other number the arena reports is computed without "
-    "it, and the table is simply omitted when it is absent.")
-
-
-def embed(texts, model_name=SIMILARITY_MODEL, log=None):
-    """Unit-normalised embeddings for `texts`, or None if the library is absent.
-
-    Normalised at encode time so a cosine is a dot product, which is what makes
-    the pairwise loop below trivial and exact rather than approximately right.
-    """
-    try:
-        from sentence_transformers import SentenceTransformer
-    except ImportError:
-        if log:
-            for line in MISSING_SENTENCE_TRANSFORMERS.splitlines():
-                log.info(f"      !! {line}")
-        return None
-
-    if log:
-        log.info(f"      embedding {len(texts)} completions with {model_name}")
-    model = SentenceTransformer(model_name)
-    return model.encode(list(texts), normalize_embeddings=True,
-                        show_progress_bar=False, convert_to_numpy=True)
-
-
-def similarity(completions, questions, model_name=SIMILARITY_MODEL, log=None):
-    """Cosine similarity between every pair of players, overall and per hop.
-
-    Answers a question the answer key cannot: two models can pick the same
-    letter for entirely different reasons, or different letters by nearly
-    identical reasoning. Correctness sees neither. This measures how alike the
-    EXPLANATIONS are, which for a distilled student and its teacher is close to
-    the thing being bought.
-
-    Broken down by hop count because reasoning depth is the axis the curriculum
-    is built on. A student that tracks its teacher at one hop and diverges at
-    four has a specific, findable weakness; one average over all depths hides
-    exactly that.
-
-    Returns None when sentence-transformers is absent - the arena's other
-    numbers do not depend on it, so its absence omits a table rather than
-    failing a stage.
-    """
-    names = sorted(completions)
-    if len(names) < 2:
-        return None
-
-    total = len(questions)
-    # One encode call for everything, then slice. Loading the model costs more
-    # than embedding a few hundred short texts, so batching across players is
-    # most of the saving available here.
-    flat = [text for name in names for text in completions[name]]
-    vectors = embed(flat, model_name=model_name, log=log)
-    if vectors is None:
-        return None
-
-    per_player = {name: vectors[i * total:(i + 1) * total]
-                  for i, name in enumerate(names)}
-
-    def mean_cosine(a, b, indices):
-        if not indices:
-            return None
-        # Both sides are unit vectors, so the dot product IS the cosine.
-        # Clamped because floating point can put it a hair outside [-1, 1], and
-        # a similarity of 1.0000000002 reads as a bug.
-        values = [max(-1.0, min(1.0, float(per_player[a][i] @ per_player[b][i])))
-                  for i in indices]
-        return sum(values) / len(values)
-
-    hops = sorted({q.get("hop") for q in questions if q.get("hop") is not None})
-    pairs = {}
-    for i, a in enumerate(names):
-        for b in names[i + 1:]:
-            key = f"{a} vs {b}"
-            entry = {"overall": mean_cosine(a, b, list(range(total))),
-                     "by_hop": {}}
-            for hop in hops:
-                indices = [i for i, q in enumerate(questions) if q.get("hop") == hop]
-                entry["by_hop"][str(hop)] = {
-                    "n": len(indices), "cosine": mean_cosine(a, b, indices)}
-            pairs[key] = entry
-
-    return {"model": model_name, "pairs": pairs, "hops": [str(h) for h in hops]}
-
-
-def render_similarity(sim):
-    """The hop-wise similarity table, for a log or a terminal."""
-    if not sim or not sim.get("pairs"):
-        return ""
-    pairs = sorted(sim["pairs"])
-    width = max(len(p) for p in pairs)
-    hops = sim.get("hops") or []
-
-    lines = ["", f"  explanation similarity (cosine, 0-1) - {sim['model']}",
-             "", "  " + "pair".ljust(width + 2)
-             + "".join(f"hop {h}".rjust(9) for h in hops) + "overall".rjust(10)
-             + "  n"]
-    lines.append("  " + "-" * (width + 2) + "-" * (9 * len(hops)) + "-" * 13)
-    for pair in pairs:
-        entry = sim["pairs"][pair]
-        cells = ""
-        for hop in hops:
-            value = (entry["by_hop"].get(hop) or {}).get("cosine")
-            cells += (f"{value:.3f}" if value is not None else "-").rjust(9)
-        overall = entry.get("overall")
-        cells += (f"{overall:.3f}" if overall is not None else "-").rjust(10)
-        total = sum((entry["by_hop"].get(h) or {}).get("n", 0) for h in hops)
-        lines.append("  " + pair.ljust(width + 2) + cells + f"  {total}")
-
-    lines += [
-        "",
-        "  How alike the EXPLANATIONS are, not whether they agree on a letter.",
-        "  Two models can pick the same option for different reasons, or differ",
-        "  on the letter while reasoning almost identically - the answer key",
-        "  sees neither. Read `teacher vs distilled` against `teacher vs base`:",
-        "  the rise between them is what distillation moved.",
-    ]
-    return "\n".join(lines)
-
-
-# --------------------------------------------------------------------------- #
 # Playing the matches
 # --------------------------------------------------------------------------- #
 def _free(model):
@@ -772,12 +778,14 @@ def _generate(model, tokenizer, prompt, device, max_new_tokens):
     return tokenizer.decode(completion, skip_special_tokens=True).strip()
 
 
-def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log,
-                show=0):
-    """Every question, greedily.
+def score_all(questions, completions, label="player", log=None, show=0):
+    """Letters, formats and the unanswered sample, from what a player said.
 
-    Returns (predictions, unanswered examples) - a letter or None per question,
-    and the first few completions that produced no letter at all.
+    Split out from generation because there are two generators now - one
+    completion at a time through transformers, and the whole set in one batch
+    through vLLM - and exactly ONE thing that turns completions into a score. A
+    second copy of this would be a second answer parser, and the parser is where
+    this file has already been wrong once (see ANSWER_PATTERNS).
 
     KEEPING THE UNANSWERED ONES MATTERS
     -----------------------------------
@@ -792,10 +800,8 @@ def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log,
     - every completion from every player - is megabytes of text nobody reads
     when the run went fine.
     """
-    predictions, formats, unanswered, completions = [], [], [], []
-    for index, question in enumerate(questions, start=1):
-        text = _generate(model, tokenizer, question["prompt"], device,
-                         max_new_tokens)
+    predictions, formats, unanswered = [], [], []
+    for index, (question, text) in enumerate(zip(questions, completions), start=1):
         predicted, how = extract_answer_detail(text)
         if predicted is None and len(unanswered) < UNANSWERED_KEPT:
             unanswered.append({
@@ -817,12 +823,6 @@ def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log,
                 log.info(f"        {line}")
         predictions.append(predicted)
         formats.append(how)
-        completions.append(text)
-        if log and (index % 10 == 0 or index == len(questions)):
-            hits = sum(1 for p, q in zip(predictions, questions) if p == q["gold"])
-            said = sum(1 for p in predictions if p)
-            log.info(f"      {label:<10} {index}/{len(questions)}  "
-                     f"{hits / index * 100:5.1f}% correct, {said} answered")
 
     # A player that never answered anything is the case worth interrupting for -
     # it is almost always one thing wrong for every question, not many things.
@@ -833,13 +833,79 @@ def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log,
                  f"({example['completion_chars']} chars):")
         for line in example["completion_head"].strip().splitlines()[:8]:
             log.info(f"         {line}")
+    return predictions, formats, unanswered
+
+
+def _answer_all(model, tokenizer, questions, device, max_new_tokens, label, log,
+                show=0):
+    """Every question, greedily, one at a time through transformers."""
+    completions = []
+    for index, question in enumerate(questions, start=1):
+        completions.append(_generate(model, tokenizer, question["prompt"], device,
+                                     max_new_tokens))
+        if log and (index % 10 == 0 or index == len(questions)):
+            # Parsed again below, authoritatively. Here only to keep the running
+            # line honest: a player heading for 0% is worth seeing at question 20
+            # rather than after the last one of a hundred and forty.
+            seen = [extract_answer(text) for text in completions]
+            hits = sum(1 for p, q in zip(seen, questions) if p == q["gold"])
+            said = sum(1 for p in seen if p)
+            log.info(f"      {label:<10} {index}/{len(questions)}  "
+                     f"{hits / index * 100:5.1f}% correct, {said} answered")
+
+    predictions, formats, unanswered = score_all(
+        questions, completions, label=label, log=log, show=show)
     return predictions, formats, unanswered, completions
 
 
 # Every player, in the order the tables print them. A config may name a subset
 # (evaluation.players); a name outside this list is rejected up front rather
-# than silently scoring three models when four were asked for.
-PLAYERS = ("base", "distilled", "teacher-base", "teacher")
+# than silently scoring three models when five were asked for.
+#
+# `distilled` and `distilled-w4a16` ARE THE SAME TRAINING RUN, before and after
+# the weights were packed to 4 bits. Both are scored because the one number
+# nobody can infer from the other two is what quantization cost: a single
+# quantized column next to a teacher tells you the pair's combined effect, and
+# leaves "the student is 3 points down" indistinguishable from "distillation
+# fell 3 points short" and "quantization lost 3 points".
+PLAYERS = ("base", "distilled", "distilled-w4a16", "teacher-base", "teacher")
+
+# The packed player, and the dense one it is packed FROM. Named rather than
+# spelled out at each use, because the report's quantization section is built by
+# subtracting the second from the first and a typo there is a silent wrong sign.
+QUANTIZED = "distilled-w4a16"
+DENSE = "distilled"
+
+
+def resolve_quantized(config, adapter, explicit=None, log=None):
+    """Where the packed student is, or None when nothing has been packed.
+
+    Three places, in order: what was asked for, what the config names, and the
+    cache `kd quantize` writes to for this adapter. The last is what makes
+    `kd arena` pick up a quantized checkpoint with no flags at all, the run
+    after one was made.
+
+    A path that is named but holds no packed checkpoint is reported and treated
+    as absent - a silently skipped column and a typo in a path should not look
+    the same.
+    """
+    from . import paths, quantize
+
+    settings = config.get("quantization") or {}
+    for where in (explicit, settings.get("output_dir")):
+        if where:
+            if quantize.is_quantized(where):
+                return str(where)
+            if log:
+                log.info(f"      !! {where} holds no packed checkpoint; the "
+                         f"{QUANTIZED} player is skipped")
+            return None
+    if adapter and settings.get("enabled"):
+        cached = paths.quantized_cache(config, adapter,
+                                       settings.get("scheme") or "W4A16")
+        if quantize.is_quantized(cached):
+            return cached
+    return None
 
 
 def chosen_players(config, skip=()):
@@ -852,19 +918,59 @@ def chosen_players(config, skip=()):
     return tuple(p for p in PLAYERS if p in wanted and p not in (skip or ()))
 
 
+# The generation engines the arena can play with.
+#
+#   hf     transformers, one completion at a time. Runs wherever the rest of the
+#          pipeline runs - CPU, MPS, CUDA, Windows - and is the default for that
+#          reason.
+#   vllm   the whole held-out set batched through vLLM. CUDA and Linux only, and
+#          several times faster on the profiles that allow 8192 new tokens per
+#          answer. See kd.vllm_runner.
+#
+# NOT INTERCHANGEABLE WITHIN ONE SET OF NUMBERS. The two engines produce the same
+# greedy decode from the same token ids, but not through the same kernels, and
+# two floating-point paths through an 8B model do not agree on every token. The
+# engine therefore goes into the payload, and an arena run uses one of them
+# throughout: comparing a player scored under vllm against one scored under hf
+# measures the engines as much as the models.
+ENGINES = ("hf", "vllm")
+
+
+def _prompt_ids(tokenizer, questions):
+    """Every question, rendered and tokenised exactly as _generate would.
+
+    The ids rather than the text are what reaches vLLM, so the two engines
+    cannot drift apart over a chat template or over whether to add a BOS. See
+    the kd.vllm_runner header.
+    """
+    ids = []
+    for question in questions:
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": question["prompt"]}],
+            tokenize=False, add_generation_prompt=True)
+        ids.append(list(tokenizer(text).input_ids))
+    return ids
+
+
 def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
-         players=PLAYERS, show=0):
+         players=PLAYERS, show=0, engine="vllm", vllm_options=None,
+         quantized=None):
     """Load each player in turn, answer every question, return what each said.
 
     Returns {player: [letter or None, ...]}, one entry per question in order.
     The LETTERS rather than right/wrong, because two of the things worth
     reporting - whether a player answered at all, and whether two players chose
     the same option - cannot be recovered from a list of booleans.
+
+    Players are loaded ONE AT A TIME and freed between, under either engine: the
+    three of them together are far larger than the machine that trained them.
     """
-    from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from . import paths
+    from . import merge, paths
+
+    if engine not in ENGINES:
+        raise ValueError(f"unknown engine {engine!r}; valid: {', '.join(ENGINES)}")
 
     device, dtype = hardware["device"], hardware["dtype"]
     # The adapter's own record wins over the config. Both the "base" and
@@ -876,53 +982,89 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
     # weights. The Hub copy is usually the same file and occasionally is not - a
     # different revision, a changed template - and a template that disagrees with
     # training is an accuracy loss that looks like a bad run.
-    source = adapter if adapter and os.path.isfile(
+    tokenizer_source = adapter if adapter and os.path.isfile(
         os.path.join(str(adapter), "tokenizer_config.json")) else base_id
-    tokenizer = AutoTokenizer.from_pretrained(source)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if log:
         log.info(f"      base     : {base_id}")
-        log.info(f"      tokenizer: {source}")
+        log.info(f"      tokenizer: {tokenizer_source}")
+        log.info(f"      engine   : {engine}")
 
     predictions, formats, unanswered, completions = {}, {}, {}, {}
+    prompt_ids = _prompt_ids(tokenizer, questions) if engine == "vllm" else None
 
-    def run(label, build):
-        if log:
-            log.info(f"      loading {label}")
-        model = build()
-        model.eval()
-        try:
-            (predictions[label], formats[label], unanswered[label],
-             completions[label]) = _answer_all(
-                model, tokenizer, questions, device, max_new_tokens, label, log,
-                show=show)
-        finally:
-            _free(model)
+    def run(label, build, dense):
+        """One player, through whichever engine this run is using.
+
+        `build` loads it as a live transformers model; `dense` returns a path or
+        hub id to a checkpoint with no adapter left in it. Exactly one of them
+        is called, and `dense` is a callable rather than a path because
+        resolving it for the distilled player merges and writes gigabytes.
+        """
+        if engine == "vllm":
+            from . import vllm_runner
+
+            source = dense()
+            if log:
+                log.info(f"      {label}: {source}")
+            texts = vllm_runner.complete(
+                source, prompt_ids, max_new_tokens, tokenizer=tokenizer_source,
+                dtype=hardware.get("dtype_name"), options=vllm_options, log=log)
+        else:
+            if log:
+                log.info(f"      loading {label}")
+            model = build()
+            model.eval()
+            try:
+                (predictions[label], formats[label], unanswered[label],
+                 completions[label]) = _answer_all(
+                    model, tokenizer, questions, device, max_new_tokens, label,
+                    log, show=show)
+            finally:
+                _free(model)
+            return
+
+        completions[label] = texts
+        (predictions[label], formats[label],
+         unanswered[label]) = score_all(questions, texts, label=label, log=log,
+                                        show=show)
 
     if "base" in players:
-        run("base", lambda: AutoModelForCausalLM.from_pretrained(
-            base_id, dtype=dtype, low_cpu_mem_usage=True).to(device))
+        run("base",
+            lambda: AutoModelForCausalLM.from_pretrained(
+                base_id, dtype=dtype, low_cpu_mem_usage=True).to(device),
+            lambda: base_id)
 
     if "distilled" in players and adapter:
         def build_distilled():
-            model = AutoModelForCausalLM.from_pretrained(
-                base_id, dtype=dtype, low_cpu_mem_usage=True)
-            # The same trim training applied. Reproduced from the two configs
-            # rather than carried in the adapter, which would mean shipping a
-            # gigabyte of untrained embedding with every run.
-            # What the adapter recorded, first: that travels with it, so an
-            # arena on another machine needs no teacher to load the student.
-            # Falling back to deriving it from the two configs, which needs the
-            # teacher present and is why the recorded value exists.
-            target = paths.adapter_meta(adapter).get("vocab_size")
-            if not target:
-                target = paths.vocab_target(
-                    base_id, config["models"]["teacher"], len(tokenizer))
-            paths.fit_vocab(model, target, label="student")
-            return PeftModel.from_pretrained(
-                model, str(adapter)).merge_and_unload().to(device)
-        run("distilled", build_distilled)
+            # The same trim training applied, then the adapter merged in. Both
+            # live in kd.merge now, which is also what the dense path below
+            # calls - so the model vLLM scores and the model transformers scores
+            # are built by one piece of code rather than two that agree today.
+            return merge.merge_adapter(
+                adapter, base_id, config=config, tokenizer_length=len(tokenizer),
+                dtype=dtype, device=device, log=log)
+
+        run("distilled", build_distilled,
+            lambda: merge.materialise(
+                paths.merged_cache(config, adapter), base_id, adapter,
+                config=config, tokenizer=tokenizer, dtype=dtype, log=log))
+
+    if QUANTIZED in players:
+        # The same student with its weights packed to 4 bits. A complete
+        # checkpoint, not base + adapter, so both engines load it the same way
+        # they load any other: transformers reads compressed-tensors through the
+        # package of that name, and vLLM reads it natively.
+        if quantized:
+            run(QUANTIZED,
+                lambda: AutoModelForCausalLM.from_pretrained(
+                    str(quantized), dtype=dtype, low_cpu_mem_usage=True).to(device),
+                lambda: str(quantized))
+        elif log:
+            log.info(f"      {QUANTIZED} skipped: no packed checkpoint. Run "
+                     f"`kd quantize`, or set quantization.enabled")
 
     if "teacher-base" in players:
         # The model the teacher was fine-tuned FROM, with no adapter: what the
@@ -931,21 +1073,30 @@ def play(config, hardware, adapter, questions, max_new_tokens=512, log=None,
         # checkpoint cannot say what it was built from.
         teacher_base = paths.teacher_base_of(config)
         if teacher_base:
-            run("teacher-base", lambda: AutoModelForCausalLM.from_pretrained(
-                teacher_base, dtype=dtype, low_cpu_mem_usage=True).to(device))
+            run("teacher-base",
+                lambda: AutoModelForCausalLM.from_pretrained(
+                    teacher_base, dtype=dtype, low_cpu_mem_usage=True).to(device),
+                lambda: teacher_base)
         elif log:
             log.info("      teacher-base skipped: the teacher is a merged "
                      "checkpoint and models.teacher_base is not set")
 
     if "teacher" in players:
+        teacher_id = config["models"]["teacher"]
+        teacher_adapter = config["models"].get("teacher_adapter")
+
         def build_teacher():
             from .teacher import load_teacher
             model, _info = load_teacher(
-                config["models"]["teacher"],
-                config["models"].get("teacher_adapter"),
+                teacher_id, teacher_adapter,
                 dtype=dtype, device=device, verbose=False)
             return model
-        run("teacher", build_teacher)
+
+        run("teacher", build_teacher,
+            lambda: merge.materialise(
+                paths.merged_cache(config, teacher_adapter or teacher_id),
+                teacher_id, teacher_adapter, config=config, tokenizer=tokenizer,
+                dtype=dtype, log=log))
 
     return predictions, formats, unanswered, completions
 
@@ -990,6 +1141,17 @@ def main(args=None):
         parser.add_argument("--max-new-tokens", type=int, default=None)
         parser.add_argument("--device", default=None,
                             help="auto | cpu | mps | cuda")
+        parser.add_argument("--quantized", default=None, metavar="DIR",
+                            help="Packed checkpoint for the distilled-w4a16 "
+                                 "player. Default: whatever `kd quantize` "
+                                 "wrote for this adapter. That player is "
+                                 "skipped when there is none.")
+        parser.add_argument("--engine", default=None, choices=list(ENGINES),
+                            help="How the completions are generated. `hf` is "
+                                 "transformers, one at a time, and runs "
+                                 "anywhere. `vllm` batches the whole set and "
+                                 "is much faster, on CUDA and Linux only. "
+                                 "Default: evaluation.engine.")
         parser.add_argument("--json", default=None, metavar="PATH",
                             help="Where the payload goes (default: ./arena.json). "
                                  "The transcript and the report are written "
@@ -1056,6 +1218,30 @@ def main(args=None):
         log.error(f"xx  {exc}")
         return 1
 
+    # Checked before any weights are loaded. A missing vLLM discovered after the
+    # teacher has been fetched is the same failure an hour later and several
+    # gigabytes poorer.
+    engine = (getattr(args, "engine", None) or settings.get("engine") or "hf").lower()
+    if engine not in ENGINES:
+        log.error(f"xx  unknown engine {engine!r}; valid: {', '.join(ENGINES)}")
+        return 1
+    if engine == "vllm":
+        from . import vllm_runner
+
+        reason = vllm_runner.unavailable_reason()
+        if reason:
+            log.error(f"xx  {reason}")
+            return 1
+
+    # The packed student, if there is one. Skipped rather than failed when there
+    # is not: a profile that never quantised anything still has four players to
+    # score, and refusing to run at all would be refusing the whole arena over
+    # an optional column.
+    quantized = resolve_quantized(config, adapter,
+                                  getattr(args, "quantized", None), log=log)
+    if QUANTIZED in players and not quantized:
+        players = tuple(p for p in players if p != QUANTIZED)
+
     # The teacher is the only input that may live in object storage, and the
     # only one worth several gigabytes - so it is fetched when it is a player
     # and left alone when `--skip teacher` means it will never be loaded. Which
@@ -1086,34 +1272,33 @@ def main(args=None):
         config, hardware, adapter, questions,
         max_new_tokens=int(args.max_new_tokens
                            or settings.get("arena_max_new_tokens") or 512),
-        log=log, players=players, show=int(getattr(args, "show", 0) or 0))
+        log=log, players=players, show=int(getattr(args, "show", 0) or 0),
+        engine=engine, vllm_options=settings.get("vllm"), quantized=quantized)
 
     payload = summarise(predictions, [q["gold"] for q in questions],
                         formats=formats, unanswered=unanswered,
                         rounds=int(settings.get("arena_elo_rounds") or 25),
-                        seed=int(config["project"]["seed"]))
+                        seed=int(config["project"]["seed"]),
+                        questions=questions, completions=completions)
     payload["arena_file"] = str(path)
     payload["adapter"] = str(adapter) if adapter else None
+    # Recorded because the two engines are not bit-identical: see ENGINES. A
+    # payload that does not say which one produced it cannot be compared with
+    # another payload at all.
+    payload["engine"] = engine
     if limit and len(questions) < available:
         payload["limited_to"] = len(questions)
         payload["available"] = available
-    # Present from the first write, so the file always SAYS whether there is a
-    # similarity table rather than leaving a reader to infer it from a missing
-    # key - which reads the same as an older payload that never had one.
-    payload["similarity"] = None
+    payload["quantized"] = str(quantized) if quantized else None
 
     # ----------------------------------------------------------------------- #
     # ORDER MATTERS HERE, and it is the opposite of the obvious one.
     #
-    # Generation is the expensive, unrepeatable part: three models over a held-out
-    # set, hours of it. Everything below - the similarity table, the terminal
-    # summary, the report - is cheap and derived. So the derived work happens
-    # AFTER the raw result is on disk, not before it.
-    #
-    # The specific accident this avoids: similarity() downloads an embedding
-    # model. It handles the library being absent, but not a network that drops
-    # or a cache that is corrupt, and it used to run before the first write - so
-    # a failed download three hours in ended the process with nothing saved.
+    # Generation is the expensive, unrepeatable part: five models over a held-out
+    # set, hours of it. Everything below - the terminal summary, the transcript,
+    # the report - is cheap and derived. So the derived work happens AFTER the
+    # raw result is on disk, not before it: anything that can fail down here
+    # then costs a table rather than the run.
     # ----------------------------------------------------------------------- #
     saving = not getattr(args, "no_save", False)
     target = getattr(args, "json", None) or "arena.json"
@@ -1138,22 +1323,8 @@ def main(args=None):
         except Exception as exc:  # noqa: BLE001 - nothing here is worth dying for
             log.warning(f"  !! could not write the transcript: {exc}")
 
-    # Optional, and reported as absent rather than fatal: it needs
-    # sentence-transformers, which the pod install deliberately skips.
-    try:
-        payload["similarity"] = similarity(completions, questions, log=log)
-    except Exception as exc:  # noqa: BLE001 - a download, an encode, a disk
-        payload["similarity"] = None
-        log.warning(f"      !! similarity skipped: {exc}")
-    if payload.get("similarity"):
-        payload["closeness"] = closeness(payload)   # now with explanations
-        if saving:
-            write_payload()          # now with the table in it
-
     log.info("")
     log.info(render(payload))
-    if payload.get("similarity"):
-        log.info(render_similarity(payload["similarity"]))
 
     if not saving:
         log.info("")

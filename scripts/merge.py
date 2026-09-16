@@ -32,14 +32,20 @@
 #  before training, so the adapter is built against the trimmed width.
 #
 #  Hand that adapter to an untrimmed base and peft refuses the state dict on a
-#  shape mismatch. So the base is trimmed here too, to the same width, worked
-#  out from whichever of these is available first:
+#  shape mismatch. So the base is trimmed first, to the same width, worked out
+#  from whichever of these is available:
 #
 #      --vocab-size N                     you said so
-#      the run bundle beside the adapter  config.resolved.yaml names the teacher
+#      the adapter's kd-meta.json         what kd.train recorded beside it
 #      the adapter's own embedding        older adapters saved a resized copy
+#      the run bundle beside the adapter  config.resolved.yaml names the teacher
 #
 #  and left alone when none of them apply, which is the ordinary case.
+#
+#  That logic is NOT in this file. It lives in kd.merge, with the merge itself,
+#  because `kd arena` and `kd publish` have to get past exactly the same trap
+#  and three copies of the answer is three chances to have a different one. This
+#  script is the by-hand front end to it.
 # ===========================================================================
 
 import argparse
@@ -56,7 +62,9 @@ def log(message=""):
 
 
 class _Log:
-    """The .info surface kd.remote.s3 expects, wired to this script's stderr."""
+    """The .info surface kd.remote.s3 and kd.merge expect, wired to this script's
+    stderr - so their progress lands with this script's, not in stdout beside
+    the model's answer."""
 
     def info(self, message):
         log(str(message))
@@ -91,66 +99,6 @@ def adapter_base(adapter_dir):
         return json.load(handle).get("base_model_name_or_path")
 
 
-def vocab_from_bundle(adapter_dir):
-    """The teacher's width, from the run bundle the adapter was written into.
-
-    kd.runlog puts config.resolved.yaml one level above final_adapter/, and that
-    file names the teacher the student was trimmed to match. Absent whenever the
-    adapter has been moved on its own, which is why this is one of three routes
-    rather than the only one.
-    """
-    resolved = os.path.join(os.path.dirname(os.path.abspath(adapter_dir)),
-                            "config.resolved.yaml")
-    if not os.path.isfile(resolved):
-        return None
-    try:
-        import yaml
-        from transformers import AutoConfig
-
-        with open(resolved, encoding="utf-8") as handle:
-            teacher = ((yaml.safe_load(handle) or {}).get("models") or {}).get("teacher")
-        if not teacher or not (os.path.isdir(str(teacher)) or "/" in str(teacher)):
-            return None
-        return int(AutoConfig.from_pretrained(teacher).vocab_size)
-    except Exception:
-        return None
-
-
-def vocab_from_adapter(adapter_dir):
-    """The width baked into an adapter that saved its resized embedding.
-
-    Runs before kd.train stopped saving those wrote a full embed_tokens into the
-    adapter - a gigabyte of it. Reading the shape back is the most direct
-    evidence of what the adapter expects, when it is there.
-    """
-    path = os.path.join(adapter_dir, "adapter_model.safetensors")
-    if not os.path.isfile(path):
-        return None
-    try:
-        from safetensors import safe_open
-
-        with safe_open(path, framework="pt") as handle:
-            for key in handle.keys():
-                if key.endswith(("embed_tokens.weight", "lm_head.weight")):
-                    return int(handle.get_slice(key).get_shape()[0])
-    except Exception:
-        return None
-    return None
-
-
-def resolve_vocab(adapter_dir, explicit=None):
-    """The width to trim the base to, and where that came from."""
-    if explicit:
-        return int(explicit), "--vocab-size"
-    found = vocab_from_adapter(adapter_dir)
-    if found:
-        return found, "the adapter's saved embedding"
-    found = vocab_from_bundle(adapter_dir)
-    if found:
-        return found, "the run bundle's config.resolved.yaml"
-    return None, None
-
-
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
@@ -181,10 +129,17 @@ def resolve_dtype(name, device):
 
 
 def merge(adapter_dir, base_id=None, vocab=None, device="auto", dtype="auto"):
-    """Base + adapter, added together, as one ordinary model."""
+    """Base + adapter, added together, as one ordinary model.
+
+    The addition itself, and the vocabulary trap it has to get past, live in
+    `kd.merge` - the same code `kd arena` scores with and `kd publish` ships. A
+    model merged by hand here is therefore the model they produce, which is the
+    only way "it worked when I tried it" means anything.
+    """
     import torch  # noqa: F401 - imported for the side effect of a clear error
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+
+    from kd import merge as kd_merge
 
     base_id = base_id or adapter_base(adapter_dir)
     if not base_id:
@@ -197,40 +152,21 @@ def merge(adapter_dir, base_id=None, vocab=None, device="auto", dtype="auto"):
     log(f"==> adapter : {adapter_dir}")
     log(f"==> device  : {device} ({str(torch_dtype).replace('torch.', '')})")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        base_id, dtype=torch_dtype, low_cpu_mem_usage=True)
-
-    # Only ever narrower. resize_token_embeddings grows as readily as it shrinks,
-    # and growing would append rows initialised from nothing - weights the
-    # adapter was never trained against and no token id indexes. Training only
-    # ever trimmed (kd.paths.vocab_target takes the MIN of the two widths), so
-    # anything asking to widen here is a wrong answer from one of the three
-    # routes rather than an instruction to follow.
-    target, source = resolve_vocab(adapter_dir, vocab)
-    current = int(model.config.vocab_size)
-    if target and target < current:
-        log(f"==> vocab   : trimming base from {current} to {target}  "
-            f"(from {source})")
-        model.resize_token_embeddings(target)
-        model.config.vocab_size = target
-    elif target and target > current:
-        log(f"!!  {source} says {target} but the base is {current}; leaving it "
-            f"alone - widening would invent rows the adapter never saw")
-
-    log("==> merging the adapter into the base weights")
-    model = PeftModel.from_pretrained(model, adapter_dir).merge_and_unload()
-    model = model.to(device).eval()
-
     # From the adapter directory when it has one: kd.train saves the tokenizer
     # beside the weights precisely so a merged model cannot end up paired with a
-    # different one than it was trained against.
+    # different one than it was trained against. Read before the merge because
+    # its length is one of the things the width routes need.
     source_dir = adapter_dir if os.path.isfile(
         os.path.join(adapter_dir, "tokenizer_config.json")) else base_id
     log(f"==> tokenizer: {source_dir}")
     tokenizer = AutoTokenizer.from_pretrained(source_dir)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    return model, tokenizer, device
+
+    model = kd_merge.merge_adapter(
+        adapter_dir, base_id, tokenizer_length=len(tokenizer), vocab=vocab,
+        dtype=torch_dtype, device=device, log=_Log())
+    return model.eval(), tokenizer, device
 
 
 def load_merged(path, device="auto", dtype="auto"):

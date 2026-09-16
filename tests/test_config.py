@@ -436,6 +436,28 @@ def test_stand_in_teachers_do_not_inherit_a_real_teacher_base():
         assert profile(name)["models"]["teacher_base"] is None, name
 
 
+def test_every_profile_scores_through_vllm():
+    """One engine for every profile, set in exactly one place.
+
+    The two engines are not bit-identical - same greedy decode from the same
+    token ids, different kernels - so a laptop profile scoring under `hf` while
+    the pod profile scores under `vllm` would stop being a rehearsal of the real
+    run and become a rehearsal of a different measurement. A machine without
+    vLLM asks for `hf` on the command line, where it is a visible choice.
+    """
+    import yaml
+
+    for path in shipped_profiles():
+        name = os.path.basename(path)
+        assert profile(name[:-5])["evaluation"]["engine"] == "vllm", name
+        # And not by each profile saying so: `engine` belongs to _base.yaml
+        # alone, or the next one added quietly picks its own.
+        with open(path, encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle) or {}
+        assert "engine" not in (raw.get("evaluation") or {}), (
+            f"{name} sets evaluation.engine itself; it belongs to _base.yaml")
+
+
 for _name, _fn in sorted(list(globals().items())):
     if _name.startswith("test_") and callable(_fn):
         check(_name, _fn)

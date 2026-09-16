@@ -363,3 +363,24 @@ runpod:
   # volume, alongside the teacher adapter, the run bundle and its checkpoints.
   volume_gb: 200
   container_disk_gb: 40
+
+# ---------------------------------------------------------------------------
+#  Quantization. The artifact that actually ships: the distilled Qwen3-8B with
+#  its weights packed to 4 bits, ~2.7x smaller and, at this size, faster to
+#  decode than bf16.
+#
+#  The arena scores it as `distilled-w4a16` beside the dense `distilled`, and
+#  the report's "what W4A16 cost" table is the difference between the two -
+#  which is the only way to tell what quantization cost from what distillation
+#  fell short by.
+# ---------------------------------------------------------------------------
+quantization:
+  enabled: true
+  scheme: W4A16
+  group_size: 128          # divides the 8B's hidden 4096 and FFN 12288
+  ignore: [lm_head]        # 151,669 x 4,096 is 1.2 GiB, and its error hits the logits directly
+  calibration_samples: 128
+  max_seq_length: 2048
+  # The rows the student trained on, so GPTQ tunes its rounding for the
+  # distribution this model will actually be asked to produce.
+  calibration_file: ./data/enlibra-neuroscience/sft-1to3hop.jsonl

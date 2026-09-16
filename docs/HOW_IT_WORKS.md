@@ -513,8 +513,11 @@ distillation metric separately, because they are not the same question:
   base student and distilled student.
 * **Gap recovered**, `(ppl_base − ppl_distilled) / (ppl_base − ppl_teacher)` — the
   fraction of the base→teacher gap the adapter closed.
-* Optionally, **task benchmarks** through lm-evaluation-harness, reported as
-  **retention = distilled / teacher**, the DistilBERT-style headline.
+* **Top-5 overlap** with the teacher, which moves smoothly where top-1
+  agreement flips on a near-tie.
+* When a packed checkpoint exists, the same perplexity on the **same tokens**
+  for the W4A16 student, so the cost of quantization is a difference rather
+  than a second run's number.
 
 Every metric is computed for the base student as well as the distilled one, and
 the base column is what makes the numbers interpretable. Stanton et al.

@@ -16,28 +16,38 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The standard task-benchmark harness, pulled in only for `--tasks` / `--gen-similarity`
-# (uv sync --extra eval). A large dependency tree, and not needed for the fidelity and
-# perplexity metrics, which kd.evaluate computes with what is already installed.
-eval = [
-    "lm-eval[ifeval]>=0.4.5",
-    # Free-running generation similarity. bert-score compares contextual embeddings
-    # rather than surface strings, so a correct answer worded differently is not
-    # scored as wrong - which exact-match and n-gram metrics do.
-    "bert-score>=0.3.13",
-    "rouge-score>=0.1.2",
-    # Cosine similarity between model explanations, for the arena's hop-wise
-    # table. ~90 MB of model, and optional: the arena omits that one table when
-    # it is absent and reports everything else unchanged.
-    "sentence-transformers>=3.0",
-]
-
 # Remote execution and object storage. Entirely optional: nothing in the core pipeline
 # imports these, and a machine with no AWS or RunPod credentials runs every local stage
 # without them. Installed on demand with `uv sync --extra remote`.
 remote = [
     "boto3>=1.35",
     "runpod>=1.7",
+]
+
+# Batched arena generation (`evaluation.engine: vllm`). CUDA and Linux only - vLLM
+# publishes no Windows wheel and no CPU-useful build, which is why the arena defaults
+# to transformers and this is an extra rather than a dependency.
+#
+# NOT installable with a plain `uv sync --extra serve`: vLLM needs a CUDA build of
+# torch, and [tool.uv.sources] below pins torch to the CPU index on Linux and Windows
+# for everything else. Install it against the CUDA index explicitly -
+#
+#   uv pip install --index-url https://download.pytorch.org/whl/cu128 \
+#                  --extra-index-url https://pypi.org/simple vllm
+#
+# - which is what docker/Dockerfile.cuda does, and that image is where the long
+# arenas actually run.
+serve = [
+    "vllm>=0.8",
+]
+
+# W4A16 packing (`quantization.enabled`). CUDA-only for the same reason `serve` is,
+# and installed the same way - against the CUDA torch index, which is what
+# docker/Dockerfile.cuda does. `compressed-tensors` is what lets plain transformers
+# read the result back, which is how the hf engine scores the packed player.
+quantize = [
+    "llmcompressor>=0.5",
+    "compressed-tensors>=0.9",
 ]
 
 [project.scripts]

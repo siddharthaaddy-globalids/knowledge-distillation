@@ -171,10 +171,7 @@ EVAL_OPTS = [
     ("device",           "--device"),
     ("dtype",            "--dtype"),
     ("samples",          "--samples"),
-    ("gen_similarity",   "--gen-similarity"),
-    ("similarity_model", "--similarity-model"),
-    ("tasks",            "--tasks"),
-    ("limit",            "--limit"),
+    ("quantized",        "--quantized"),
     ("report",           "--report"),
     ("eval_json",        "--json"),
 ]
@@ -511,8 +508,8 @@ def run_training(profile, teacher, student, teacher_adapter, dataset, device, dt
 # --------------------------------------------------------------------------- #
 # Evaluate tab
 # --------------------------------------------------------------------------- #
-def run_evaluation(profile, adapter, device, dtype, samples, gen_similarity,
-                   similarity_model, tasks, limit, report, eval_json):
+def run_evaluation(profile, adapter, device, dtype, samples, quantized,
+                   report, eval_json):
     # Absolute, for the same reason the output dir is: the runner's cwd is its own
     # checkout, and a relative path would write the report where nothing reads it.
     report = os.path.abspath(_clean(report) or default_report_path()).replace("\\", "/")
@@ -524,8 +521,7 @@ def run_evaluation(profile, adapter, device, dtype, samples, gen_similarity,
 
     fields = {
         "adapter": adapter, "device": device, "dtype": dtype, "samples": samples,
-        "gen_similarity": gen_similarity, "similarity_model": similarity_model,
-        "tasks": tasks, "limit": limit, "report": report, "eval_json": eval_json,
+        "quantized": quantized, "report": report, "eval_json": eval_json,
     }
     argv, env, display = build_eval_command(profile, fields)
 
@@ -695,22 +691,18 @@ def build_ui():
                     e_device = gr.Dropdown(DEVICES, value="", label="Device")
                     e_dtype = gr.Dropdown(DTYPES, value="", label="Dtype")
 
-                with gr.Accordion("Slower, optional measurements", open=False):
+                with gr.Accordion("The packed student", open=False):
                     gr.Markdown(
-                        "Both need the `eval` extra (`lm-eval`, `bert-score`). The runner "
-                        "installs it automatically; the direct backend does not - run "
-                        "`uv sync --extra eval` once if these fail to import."
+                        "Score a W4A16 checkpoint on the **same tokens** as the dense "
+                        "one, which is what separates the cost of quantization from "
+                        "the cost of distillation. Blank uses whatever `kd quantize` "
+                        "wrote for this adapter; the column is simply absent when "
+                        "nothing has been packed."
                     )
                     with gr.Row():
-                        e_gen_sim = gr.Textbox(
-                            label="Generation similarity (N prompts)", placeholder="0 = off",
-                            info="Compares free-running generations, not next-token agreement")
-                        e_sim_model = gr.Textbox(label="Similarity model",
-                                                 placeholder="roberta-large")
-                    with gr.Row():
-                        e_tasks = gr.Textbox(label="Benchmark tasks",
-                                             placeholder="e.g. ifeval,arc_easy")
-                        e_limit = gr.Textbox(label="Per-task example cap", placeholder="e.g. 100")
+                        e_quant = gr.Textbox(
+                            label="Packed checkpoint", placeholder="blank = the cached one",
+                            info="Needs the `quantize` extra to have produced it")
 
                 with gr.Row():
                     e_report = gr.Textbox(label="Report path", placeholder=default_report_path(),
@@ -733,8 +725,8 @@ def build_ui():
                                            interactive=False, autoscroll=True,
                                            elem_classes="kd-log")
 
-                e_inputs = [e_profile, e_adapter, e_device, e_dtype, e_samples, e_gen_sim,
-                            e_sim_model, e_tasks, e_limit, e_report, e_json]
+                e_inputs = [e_profile, e_adapter, e_device, e_dtype, e_samples,
+                            e_quant, e_report, e_json]
                 e_start.click(
                     fn=run_evaluation, inputs=e_inputs,
                     outputs=[e_cmd, e_log, e_status, e_start, e_stop, e_report_md],

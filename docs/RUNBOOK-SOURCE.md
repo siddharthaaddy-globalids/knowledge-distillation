@@ -319,20 +319,21 @@ the CLI rather than hiding it.
 Four features ship switched off. Nothing in the core pipeline imports their
 dependencies, so a machine that never uses them never needs them installed.
 
-### Benchmark evaluation — *off: extra not installed*
+### W4A16 quantization — *off: `quantization.enabled: false`*
 
-Score base, distilled and teacher on lm-evaluation-harness tasks, and compare
-free-running generations with BERTScore.
+Packs the distilled student to 4-bit weights, as a checkpoint vLLM loads
+natively. The arena scores it as `distilled-w4a16` beside the dense student, so
+the report can say what the packing cost rather than leaving it folded into the
+gap to the teacher.
 
 ```bash
-uv sync --extra eval
+uv pip install --index-url https://download.pytorch.org/whl/cu128 \
+  --extra-index-url https://pypi.org/simple llmcompressor vllm
 
-uv run kd evaluate --config configs/qwen/finance.yaml \
-  --tasks ifeval --limit 100 \
-  --gen-similarity 20
+uv run kd quantize --config configs/enlibra/enlibraQ3-14B.yaml
 ```
 
-Slow — it scores every player. Start with `--limit`.
+CUDA only — neither library has a build for macOS or Windows.
 
 ### Hugging Face Hub — *off: `publish.enabled: false`*
 
@@ -390,7 +391,7 @@ present — without printing any of the values:
 
 ```
  optional features
-   evaluation extra (--tasks, --gen-similarity)  available
+   batched arena generation (engine: vllm)      available
    S3 (boto3)                                    available
    RunPod                                        available
 

@@ -11,8 +11,9 @@ read:
 
 The second used to raise a KeyError, which meant an arena run that had cost
 hours of generation ended with nothing readable. These checks pin both shapes,
-and pin the similarity table in particular: it is computed by the arena, and for
-a while it reached the terminal and never the file.
+and pin in particular the tables that exist only when their measurement ran:
+the reasoning-depth breakdown, and the quantization comparison - which appears
+only when both students were scored.
 """
 
 import os
@@ -37,16 +38,27 @@ def check(name, fn):
         passed.append(name)
 
 
-def player(answered, accuracy, when_answered, tagged, rating):
+def player(answered, accuracy, when_answered, tagged, rating, questions=100):
+    correct = round(accuracy * questions)
     return {"answered": answered, "accuracy": accuracy,
             "accuracy_when_answered": when_answered, "in_trained_format": tagged,
-            "unanswered_examples": [], "elo": rating, "elo_spread": 15.0}
+            "unanswered_examples": [], "elo": rating, "elo_spread": 15.0,
+            "correct": correct, "wrong": answered - correct,
+            "unanswered": questions - answered,
+            "by_hop": by_hop(answered, correct, questions)}
 
 
-def hops(*values):
-    return {"by_hop": {str(i + 1): {"n": 20, "cosine": v}
-                       for i, v in enumerate(values)},
-            "overall": sum(values) / len(values)}
+def by_hop(answered, correct, questions, depths=3):
+    """The same totals split evenly across `depths` reasoning depths."""
+    n = questions // depths
+    return {str(d + 1): {"n": n, "answered": answered // depths,
+                         "correct": correct // depths,
+                         "accuracy": (correct // depths) / n,
+                         "answer_rate": (answered // depths) / n,
+                         "accuracy_when_answered": (
+                             (correct // depths) / (answered // depths)
+                             if answered else None)}
+            for d in range(depths)}
 
 
 ARENA = {
@@ -58,10 +70,6 @@ ARENA = {
     "agreement": {"base vs teacher": {"same": 44, "of": 100, "pct": 0.44},
                   "distilled vs teacher": {"same": 71, "of": 100, "pct": 0.71}},
     "head_to_head": {},
-    "similarity": {"model": "all-MiniLM-L6-v2", "hops": ["1", "2", "3"],
-                   "pairs": {"base vs teacher": hops(0.71, 0.65, 0.60),
-                             "distilled vs teacher": hops(0.88, 0.85, 0.82),
-                             "base vs distilled": hops(0.72, 0.67, 0.63)}},
     "arena_file": "./data/eval.jsonl",
     "adapter": "/cache/final_adapter",
 }
@@ -85,10 +93,30 @@ FULL = dict(ARENA_ONLY, **{
                    "adapter_params": 36.7e6, "distilled_tok_per_s": 48.2,
                    "teacher_tok_per_s": 22.1},
     "closeness_to_teacher": {"prediction_agreement_base_pct": 41.2,
-                             "prediction_agreement_distilled_pct": 68.9,
-                             "perplexity_retention_base_pct": 45.1,
-                             "perplexity_retention_distilled_pct": 79.0},
+                             "prediction_agreement_distilled_pct": 68.9},
     "samples": 48, "completion_tokens": 6120})
+
+# A run that also packed the student. The packed column and the "what W4A16
+# cost" table appear only here - see test_quantization_appears_only_when_measured.
+PACKED_ARENA = dict(ARENA, players=dict(
+    ARENA["players"], **{"distilled-w4a16": player(97, 0.58, 0.598, 93, 1522.0)}))
+PACKED_ARENA["quantization"] = {
+    "dense": "distilled", "packed": "distilled-w4a16", "questions": 100,
+    "accuracy_dense": 0.60, "accuracy_packed": 0.58, "accuracy_delta": -0.02,
+    "answered_dense": 98, "answered_packed": 97, "answered_delta": -1,
+    "elo_dense": 1530.0, "elo_packed": 1522.0, "elo_delta": -8.0,
+    "same_letter": 94, "same_letter_pct": 0.94, "changed_answer": 6,
+}
+PACKED = dict(FULL, arena=PACKED_ARENA, quantization={
+    "path": "/cache/quantized", "scheme": "W4A16", "group_size": 128,
+    "ignore": ["lm_head"], "format": "compressed-tensors",
+    "calibration_samples": 128, "tokens": 6120, "scored_tokens": 6120,
+    "nll": 1.2253, "dense_nll": 1.2197, "nll_change": 0.0056,
+    "perplexity": 3.4053, "dense_perplexity": 3.3863,
+    "perplexity_change_pct": 0.56,
+    "tok_per_s": 31.0, "dense_tok_per_s": 22.64, "throughput_change_pct": 36.9,
+    "bytes": 6120000000, "dense_bytes": 16400000000, "compression": 2.68,
+})
 
 
 def render(payload, suffix, tmp):
@@ -124,35 +152,70 @@ def test_arena_alone_omits_the_sections_it_cannot_fill():
         assert not any(absent in t for t in titles), f"{absent} rendered without data"
 
 
-def test_similarity_reaches_the_report():
-    """Computed by the arena; for a while it reached the terminal and nothing else."""
+def test_the_depth_breakdown_is_three_tables_not_one():
+    """Accuracy, answer rate and accuracy-when-answered fail apart: a model can
+    hold the third flat while the second collapses, which is a budget problem
+    and not a knowledge problem. One table cannot show that."""
     for payload in (ARENA_ONLY, FULL):
         titles = [t for t, _rows, _headers in _sections(payload)]
-        assert any("alike are the explanations" in t for t in titles), titles
+        assert any("Accuracy by reasoning depth" in t for t in titles), titles
+        assert any("Answer rate by reasoning depth" in t for t in titles), titles
+        assert any("Accuracy when answered, by reasoning depth" in t
+                   for t in titles), titles
 
 
-def test_similarity_columns_are_pairs_not_models():
-    """Three columns headed Base/Distilled/Teacher would misdescribe every cell."""
-    section = [s for s in _sections(ARENA_ONLY) if "alike" in s[0]][0]
-    assert section[2][1] == "Base vs teacher", section[2]
-    assert section[2][2] == "Distilled vs teacher", section[2]
-
-
-def test_similarity_has_a_row_per_hop_and_a_total():
-    section = [s for s in _sections(ARENA_ONLY) if "alike" in s[0]][0]
+def test_the_depth_tables_have_a_row_per_hop():
+    section = [s for s in _sections(ARENA_ONLY)
+               if s[0].startswith("Accuracy by reasoning depth")][0]
     labels = [row[0] for row in section[1]]
-    assert len(labels) == 4, labels          # three hops plus the total
-    assert labels[-1] == "All questions", labels
-    assert "1 hop" in labels[0], labels
+    assert len(labels) == 3, labels
+    assert labels[0].startswith("hop 1"), labels
+    assert "33 questions" in labels[0], labels
+
+
+def test_where_the_questions_went_splits_wrong_from_silent():
+    """Accuracy counts silence as error, so a model that reasons past the token
+    ceiling scores the same as one that answers confidently and wrongly."""
+    section = [s for s in _sections(ARENA_ONLY)
+               if s[0] == "Where the questions went"][0]
+    labels = [row[0] for row in section[1]]
+    assert labels[:3] == ["Correct", "Answered, but wrong",
+                          "Never committed to a letter"], labels
+
+
+def test_quantization_appears_only_when_measured():
+    """Most runs never pack anything, and a W4A16 column full of dashes reads as
+    a measurement that failed rather than one nobody asked for."""
+    for payload in (ARENA_ONLY, FULL):
+        titles = [t for t, _rows, _headers in _sections(payload)]
+        assert not any("W4A16 cost" in t for t in titles), titles
+
+    title, rows, headers = [s for s in _sections(PACKED) if "W4A16 cost" in s[0]][0]
+    assert headers == ("Measure", "Dense (bf16)", "Packed (W4A16)", "Change"), headers
+    assert "group size 128" in title, title
+    assert "lm_head" in title, title
+    labels = [row[0] for row in rows]
+    # Both halves: the token-level pair AND the answer key. A perplexity that
+    # barely moves next to an accuracy that drops three points is a real and
+    # common outcome, and one table alone would miss it.
+    assert "Perplexity" in labels, labels
+    assert "Accuracy on the answer key" in labels, labels
+    assert "Gave a different letter" in labels, labels
+
+
+def test_the_packed_column_appears_only_when_it_was_played():
+    assert "Distilled W4A16" not in _sections(FULL)[0][2]
+    assert "Distilled W4A16" in _sections(PACKED)[0][2]
 
 
 def test_every_row_matches_its_headers():
-    """Four cells per row, four headers per section, in both payload shapes."""
-    for payload in (ARENA_ONLY, FULL):
+    """Every row carries exactly one cell per header, in every payload shape."""
+    for payload in (ARENA_ONLY, FULL, PACKED):
         for title, rows, headers in _sections(payload):
-            assert len(headers) == 4, f"{title}: {headers}"
             for row in rows:
-                assert len(row) == 4, f"{title}: {row}"
+                assert len(row) == len(headers), (
+                    f"{title}: {len(row)} cells against {len(headers)} "
+                    f"headers: {row}")
 
 
 def test_the_headline_is_closeness_to_the_teacher():
@@ -177,11 +240,10 @@ def test_closeness_is_derived_when_the_arena_did_not_write_it():
     from kd.report import _closeness
     close = _closeness(ARENA)
     assert close["distilled"]["same_answer_pct"] == 0.71, close
-    assert abs(close["distilled"]["explanation_cosine"] - 0.85) < 1e-9, close
+    assert close["distilled"]["same_answer"] == 71, close
     # ...and the arena's own block wins when it is there.
     written = dict(ARENA, closeness={"reference": "teacher", "players": {
-        "distilled": {"same_answer": 1, "of": 2, "same_answer_pct": 0.5,
-                      "explanation_cosine": None}}})
+        "distilled": {"same_answer": 1, "of": 2, "same_answer_pct": 0.5}}})
     assert _closeness(written)["distilled"]["same_answer_pct"] == 0.5
 
 
@@ -190,7 +252,6 @@ def test_closeness_section_comes_first_and_the_agreement_row_moved_into_it():
     assert sections[0][0].startswith("How close is it to the teacher?"), sections[0][0]
     labels = [row[0] for row in sections[0][1]]
     assert labels[0] == "Gave the teacher's answer", labels
-    assert any("cosine" in l for l in labels), labels
     assert any("share of the teacher" in l for l in labels), labels
     key = [s for s in sections if s[0].startswith("The answer key")][0]
     assert not any("teacher's letter" in row[0] for row in key[1]), key[1]
@@ -398,9 +459,6 @@ def test_evaluate_payload_with_a_teacher_base_column():
         "closeness_to_teacher": {"prediction_agreement_base_pct": 40.0,
                                  "prediction_agreement_distilled_pct": 55.0,
                                  "prediction_agreement_teacher_base_pct": 48.0,
-                                 "perplexity_retention_base_pct": 50.0,
-                                 "perplexity_retention_distilled_pct": 66.7,
-                                 "perplexity_retention_teacher_base_pct": 80.0,
                                  "gap_recovered_pct": 50.0},
         "efficiency": {"teacher_params": 3e9, "student_params": 1.5e9,
                        "adapter_params": 1e7, "teacher_base_params": 3e9,

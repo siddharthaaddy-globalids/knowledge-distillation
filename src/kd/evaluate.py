@@ -8,8 +8,7 @@ Really Work?", NeurIPS 2021):
               -> top-1 agreement rate, KL(teacher || student)
 
   CAPABILITY  is the student actually better at the task than it was?
-              -> held-out perplexity, and optionally task benchmarks via
-                 lm-evaluation-harness
+              -> held-out perplexity on the held-out split
 
 Both are reported for the BASE student and the DISTILLED student against the same
 teacher, on the same held-out split. The base student column is what makes the
@@ -27,7 +26,7 @@ teachers rather than three models.
 
     kd evaluate --config configs/qwen/finance.yaml
     kd evaluate --config configs/qwen/finance.yaml --dtype bfloat16 --samples 100
-    kd evaluate --config configs/qwen/finance.yaml --tasks ifeval,hellaswag
+    kd evaluate --config configs/enlibra/enlibraQ3-14B.yaml --quantized ./packed
     kd evaluate --config configs/smollm/mac.yaml --json results.json
 
 The held-out split is rebuilt with the training seed, so it is exactly the split
@@ -96,28 +95,13 @@ def parse_args():
                     help="Override hardware.device")
     ap.add_argument("--dtype", default="auto", choices=sorted(DTYPES),
                     help="Override hardware.dtype (default: auto)")
-    ap.add_argument("--tasks", default=None,
-                    help="Comma-separated lm-evaluation-harness tasks to run as well, "
-                         "e.g. ifeval,hellaswag,arc_easy. Requires `lm-eval` "
-                         "(uv sync --extra eval). Slow: it runs three models.")
-    ap.add_argument("--limit", type=int, default=None,
-                    help="Per-task example cap passed to lm-eval (use for a quick look)")
     ap.add_argument("--no-generations", action="store_true",
                     help="Skip the qualitative side-by-side generations")
-    ap.add_argument("--gen-similarity", type=int, default=0, metavar="N",
-                    help="Also measure free-running generation similarity to the "
-                         "teacher on N held-out prompts (BERTScore + ROUGE-L). "
-                         "0 = off. Unlike agreement/KL this is NOT teacher-forced, "
-                         "so it captures the student's own drift. Slow: generates "
-                         "from three models. Requires `uv sync --extra eval`.")
-    ap.add_argument("--no-rescale", action="store_true",
-                    help="Report RAW BERTScore instead of baseline-rescaled. Raw is "
-                         "what papers quote, but it is not a 0-1 similarity: two "
-                         "unrelated English sentences score ~0.86, so real gains "
-                         "look like rounding errors.")
-    ap.add_argument("--similarity-model", default="roberta-large", metavar="ID",
-                    help="Encoder for BERTScore (default: roberta-large, the "
-                         "bert-score English default; ~1.4GB on first use)")
+    ap.add_argument("--quantized", default=None, metavar="DIR",
+                    help="Packed checkpoint to score alongside the dense "
+                         "student, on the SAME tokens - which is what isolates "
+                         "the cost of quantization from the cost of "
+                         "distillation. Default: whatever `kd quantize` wrote.")
     ap.add_argument("--json", default=None, metavar="PATH",
                     help="Write all metrics to a JSON file (machine-readable)")
     ap.add_argument("--report", default=None, metavar="PATH",
@@ -178,6 +162,30 @@ def completion_slice(logits, ids, prompt_len):
 # --------------------------------------------------------------------------- #
 # Metrics
 # --------------------------------------------------------------------------- #
+def top_k_overlap(teacher_logits, student_logits, k=5, chunk=32):
+    """Mean size of the intersection of the two top-k sets, as a fraction of k.
+
+    Top-1 agreement is brittle at exactly the positions that matter least: where
+    the teacher is genuinely uncertain between two near-tied tokens, the student
+    can be doing the right thing and still "disagree" on every one of them. The
+    overlap of the top-5 sets moves smoothly where top-1 flips, so a student that
+    tracks the teacher's shortlist without matching its argmax shows up here as
+    close rather than as wrong.
+    """
+    positions = teacher_logits.shape[0]
+    if not positions:
+        return None
+    total = 0.0
+    for i in range(0, positions, chunk):
+        t = teacher_logits[i:i + chunk].topk(k, dim=-1).indices
+        s = student_logits[i:i + chunk].topk(k, dim=-1).indices
+        # Set intersection per row, without building a Python set per position:
+        # a [rows, k, 1] against a [rows, 1, k] comparison is the same question
+        # and stays on the device the logits are already on.
+        total += float((t.unsqueeze(-1) == s.unsqueeze(-2)).any(-1).sum())
+    return total / (positions * k)
+
+
 def compare_distributions(teacher_logits, student_logits, chunk=32):
     """Top-1 agreement count and summed KL(teacher || student) over positions.
 
@@ -302,318 +310,112 @@ def score_teacher_base(base_id, teacher, teacher_id, tokenizer, samples, device,
 
 
 # --------------------------------------------------------------------------- #
-# Optional: free-running generation similarity
+# The packed student, on the same tokens
 # --------------------------------------------------------------------------- #
-def generation_similarity(student, teacher, tokenizer, prompts, device,
-                          model_type="roberta-large", new_tokens=64, rescale=True):
-    """Does the student SAY what the teacher says, when each writes freely?
+def score_quantized(where, scored_ids, tokenizer, device, dtype, probe, config):
+    """Perplexity and throughput for the packed student, or None.
 
-    Agreement and KL are teacher-forced: both models read the same correct text,
-    so neither ever sees the student's own drift. At inference the student runs
-    free and its errors compound. This generates from each model independently on
-    the same prompts and compares the resulting text, which is the behaviour a
-    user actually experiences.
+    THE SAME TOKENS the dense student was scored on, replayed from `scored_ids`.
+    That is what makes the difference a measurement of quantization rather than
+    of two slightly different held-out splits - and it is why the ids are kept
+    through the whole run instead of being rebuilt here.
 
-    BERTScore is the primary metric because these are free-text answers with many
-    valid phrasings. Exact-match and n-gram metrics punish paraphrase: on two
-    sentences that mean the same thing, exact_match scores 0.0 and ROUGE-2 scores
-    0.0 (the shared words appear in a different order), while BERTScore - which
-    compares contextual embeddings rather than spelling - scores ~0.95. ROUGE-L is
-    reported beside it only as a cheap surface-overlap reference point.
-
-    The comparison is student-vs-TEACHER, not student-vs-dataset-reference: this
-    is a fidelity measurement, not a correctness one.
+    Absent rather than fatal: a run with nothing packed reports every other
+    number unchanged.
     """
-    teacher_gen, base_gen, dist_gen = [], [], []
-    for index, prompt in enumerate(prompts):
-        teacher_gen.append(generate(teacher, tokenizer, prompt, device, new_tokens))
-        dist_gen.append(generate(student, tokenizer, prompt, device, new_tokens))
-        with student.disable_adapter():
-            base_gen.append(generate(student, tokenizer, prompt, device, new_tokens))
-        if (index + 1) % 5 == 0:
-            print(f"   {index + 1}/{len(prompts)} prompts generated (3 models each)")
+    from . import quantize
 
-    # A model can legitimately emit nothing; both scorers choke on an empty string.
-    clean = lambda texts: [t if t.strip() else "(empty)" for t in texts]
-    teacher_gen, base_gen, dist_gen = (clean(teacher_gen), clean(base_gen),
-                                       clean(dist_gen))
-
-    result = {"prompts": len(prompts), "max_new_tokens": new_tokens}
-
-    mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
-
-    def paired_bootstrap(base_scores, dist_scores, rounds=2000, seed=42):
-        """95% CI on the per-prompt (distilled - base) difference.
-
-        Paired and resampled over prompts, because the two columns are scored on
-        the SAME prompts - the pairing removes prompt difficulty from the
-        comparison. Without this there is no way to tell a real gain from the
-        luck of which 50 prompts landed in the held-out split.
-        """
-        deltas = [d - b for b, d in zip(base_scores, dist_scores)]
-        if len(deltas) < 2:
-            return None
-        rng = random.Random(seed)
-        n = len(deltas)
-        means = []
-        for _ in range(rounds):
-            means.append(sum(deltas[rng.randrange(n)] for _ in range(n)) / n)
-        means.sort()
-        return (means[int(0.025 * rounds)], means[int(0.975 * rounds)])
-
-    try:
-        from rouge_score import rouge_scorer
-        scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-        r_base = [scorer.score(t, c)["rougeL"].fmeasure
-                  for t, c in zip(teacher_gen, base_gen)]
-        r_dist = [scorer.score(t, c)["rougeL"].fmeasure
-                  for t, c in zip(teacher_gen, dist_gen)]
-        result["rougeL_base"] = mean(r_base)
-        result["rougeL_distilled"] = mean(r_dist)
-        result["rougeL_ci95"] = paired_bootstrap(r_base, r_dist)
-    except ImportError:
-        print(" !! rouge_score not installed; skipping ROUGE-L")
-
-    try:
-        from bert_score import score as bert_score_fn
-    except ImportError:
-        print("\n !! bert-score is not installed, so only ROUGE-L was computed.")
-        print("    BERTScore is the metric that actually handles paraphrase here:")
-        print("      uv sync --extra eval")
-        return result, {"teacher": teacher_gen, "base": base_gen, "distilled": dist_gen}
-
-    print(f"   scoring with BERTScore ({model_type}; first run downloads it)")
-    # rescale_with_baseline matters more than it looks. RAW BERTScore is not a
-    # 0-1 similarity: two entirely unrelated English sentences score ~0.86, so the
-    # whole meaningful range is compressed into roughly 0.85-0.96 and a genuine
-    # improvement reads as a rounding error. Rescaling against bert-score's
-    # random-pair baseline puts ~0 at "unrelated" and ~1 at "identical", which is
-    # what makes the number legible. Raw is still what papers report, so it stays
-    # available via --no-rescale.
-    per_pair = {}
-    for label, cands in (("base", base_gen), ("distilled", dist_gen)):
-        try:
-            _, _, f1 = bert_score_fn(cands, teacher_gen, model_type=model_type,
-                                     lang="en", rescale_with_baseline=rescale,
-                                     verbose=False, batch_size=8)
-        except Exception as exc:
-            # No baseline file ships for every encoder; raw is better than nothing.
-            print(f"   !! rescaling unavailable ({type(exc).__name__}); using raw scores")
-            rescale = False
-            _, _, f1 = bert_score_fn(cands, teacher_gen, model_type=model_type,
-                                     verbose=False, batch_size=8)
-        per_pair[label] = [float(x) for x in f1]
-        result[f"bertscore_f1_{label}"] = mean(per_pair[label])
-    result["bertscore_ci95"] = paired_bootstrap(per_pair["base"], per_pair["distilled"])
-    result["bertscore_rescaled"] = rescale
-    result["bertscore_model"] = model_type
-
-    return result, {"teacher": teacher_gen, "base": base_gen, "distilled": dist_gen}
-
-
-def report_similarity(result):
-    print("\n" + BAR)
-    print("  GENERATION SIMILARITY - free-running, vs the teacher's own output")
-    print(BAR)
-    print(f"\n  {result['prompts']} prompts, greedy decoding, "
-          f"{result['max_new_tokens']} new tokens per model\n")
-    print(f"  {'metric':34} {'base':>10} {'distilled':>11} {'change':>12}")
-    print("  " + "-" * 70)
-
-    scale = "" if result.get("bertscore_rescaled", True) else " (raw)"
-    rows = [(f"BERTScore F1 vs teacher{scale}", "bertscore_f1_base",
-             "bertscore_f1_distilled", "bertscore_ci95"),
-            ("ROUGE-L vs teacher", "rougeL_base", "rougeL_distilled", "rougeL_ci95")]
-    significant = {}
-    for title, base_key, dist_key, ci_key in rows:
-        if base_key not in result or dist_key not in result:
-            continue
-        b, d = result[base_key], result[dist_key]
-        ci = result.get(ci_key)
-        line = f"  {title:34} {b:10.4f} {d:11.4f} {d - b:+12.4f}"
-        if ci:
-            # A 95% CI on the difference that excludes zero is the difference
-            # being real rather than an artefact of which prompts were sampled.
-            line += f"   95% CI [{ci[0]:+.4f}, {ci[1]:+.4f}]"
-            significant[title] = ci[0] > 0 or ci[1] < 0
-        print(line)
-
-    print("""
-  This is the one measurement here taken with the models running FREE rather
-  than reading the reference text, so it is the closest to what a user sees.
-  BERTScore compares meaning, so a correct answer worded differently is not
-  punished; ROUGE-L compares word overlap and is shown only for contrast.""")
-
-    # Free-running generation is far noisier than the teacher-forced metrics: a
-    # single divergent token early in a greedy decode changes the whole
-    # continuation. Small prompt counts routinely produce a change of either sign.
-    for title, is_sig in significant.items():
-        verdict = ("REAL - the 95% interval excludes zero" if is_sig
-                   else "NOT SIGNIFICANT - the 95% interval includes zero")
-        print(f"\n  {title.split(' vs')[0]}: {verdict}.")
-
-    if result["prompts"] < 20:
-        print(f"\n  !! ONLY {result['prompts']} PROMPTS - treat the change column as noise.")
-        print("     Greedy generation diverges on a single early token, so this")
-        print("     metric needs 50+ prompts before a small difference means")
-        print("     anything. Raise --gen-similarity.")
-
-    # Worth saying out loud when it happens: the two families of fidelity metric
-    # genuinely can disagree, and that disagreement is informative rather than a bug.
-    b = result.get("bertscore_f1_base")
-    d = result.get("bertscore_f1_distilled")
-    if isinstance(b, (int, float)) and isinstance(d, (int, float)) and d < b:
-        print("\n  Note: free-running similarity did NOT improve, even if the")
-        print("  teacher-forced agreement above did. That combination means the")
-        print("  student matches the teacher well when reading correct text, but")
-        print("  still drifts when writing on its own - the gap on-policy training")
-        print("  (a higher gkd.lmbda) is meant to close.")
-
-
-# --------------------------------------------------------------------------- #
-# Optional: lm-evaluation-harness
-# --------------------------------------------------------------------------- #
-def run_lm_eval(tasks, student_id, adapter_dir, teacher_id, teacher_adapter,
-                dtype_name, device, limit, teacher_base=None):
-    """Score base student, distilled student and teacher on standard benchmarks.
-
-    lm-evaluation-harness is the de facto standard harness (it is what the HF Open
-    LLM Leaderboard runs), so numbers produced here are comparable with published
-    ones rather than only with each other.
-    """
-    if importlib.util.find_spec("lm_eval") is None:
-        print("\n !! lm-eval is not installed; skipping --tasks.")
-        print("    Install the optional extra and re-run:")
-        print("      uv sync --extra eval")
+    if not (where and quantize.is_quantized(where)):
         return None
 
-    runs = {
-        "base_student": f"pretrained={student_id}",
-        "distilled_student": f"pretrained={student_id},peft={adapter_dir}",
-        "teacher": f"pretrained={teacher_id}"
-                   + (f",peft={teacher_adapter}" if teacher_adapter else ""),
+    print(f"\n  Scoring the packed student on the same {len(scored_ids)} samples...")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            str(where), dtype=dtype, low_cpu_mem_usage=True).to(device).eval()
+    except Exception as exc:  # noqa: BLE001 - a missing compressed-tensors, a bad dir
+        print(f"  !! could not load {where}: {exc}")
+        print("     compressed-tensors is what reads this format:  "
+              "uv pip install compressed-tensors")
+        return None
+
+    nll, tokens = 0.0, 0
+    with torch.no_grad():
+        for ids, prompt_len in scored_ids:
+            ids = ids.to(device)
+            logits, targets = completion_slice(model(ids).logits, ids, prompt_len)
+            if logits is None or logits.shape[0] == 0:
+                continue
+            nll += summed_nll(logits, targets)
+            tokens += logits.shape[0]
+    if not tokens:
+        return None
+
+    result = {
+        "path": str(where),
+        "tokens": tokens,
+        "nll": nll / tokens,
+        "perplexity": math.exp(nll / tokens),
+        "tok_per_s": measure_latency(model, tokenizer, probe, device),
     }
-    if teacher_base:
-        runs["teacher_base"] = f"pretrained={teacher_base}"
-
-    results = {}
-    for label, model_args in runs.items():
-        print(f"\n  [lm-eval] {label} on {tasks}")
-        # Invoked as a module rather than by console-script name: the entry point is
-        # spelled lm-eval in some releases and lm_eval in others, and neither is
-        # guaranteed to be on PATH. sys.executable always resolves to this venv.
-        #
-        # --apply_chat_template is set for all three models, including the base
-        # student. Every model here is instruct-tuned and the adapter was trained
-        # against a chat template, so this keeps the three columns internally
-        # consistent, which is what a base-vs-distilled comparison needs. It does
-        # mean the absolute numbers are not directly comparable to leaderboard
-        # entries that scored multiple-choice tasks without a template.
-        cmd = [
-            sys.executable, "-m", "lm_eval", "run",
-            "--model", "hf",
-            "--model_args", f"{model_args},dtype={dtype_name}",
-            "--tasks", tasks,
-            "--device", device,
-            "--batch_size", "1",
-            "--seed", "42",
-            "--apply_chat_template",
-        ]
-        if limit:
-            cmd += ["--limit", str(limit)]
-        out_dir = pathlib.Path("./evals") / label
-        cmd += ["--output_path", str(out_dir)]
-
-        # lm-eval renders its summary table with Unicode arrows. On a Windows
-        # console that defaults to cp1252 the print raises UnicodeEncodeError and
-        # the process exits 1 - AFTER the results file has been written. Force
-        # UTF-8 so it does not happen, and treat the results file as the source of
-        # truth below rather than the exit status.
-        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
-        completed = subprocess.run(cmd, env=env)
-
-        # lm-eval writes results_<timestamp>.json under a model-named subdirectory.
-        files = sorted(out_dir.rglob("results_*.json"))
-        if not files:
-            print(f"  !! lm-eval produced no results for {label} "
-                  f"(exit {completed.returncode})")
-            continue
-        if completed.returncode != 0:
-            print(f"  -- lm-eval exited {completed.returncode} for {label}, but wrote "
-                  f"results; using them")
-        payload = json.loads(files[-1].read_text(encoding="utf-8"))
-        results[label] = payload.get("results", {})
-    return results or None
+    result.update({k: v for k, v in quantize.summarise(where).items()
+                   if k in ("scheme", "group_size", "ignore", "format",
+                            "calibration_samples", "bytes", "dense_bytes",
+                            "compression")})
+    del model
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return result
 
 
-def report_tasks(results):
-    """Print the retention table: distilled / teacher, the standard KD headline."""
+def quantization_delta(packed, ppl_dense, nll_dense, tps_dense, tokens):
+    """What 4-bit weights cost, as differences on identical tokens.
+
+    Perplexity as a PERCENTAGE change and NLL as an absolute one, deliberately:
+    perplexity is exponential so its absolute movement means nothing without the
+    base, and NLL is the quantity that is actually linear in the error being
+    added. Quoting only one of them hides that.
+    """
+    ppl_packed = packed["perplexity"]
+    return {
+        **packed,
+        "dense_perplexity": ppl_dense,
+        "dense_nll": nll_dense,
+        "dense_tok_per_s": tps_dense,
+        "scored_tokens": tokens,
+        "perplexity_change_pct": ((ppl_packed - ppl_dense) / ppl_dense * 100)
+        if ppl_dense else None,
+        "nll_change": packed["nll"] - nll_dense,
+        "throughput_change_pct": ((packed["tok_per_s"] - tps_dense) / tps_dense * 100)
+        if tps_dense else None,
+    }
+
+
+def report_quantization(q):
+    """The quantization block, for a terminal."""
     print("\n" + BAR)
-    print("  TASK BENCHMARKS - lm-evaluation-harness")
+    print(f"  QUANTIZATION - what {q.get('scheme') or '4-bit'} cost")
     print(BAR)
-
-    base, dist, teach = (results.get("base_student", {}),
-                         results.get("distilled_student", {}),
-                         results.get("teacher", {}))
-    task_names = sorted(set(base) | set(dist) | set(teach))
-
-    def stderr_key(metric):
-        """lm-eval names metrics 'acc,none' and their error 'acc_stderr,none'."""
-        name, _, suffix = metric.partition(",")
-        return f"{name}_stderr,{suffix}" if suffix else f"{name}_stderr"
-
-    def is_reportable(task, metric):
-        # Skip the error bars themselves (they are attached to their metric below)
-        # and lm-eval's bookkeeping entries, which have no meaningful retention.
-        name = metric.partition(",")[0]
-        if name.endswith("_stderr") or name in ("alias", "sample_len"):
-            return False
-        return isinstance((dist.get(task) or {}).get(metric), (int, float))
-
-    def cell(value, err):
-        if not isinstance(value, (int, float)):
-            return f"{'-':>14}"
-        return f"{value:8.4f}+-{err:<4.3f}" if isinstance(err, (int, float)) \
-            else f"{value:8.4f}      "
-
-    print(f"\n  {'task / metric':30} {'base':>14} {'distilled':>14} "
-          f"{'teacher':>14} {'retention':>10}")
-    print("  " + "-" * 86)
-    noisy = []
-    for task in task_names:
-        for metric in [m for m in (dist.get(task) or {}) if is_reportable(task, m)]:
-            sk = stderr_key(metric)
-            b, d, t = ((base.get(task) or {}).get(metric),
-                       (dist.get(task) or {}).get(metric),
-                       (teach.get(task) or {}).get(metric))
-            be, de, te = ((base.get(task) or {}).get(sk),
-                          (dist.get(task) or {}).get(sk),
-                          (teach.get(task) or {}).get(sk))
-            retention = (f"{d / t * 100:9.1f}%"
-                         if isinstance(d, (int, float)) and isinstance(t, (int, float)) and t
-                         else "        -")
-            print(f"  {task + ' / ' + metric.partition(',')[0]:30} "
-                  f"{cell(b, be)} {cell(d, de)} {cell(t, te)} {retention}")
-
-            # A difference smaller than the combined error bars is not a result.
-            # Saying so here is the whole point of running a standard harness.
-            if all(isinstance(v, (int, float)) for v in (b, d, be, de)):
-                if abs(d - b) <= (be + de):
-                    noisy.append(f"{task}/{metric.partition(',')[0]}")
-
-    print("\n  retention = distilled / teacher. The comparison that matters is")
-    print("  distilled vs base: if that lift is ~0, distillation changed nothing.")
-    print("  +- values are lm-eval's standard error at the sample count you ran.")
-    if noisy:
-        print("\n  !! NOT SIGNIFICANT - distilled vs base is within the error bars for:")
-        for item in noisy:
-            print(f"       {item}")
-        print("     Re-run with a larger --eval-limit (or none) before drawing")
-        print("     any conclusion from these.")
+    print(f"  Both students on the identical {q['scored_tokens']} completion "
+          f"tokens.\n")
+    print(f"  {'measure':28} {'dense':>12} {'packed':>12} {'change':>12}")
+    print("  " + "-" * 66)
+    print(f"  {'perplexity':28} {q['dense_perplexity']:12.4f} "
+          f"{q['perplexity']:12.4f} {q['perplexity_change_pct']:+11.2f}%")
+    print(f"  {'negative log-likelihood':28} {q['dense_nll']:12.4f} "
+          f"{q['nll']:12.4f} {q['nll_change']:+12.4f}")
+    if q.get("dense_bytes") and q.get("bytes"):
+        print(f"  {'on disk':28} {q['dense_bytes'] / 2**30:11.1f}G "
+              f"{q['bytes'] / 2**30:11.1f}G {q['compression']:11.1f}x")
+    if q.get("dense_tok_per_s") and q.get("tok_per_s"):
+        print(f"  {'decode throughput (tok/s)':28} {q['dense_tok_per_s']:12.2f} "
+              f"{q['tok_per_s']:12.2f} {q['throughput_change_pct']:+11.1f}%")
+    print("\n  Single-stream decode is memory-bandwidth bound, so at this size")
+    print("  4-bit weights are usually FASTER than bf16 despite the unpacking.")
 
 
 # --------------------------------------------------------------------------- #
-# Main
+# The run
 # --------------------------------------------------------------------------- #
 def main(args=None):
     # The pipeline calls this with a prepared Namespace rather than through argparse,
@@ -732,6 +534,11 @@ def main(args=None):
     print(f"[3/{phases}] Scoring {len(samples)} held-out samples...")
     tokens = 0
     agree_base = agree_dist = 0
+    top5_dist = 0.0
+    # Every completion slice, kept so the packed student can be scored on the
+    # IDENTICAL tokens after the dense one is freed. That identity is the whole
+    # point: two perplexities from two different token sets do not subtract.
+    scored_ids = []
     kl_base = kl_dist = 0.0
     nll_teacher = nll_base = nll_dist = 0.0
     skipped = 0
@@ -761,12 +568,16 @@ def main(args=None):
 
         n = t_logits.shape[0]
         tokens += n
+        scored_ids.append((ids.detach().to("cpu"), prompt_len))
         a, k = compare_distributions(t_logits, b_logits)
         agree_base += a
         kl_base += k
         a, k = compare_distributions(t_logits, d_logits)
         agree_dist += a
         kl_dist += k
+        overlap = top_k_overlap(t_logits, d_logits)
+        if overlap is not None:
+            top5_dist += overlap * n
         nll_teacher += summed_nll(t_logits, targets)
         nll_base += summed_nll(b_logits, targets)
         nll_dist += summed_nll(d_logits, targets)
@@ -826,10 +637,9 @@ def main(args=None):
     # Two standard percentages, deliberately NOT blended into one score. There is
     # no accepted composite closeness metric, and averaging these would combine a
     # token-level agreement rate with a likelihood ratio - different units,
-    # different questions. Retention on perplexity is inverted (teacher/student)
-    # because lower perplexity is better.
-    ppl_ret_base = (ppl_teacher / ppl_base * 100) if ppl_base else float("nan")
-    ppl_ret_dist = (ppl_teacher / ppl_dist * 100) if ppl_dist else float("nan")
+    # different questions. Raw perplexity is reported above, as a number, rather
+    # than as a retention ratio a reader has to un-normalise before it can be
+    # compared with anything.
 
     print("\n" + BAR)
     print("  CLOSENESS TO TEACHER")
@@ -838,8 +648,9 @@ def main(args=None):
     print("  " + "-" * 70)
     print(f"  {'prediction agreement':34} {agreement_base:9.2f}% "
           f"{agreement_dist:10.2f}% {100.0:9.2f}%")
-    print(f"  {'perplexity retention':34} {ppl_ret_base:9.2f}% "
-          f"{ppl_ret_dist:10.2f}% {100.0:9.2f}%")
+    if top5_dist and tokens:
+        print(f"  {'top-5 overlap':34} {'-':>10} "
+              f"{top5_dist / tokens * 100:10.2f}% {100.0:9.2f}%")
     if math.isfinite(recovered):
         print(f"\n  Training closed {recovered:.1f}% of the base->teacher gap.")
     print("""
@@ -882,21 +693,6 @@ def main(args=None):
             print(f"    base      : {base_text[:220]}")
             print(f"    distilled : {dist_text[:220]}")
             print(f"    teacher   : {teach_text[:220]}")
-
-    similarity, similarity_texts = None, None
-    if args.gen_similarity > 0:
-        print("\n" + BAR)
-        print(f"  Generating from three models on {args.gen_similarity} held-out "
-              f"prompts...")
-        print(BAR)
-        # The user turn of each held-out sample: real domain prompts the student
-        # was never trained on, not the handful of benchmark_prompts.
-        prompts = [m[-2]["content"] for m in samples[:args.gen_similarity]
-                   if len(m) >= 2]
-        similarity, similarity_texts = generation_similarity(
-            student, teacher, tokenizer, prompts, device,
-            model_type=args.similarity_model, rescale=not args.no_rescale)
-        report_similarity(similarity)
 
     # --- the fourth column: the teacher's own base ---------------------------- #
     # After everything that needs the student, which is freed first: the base
@@ -959,6 +755,9 @@ def main(args=None):
             "agreement_lift_pts": agreement_dist - agreement_base,
             "kl_base": kl_base_avg,
             "kl_distilled": kl_dist_avg,
+            # Where top-1 flips on a near-tie, this moves smoothly. See
+            # top_k_overlap.
+            "top5_overlap_distilled": (top5_dist / tokens) if tokens else None,
         },
         "capability": {
             "perplexity_teacher": ppl_teacher,
@@ -969,8 +768,6 @@ def main(args=None):
         "closeness_to_teacher": {
             "prediction_agreement_base_pct": agreement_base,
             "prediction_agreement_distilled_pct": agreement_dist,
-            "perplexity_retention_base_pct": ppl_ret_base,
-            "perplexity_retention_distilled_pct": ppl_ret_dist,
             "gap_recovered_pct": recovered,
         },
         "efficiency": {
@@ -981,8 +778,6 @@ def main(args=None):
             "distilled_tok_per_s": tps_dist,
         },
         "generations": generations,
-        "generation_similarity": similarity,
-        "generation_similarity_texts": similarity_texts,
     }
 
     if teacher_base:
@@ -991,17 +786,13 @@ def main(args=None):
         payload["capability"]["perplexity_teacher_base"] = teacher_base["perplexity"]
         payload["closeness_to_teacher"]["prediction_agreement_teacher_base_pct"] = \
             teacher_base["agreement_pct"]
-        payload["closeness_to_teacher"]["perplexity_retention_teacher_base_pct"] = (
-            ppl_teacher / teacher_base["perplexity"] * 100
-            if teacher_base["perplexity"] else float("nan"))
         payload["efficiency"]["teacher_base_params"] = teacher_base["params"]
         for prompt, text in (teacher_base.get("generations") or {}).items():
             generations.setdefault(prompt, {})["teacher-base"] = text
 
-    # Free the resident models before lm-eval spawns its own processes. Not
-    # cosmetic: each lm-eval run loads its own copy of the model, so on a 16 GB
-    # unified-memory Mac the parent still caching ~6 GB is the difference between
-    # the benchmark running and the machine swapping itself to a halt.
+    # Everything resident is given back before the packed student is loaded. The
+    # quantized pass measures ONE more model on the same tokens; it should not
+    # also mean holding three at once on a card sized for two.
     del teacher
     if not teacher_base_id:
         del student
@@ -1011,13 +802,12 @@ def main(args=None):
     elif device == "mps" and hasattr(torch, "mps"):
         torch.mps.empty_cache()
 
-    if args.tasks:
-        task_results = run_lm_eval(args.tasks, student_id, adapter_dir, teacher_id,
-                                   teacher_adapter, dtype_name, device, args.limit,
-                                   teacher_base=teacher_base_id if teacher_base else None)
-        if task_results:
-            report_tasks(task_results)
-            payload["tasks"] = task_results
+    packed = score_quantized(getattr(args, "quantized", None), scored_ids,
+                             tokenizer, device, dtype, probe, config)
+    if packed:
+        payload["quantization"] = quantization_delta(
+            packed, ppl_dist, nll_dist / tokens, tps_dist, tokens)
+        report_quantization(payload["quantization"])
 
     if args.json:
         pathlib.Path(args.json).write_text(json.dumps(payload, indent=2), encoding="utf-8")

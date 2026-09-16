@@ -364,23 +364,24 @@ the CLI rather than hiding it.
 Four features ship switched off. Two of them need dependencies the core install
 does not carry, and `--extra` is how the runner installs them.
 
-### Benchmark evaluation — *needs `--extra eval`*
+### W4A16 quantization — *needs `--extra quantize`, `quantization.enabled: false`*
 
-Score base, distilled and teacher on lm-evaluation-harness tasks, and compare
-free-running generations with BERTScore.
+Packs the distilled student to 4-bit weights and writes a checkpoint vLLM loads
+natively — the artifact that actually ships. The arena then scores it as
+`distilled-w4a16` beside the dense `distilled`, and the report says what the
+packing cost.
 
 ```bash
-./distill.sh --extra eval evaluate --config configs/qwen/finance.yaml \
-  --tasks ifeval --limit 100 \
-  --gen-similarity 20
+./distill.sh --extra quantize --extra serve \
+  --config configs/enlibra/enlibraQ3-14B.yaml
 ```
 
-Slow — it scores every player. Start with `--limit`. The extra installs once and
-stays in the runner's cached environment — but name every group you want on each
-invocation, because `uv` removes extras it was not asked for:
+CUDA only. Name every group you want on each invocation, because `uv` removes
+extras it was not asked for:
 
 ```bash
-./distill.sh --extra eval --extra remote --config configs/qwen/finance.yaml
+./distill.sh --extra quantize --extra serve --extra remote \
+  --config configs/enlibra/enlibraQ3-14B.yaml
 ```
 
 ### Hugging Face Hub — *`publish.enabled: false`*
@@ -438,7 +439,7 @@ without printing any of the values:
 
 ```
  optional features
-   evaluation extra (--tasks, --gen-similarity)  available
+   batched arena generation (engine: vllm)      available
    S3 (boto3)                                    available
    RunPod                                        available
 
@@ -505,12 +506,12 @@ from the same stage definition, so the two cannot drift.
 ```powershell
 .\distill.ps1 -Config configs\smollm\smoke.yaml
 .\distill.ps1 doctor
-.\distill.ps1 -Extra eval evaluate -Config configs\finance.yaml --tasks ifeval
+.\distill.ps1 -Extra quantize -Config configs\enlibraQ3-14B.yaml --only quantize
 .\distill.ps1 -Config configs\finance.yaml --set training.max_steps=500
 ```
 
 `-Config`, `-Extra`, `-WorkDir`, `-Local`, `-RunnerHelp` and `-RunnerVersion` use
-PowerShell's parameter style; everything else — `--set`, `--only`, `--tasks` — is
+PowerShell's parameter style; everything else — `--set`, `--only`, `--skip` — is
 spelled exactly as it is above and passed through untouched.
 
 ### Inside a container or a CI job

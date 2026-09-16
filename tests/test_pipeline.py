@@ -63,7 +63,7 @@ def fake_stages(record, failing=None, raising=None, table=None, names=None):
         return stage
     table = pipeline.STAGES if table is None else table
     names = names or ["preflight", "teacher-check", "smoke", "train",
-                      "evaluation", "publish", "upload"]
+                      "quantize", "evaluation", "publish", "upload"]
     table.clear()
     table.update({name: make(name) for name in names})
 
@@ -92,7 +92,7 @@ def stages_in_manifest(run_dir):
 # --------------------------------------------------------------------------- #
 def test_default_plan_is_the_config_order(workspace):
     plan = [name for name, _ in pipeline.planned_stages(make_config(workspace))]
-    assert plan == ["preflight", "teacher-check", "smoke", "train",
+    assert plan == ["preflight", "teacher-check", "smoke", "train", "quantize",
                     "evaluation", "publish", "upload"], plan
 
 

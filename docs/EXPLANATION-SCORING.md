@@ -1,6 +1,21 @@
 # Scoring the explanations
 
-**Status:** design, not implemented. Nothing in `src/kd/` does any of this yet.
+**Status: SUPERSEDED, 2026-09-16. Kept for the argument, not as a plan.**
+
+The table this document proposes to fix — the sentence-transformers cosine
+between players' explanations — has been **removed**, along with BERTScore,
+ROUGE-L and the lm-eval task path. What replaced it is not a better similarity
+metric but a different question: the arena now reports accuracy, answer rate and
+accuracy-when-answered **split by reasoning depth**, which is what says whether
+anything generalised past the hops the curriculum taught.
+
+The criticism below still stands and is worth reading before anyone reintroduces
+a similarity score. The design in "Tier 1" onward builds on a `similarity` block
+in `arena.json` that no longer exists.
+
+Original introduction follows.
+
+---
 
 The arena scores the players - base, distilled, teacher-base when known, and
 teacher - on a held-out multiple-choice set and reports

@@ -181,8 +181,8 @@ block() {
 #            has hit, not a hypothetical.
 SKIP='^(torch|gradio|runpod)([<>=!~[]|$)'
 
-# An array, not a string: `lm-eval[ifeval]>=0.4.5` carries glob characters, and a
-# word-split string would let the shell try to expand them.
+# An array, not a string: a requirement like `pkg[extra]>=1.0` carries glob
+# characters, and a word-split string would let the shell try to expand them.
 REQS=()
 while IFS= read -r req; do
   [ -n "$req" ] && REQS+=("$req")

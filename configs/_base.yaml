@@ -225,15 +225,22 @@ evaluation:
   # either way.
   after_training: false
   # Who is scored. Four models, each answering a question the others cannot:
-  #   base          the stock student, no adapter - the control
-  #   distilled     the student plus the trained adapter - the result
-  #   teacher-base  the stock model the teacher was fine-tuned from - what
-  #                 the fine-tune bought the TEACHER; skipped when unknown
-  #   teacher       the fine-tuned teacher - the ceiling, and the reference
-  #                 every closeness figure is measured against
-  # Drop `teacher` and `teacher-base` to score base against distilled without
-  # loading eight gigabytes of weights.
-  players: [base, distilled, teacher-base, teacher]
+  #   base             the stock student, no adapter - the control
+  #   distilled        the student plus the trained adapter - the result
+  #   distilled-w4a16  the SAME student with its weights packed to 4 bits.
+  #                    Skipped when nothing has been packed. Both it and
+  #                    `distilled` play because what quantization cost is a
+  #                    DIFFERENCE, and one column cannot carry a difference:
+  #                    with only the packed student scored, "3 points short of
+  #                    the teacher" cannot be told apart from "distillation
+  #                    fell 3 short" plus "quantization cost nothing".
+  #   teacher-base     the stock model the teacher was fine-tuned from - what
+  #                    the fine-tune bought the TEACHER; skipped when unknown
+  #   teacher          the fine-tuned teacher - the ceiling, and the reference
+  #                    every closeness figure is measured against
+  # Drop `teacher` and `teacher-base` to score the students without loading
+  # eight gigabytes of weights.
+  players: [base, distilled, distilled-w4a16, teacher-base, teacher]
   # The stages `kd eval` walks, in order. A gate that fails stops the
   # evaluation; a non-gate failure is reported and the rest still runs. The
   # arena runs only when arena_file names a held-out set; upload only when
@@ -245,10 +252,6 @@ evaluation:
     - {name: report,    gate: false}   # report.html in the evaluation directory
     - {name: upload,    gate: false}   # to <bundle>/evaluation/<id>/ in the bucket
   samples: 50           # held-out samples scored for fidelity and perplexity
-  tasks: null           # lm-eval task list, e.g. "ifeval,arc_easy"; null = skip
-  limit: null           # per-task example cap for a quick look
-  gen_similarity: 0     # free-running BERTScore prompts; 0 = skip (slow: 3 models generate)
-  similarity_model: roberta-large
   report_format: html   # html | md - written into the run bundle as report.<ext>
   # The report's "How it was trained" section: the gkd knobs, what each does,
   # and what each meant at the value this run used. Off hides the section.
@@ -273,12 +276,108 @@ evaluation:
   # a real run wants. A small number is for proving the stage runs at all
   # without waiting for three models to answer everything.
   arena_limit: null
+  # How the arena generates its completions. vLLM, everywhere - NO PROFILE
+  # OVERRIDES THIS, deliberately.
+  #
+  #   vllm   the whole held-out set batched through vLLM. CUDA and Linux only,
+  #          and far faster on the profiles that matter: four players over ~140
+  #          questions at up to 8192 new tokens each is 560 sequential
+  #          generations under `hf`, and one batch per player under `vllm`.
+  #   hf     transformers, one completion at a time. Runs anywhere - CPU, MPS,
+  #          CUDA, Windows - and exists as an escape hatch, not as a default.
+  #
+  # ONE ENGINE FOR EVERY PROFILE is the point. The two are not bit-identical:
+  # both decode greedily from the same token ids, but not through the same
+  # kernels, and two floating-point paths through an 8B model do not agree on
+  # every token. If the laptop profiles scored under `hf` and the real ones
+  # under `vllm`, a smoke run would stop being a rehearsal of the real run - it
+  # would be a rehearsal of a different measurement. The engine is recorded in
+  # arena.json for the same reason.
+  #
+  # A machine without vLLM FAILS AT PREFLIGHT rather than quietly falling back,
+  # which is the rule run.sh already states for profiles: a run that silently
+  # measures something other than what you asked for is worse than a run that
+  # stops, because it reports success.
+  #
+  # To score on a machine with no vLLM - a Mac, a Windows box - ask for it on
+  # the command line, where it is a visible choice rather than a hidden default:
+  #     kd arena --engine hf ...
+  #     kd eval --set evaluation.engine=hf ...
+  #
+  # `vllm` needs a dense checkpoint, so the distilled player is merged to
+  # ~/.cache/kd/merged/ first - once, and reused by later runs.
+  engine: vllm
+  # Engine settings, used only when engine is vllm. Ignored otherwise.
+  vllm:
+    # Share of the card vLLM preallocates for weights and KV cache. Lower this
+    # when a player is killed during load; the arena holds one player at a time,
+    # so the default leaves room for little else and does not need to.
+    gpu_memory_utilization: 0.85
+    # Context window for the engine. null sizes it to the job - the longest
+    # prompt in the held-out file plus arena_max_new_tokens - which is smaller
+    # than a Qwen3 model's declared 40960 and reserves correspondingly less KV
+    # cache. Set a number only to override that.
+    max_model_len: null
+    # Skip CUDA graph capture. Costs some decode throughput and saves both the
+    # capture time and the memory the graphs hold, which on a batch this size is
+    # the better trade - and it removes one source of run-to-run variation from
+    # a number that is supposed to be reproducible.
+    enforce_eager: true
+    # Cards to shard each player across. 1 unless a player does not fit on one.
+    tensor_parallel_size: 1
   # How much of the teacher's answer the teacher-check stage prints. Not a
   # quality setting - the check reads the first token's distribution, not the
   # text - but the text is what a person actually looks at, and an answer cut
   # off mid-sentence tells them nothing. Same reasoning as the benchmark
   # ceiling above: high enough never to bind on a model that stops properly.
   teacher_check_max_new_tokens: 2048
+
+# ---------------------------------------------------------------------------
+#  Quantization. Packs the distilled student's weights to 4 bits, producing a
+#  checkpoint vLLM loads natively - the artifact that actually gets deployed.
+#
+#  Runs as the `quantize` stage, AFTER training and before evaluation, so the
+#  arena scores the packed student (`distilled-w4a16`) beside the dense one and
+#  the report can say what the packing cost. Nothing about training changes: a
+#  failed quantization costs a column, never the adapter.
+#
+#  Needs llm-compressor, which like vLLM is a CUDA-only optional extra.
+# ---------------------------------------------------------------------------
+quantization:
+  enabled: false
+  # W4A16: INT4 weights, FP16 activations. The right choice for a model that
+  # serves one request at a time - single-stream decode is memory-bandwidth
+  # bound, so at 8B the bytes saved outweigh the cost of unpacking and 4-bit
+  # weights decode FASTER than bf16. W8A8 wins instead at large batch, where
+  # the arithmetic dominates; that is not what is being shipped.
+  scheme: W4A16
+  # Weights are quantised in groups of this many, each with its own scale. 128
+  # is the standard trade and divides both the hidden size (4096) and the FFN
+  # width (12288) of the Qwen3 students here.
+  group_size: 128
+  # Never quantised. The output projection is vocabulary x hidden - 1.2 GiB on
+  # its own here - and it is the one matrix whose error lands straight on the
+  # logits with no later layer to absorb it. Keeping it at full width is why
+  # the checkpoint comes out ~2.7x smaller rather than the ~3.5x four-bit
+  # weights suggest, and it is worth the bytes.
+  ignore: [lm_head]
+  # Sequences GPTQ measures each layer's activation statistics against, drawn
+  # from calibration_file. A few hundred is enough; more costs time and buys
+  # little.
+  calibration_samples: 128
+  max_seq_length: 2048
+  # Added to the Hessian diagonal before inverting it. Raise it if the pass
+  # fails on a singular matrix; lower values quantise slightly more faithfully.
+  dampening: 0.01
+  # The rows to calibrate on. THE TRAINING FILE, not generic text: GPTQ tunes
+  # its rounding for the distribution it sees here, and tuning it for web text
+  # optimises for a distribution this model will never be asked to produce.
+  # null falls back to evaluation.arena_file.
+  calibration_file: null
+  # Where the packed checkpoint goes. null uses ~/.cache/kd/quantized/, keyed by
+  # adapter and scheme, so two runs on one adapter pack it once and the run
+  # bundle - which is uploaded wholesale - does not carry a second copy.
+  output_dir: null
 
 benchmark_prompts:
   - List three states of matter. Use a numbered list.
@@ -304,6 +403,7 @@ pipeline:
     - {name: teacher-check, gate: true}   # teacher only: missing weights, NaN scan, coherence
     - {name: smoke,         gate: true}   # 2 real steps; measures s/step and projects the run
     - {name: train,         gate: true}
+    - {name: quantize,      gate: false}  # skipped unless quantization.enabled
     - {name: evaluation,    gate: false}  # skipped unless evaluation.after_training
     - {name: publish,       gate: false}  # skipped unless publish.enabled
     - {name: upload,        gate: false}  # skipped unless s3.enabled; also runs after a failure

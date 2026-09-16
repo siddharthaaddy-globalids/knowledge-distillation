@@ -654,6 +654,36 @@ def adapter_cache(config, source):
     return os.path.join(root, safe)
 
 
+def merged_cache(config, source):
+    """Where a merged, dense copy of `source` is kept, so it is merged once.
+
+    vLLM and the quantiser cannot be handed base + adapter; they want an
+    ordinary checkpoint on disk. Building one costs several gigabytes of write,
+    so it goes beside the other caches rather than into the run bundle - a run
+    directory is uploaded wholesale, and nobody wants an extra copy of the
+    student in the bucket next to the adapter that produced it.
+
+    Keyed the same way as adapter_cache, so two runs scoring the same adapter
+    share the merge instead of each paying for it.
+    """
+    root = os.path.join(os.path.dirname(cache_dir(config)), "merged")
+    safe = str(source).replace("\\", "/").strip("./").replace("/", "__")
+    return os.path.join(root, safe)
+
+
+def quantized_cache(config, source, scheme="W4A16"):
+    """Where the packed copy of `source` is kept, so it is packed once.
+
+    Beside the merged cache and keyed the same way, with the scheme in the name:
+    a W4A16 checkpoint and a W8A8 one are different artifacts and must not
+    overwrite each other. Packing an 8B student is minutes on a rented GPU, and
+    an arena that re-ran the stage every time would pay them every time.
+    """
+    root = os.path.join(os.path.dirname(cache_dir(config)), "quantized")
+    safe = str(source).replace("\\", "/").strip("./").replace("/", "__")
+    return os.path.join(root, f"{safe}-{str(scheme).lower()}")
+
+
 def ensure_peft_adapter(config, log=None):
     """Convert an MLX/unsloth teacher adapter to PEFT, once, and point at the copy.
 

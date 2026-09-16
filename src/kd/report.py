@@ -72,14 +72,6 @@ def _arena_summary(arena):
             f"On {total} held-out questions the distilled student gave the "
             f"teacher's answer {same_d * 100:.1f}% of the time{before}. That is "
             f"how close it is to the teacher, and it is the number to quote.")
-    cos_b, cos_d = cb.get("explanation_cosine"), cd.get("explanation_cosine")
-    if isinstance(cos_d, (int, float)):
-        before = (f", from {cos_b:.2f}"
-                  if isinstance(cos_b, (int, float)) else "")
-        lines.append(
-            f"Its explanations read like the teacher's at {cos_d:.2f} cosine "
-            f"similarity{before} (1.00 would be word for word).")
-
     moved = pct(dist) - pct(base)
     verb = ("is ahead of" if moved > 0 else
             "is level with" if moved == 0 else "is behind")
@@ -143,7 +135,8 @@ def plain_summary(payload):
     # An arena-only payload: `kd arena --report` writes one, and it carries the
     # answer key without any of the token-level measurements below.
     if "fidelity" not in payload:
-        return _arena_summary(payload.get("arena") or {})
+        return (_arena_summary(payload.get("arena") or {})
+                + _quantization_summary(payload))
 
     fid, cap = payload["fidelity"], payload["capability"]
     lift = fid["agreement_lift_pts"]
@@ -173,23 +166,6 @@ def plain_summary(payload):
         f"(perplexity {cap['perplexity_base']:.1f} to {cap['perplexity_distilled']:.1f}; "
         f"the teacher scores {cap['perplexity_teacher']:.1f}, and lower is better).")
 
-    sim = payload.get("generation_similarity") or {}
-    bs_b, bs_d = sim.get("bertscore_f1_base"), sim.get("bertscore_f1_distilled")
-    rl_b, rl_d = sim.get("rougeL_base"), sim.get("rougeL_distilled")
-    if all(isinstance(v, (int, float)) for v in (bs_b, bs_d, rl_b, rl_d)) and bs_b and rl_b:
-        words = (rl_d - rl_b) / rl_b * 100
-        meaning = (bs_d - bs_b) / bs_b * 100
-        lines.append(
-            f"When both models write a full answer on their own, the student's "
-            f"WORDING moved {words:+.0f}% toward the teacher's while its MEANING "
-            f"moved {meaning:+.0f}%.")
-        if words > 2 * meaning:
-            lines.append(
-                "Wording moved far more than meaning. That is the signature of "
-                "distillation transferring style and structure rather than "
-                "knowledge - normal for a short run, and worth knowing if you "
-                "needed the student to learn facts it did not already have.")
-
     eff = payload["efficiency"]
     if eff["teacher_params"]:
         ratio = eff["student_params"] / eff["teacher_params"]
@@ -197,15 +173,68 @@ def plain_summary(payload):
                  if eff.get("teacher_tok_per_s") else None)
         tail = f" and runs {speed:.1f}x faster" if speed else ""
         lines.append(f"It does this at {ratio:.0%} of the teacher's size{tail}.")
+    lines += _quantization_summary(payload)
+    return lines
+
+
+def _quantization_summary(payload):
+    """What packing to 4 bits cost, in a sentence, or nothing.
+
+    Two sentences rather than one, because the two costs are independent and
+    people quote whichever they saw first: a perplexity that barely moves next
+    to an accuracy that drops three points is a real and common outcome, and a
+    summary naming only the first would be a true sentence used to support a
+    false conclusion.
+    """
+    quant = payload.get("quantization") or {}
+    aquant = ((payload.get("arena") or {}).get("quantization")) or {}
+    if not (quant or aquant):
+        return []
+
+    scheme = quant.get("scheme") or aquant.get("scheme") or "4-bit"
+    lines = []
+
+    size = ""
+    if quant.get("compression") and quant.get("bytes"):
+        size = (f" - {quant['bytes'] / 2 ** 30:.1f} GiB on disk against "
+                f"{quant['dense_bytes'] / 2 ** 30:.1f}, {quant['compression']:.1f}x "
+                f"smaller")
+    change = quant.get("perplexity_change_pct")
+    if isinstance(change, (int, float)):
+        faster = quant.get("throughput_change_pct")
+        speed = (f", and decodes {faster:+.0f}% "
+                 f"{'faster' if faster > 0 else 'slower'}"
+                 if isinstance(faster, (int, float)) else "")
+        lines.append(
+            f"Packed to {scheme}{size}, it is {change:+.2f}% worse on perplexity "
+            f"over the identical {quant.get('scored_tokens', '?')} tokens{speed}.")
+    elif size:
+        lines.append(f"Packed to {scheme}{size}.")
+
+    delta = aquant.get("accuracy_delta")
+    if isinstance(delta, (int, float)):
+        changed = aquant.get("changed_answer")
+        moved = (f" It gave a different letter on {changed} of "
+                 f"{aquant.get('questions')} questions."
+                 if changed is not None else "")
+        if abs(delta) < 0.005:
+            lines.append(
+                f"On the answer key the packed student scores the same as the "
+                f"dense one, within half a point.{moved}")
+        else:
+            lines.append(
+                f"On the answer key it scores {delta * 100:+.1f} points against "
+                f"the dense student ({aquant['accuracy_packed'] * 100:.1f}% "
+                f"against {aquant['accuracy_dense'] * 100:.1f}%).{moved}")
     return lines
 
 
 def _closeness(arena):
-    """{player: {same_answer, of, same_answer_pct, explanation_cosine}}.
+    """{player: {same_answer, of, same_answer_pct}}.
 
     From the arena's own `closeness` block when it wrote one, else derived here
-    from the agreement and similarity tables - so an arena.json written before
-    the block existed still gets the same headline.
+    from the agreement table - so an arena.json written before the block existed
+    still gets the same headline.
     """
     block = (arena.get("closeness") or {}).get("players")
     if block:
@@ -214,13 +243,11 @@ def _closeness(arena):
     if "teacher" not in players:
         return {}
     agreement = arena.get("agreement") or {}
-    pairs = (arena.get("similarity") or {}).get("pairs") or {}
     pair = lambda table, name: (table.get(f"{name} vs teacher")
                                 or table.get(f"teacher vs {name}") or {})
     return {name: {"same_answer": pair(agreement, name).get("same"),
                    "of": pair(agreement, name).get("of"),
-                   "same_answer_pct": pair(agreement, name).get("pct"),
-                   "explanation_cosine": pair(pairs, name).get("overall")}
+                   "same_answer_pct": pair(agreement, name).get("pct")}
             for name in sorted(players) if name != "teacher"}
 
 
@@ -524,20 +551,29 @@ def loss_note(beta, ce_alpha=0.0):
 # teacher checkpoint cannot say what it was built from, and a report that
 # printed a column of dashes for it would look like a measurement that failed.
 COLUMNS = (("base", "Base student"), ("distilled", "Distilled"),
+           ("distilled-w4a16", "Distilled W4A16"),
            ("teacher-base", "Teacher base"), ("teacher", "Teacher"))
 DEFAULT_HEADERS = ("Metric", "Base student", "Distilled", "Teacher")
 
 
 def _columns(payload):
-    """The model columns this payload can fill: [(player, header), ...]."""
+    """The model columns this payload can fill: [(player, header), ...].
+
+    A column appears only when something measured it. The packed student is the
+    clearest case: most runs never quantise anything, and an always-present
+    W4A16 column full of dashes would suggest a measurement that failed rather
+    than one that was never asked for.
+    """
     players = set((payload.get("arena") or {}).get("players") or {})
     fid = payload.get("fidelity") or {}
     cap = payload.get("capability") or {}
     has_teacher_base = ("teacher-base" in players
                         or "top1_agreement_teacher_base_pct" in fid
                         or "perplexity_teacher_base" in cap)
+    has_packed = ("distilled-w4a16" in players or bool(payload.get("quantization")))
+    optional = {"teacher-base": has_teacher_base, "distilled-w4a16": has_packed}
     return [(name, header) for name, header in COLUMNS
-            if name != "teacher-base" or has_teacher_base]
+            if optional.get(name, True)]
 
 
 def _headers(payload):
@@ -566,15 +602,7 @@ def _closeness_rows(arena, total, pct, columns):
             return "-"
         return f"{e['same_answer']} / {e['of']}  ({pct(e.get('same_answer_pct'))})"
 
-    def cos(name):
-        if name == "teacher":
-            return "1.000"
-        value = entry(name).get("explanation_cosine")
-        return f"{value:.3f}" if isinstance(value, float) else "-"
-
     rows = [("Gave the teacher's answer", *(same(n) for n in names))]
-    if any(isinstance(entry(n).get("explanation_cosine"), float) for n in names):
-        rows.append(("Explanations alike (cosine, 0-1)", *(cos(n) for n in names)))
     # Accuracy as a share of the teacher's: the same closeness, asked of the
     # answer key. Skipped when the teacher scored nothing, since a share of
     # zero is not a number.
@@ -588,6 +616,138 @@ def _closeness_rows(arena, total, pct, columns):
         rows.append(("Accuracy, as a share of the teacher's",
                      *(share(n) for n in names)))
     return rows
+
+
+def _gib(value):
+    """Bytes as GiB, or a dash. Binary, because that is what a disk reports."""
+    return f"{value / 2 ** 30:.1f} GiB" if isinstance(value, (int, float)) and value \
+        else "-"
+
+
+def _hop_sections(players, names, columns, pct):
+    """Three tables, one per question, split by reasoning depth.
+
+    The eval split is weighted toward depths the curriculum never taught, so a
+    single accuracy averages the taught and the untaught together and cannot say
+    whether anything GENERALISED. Split by depth, that is the only question.
+
+    Three tables and not one, because they fail apart:
+      accuracy               correct out of everything asked at that depth
+      answer rate            how often a parseable answer appeared at all
+      accuracy when answered correct out of what it committed to
+
+    A model can hold the third flat while the second collapses - that is a
+    budget problem, not a knowledge problem - and only reading them side by side
+    shows which one moved.
+    """
+    hops = sorted({hop for name in names if name in players
+                   for hop in (players[name].get("by_hop") or {})},
+                  key=lambda h: int(h))
+    if not hops:
+        return []
+
+    headers = ("Reasoning depth",) + tuple(h for _n, h in columns)
+
+    def table(field, counted):
+        rows = []
+        for hop in hops:
+            asked = max((((players[n].get("by_hop") or {}).get(hop) or {}).get("n", 0)
+                         for n in names if n in players), default=0)
+            cells = []
+            for name in names:
+                cell = ((players.get(name) or {}).get("by_hop") or {}).get(hop)
+                cells.append(counted(cell) if cell else "-")
+            rows.append((f"hop {hop}  ({asked} questions)", *cells))
+        return rows
+
+    return [
+        ("Accuracy by reasoning depth — correct out of everything asked",
+         table("accuracy", lambda c: f"{c['correct']} · {pct(c.get('accuracy'))}"),
+         headers),
+        ("Answer rate by reasoning depth — how often it committed at all",
+         table("answer_rate",
+               lambda c: f"{c['answered']} · {pct(c.get('answer_rate'))}"),
+         headers),
+        ("Accuracy when answered, by reasoning depth",
+         table("accuracy_when_answered",
+               lambda c: (f"{c['correct']}/{c['answered']} · "
+                          f"{pct(c.get('accuracy_when_answered'))}"
+                          if c.get("answered") else "-")),
+         headers),
+    ]
+
+
+def _quantization_section(quant, aquant, arena):
+    """What packing the student to 4 bits cost, in one table.
+
+    Both halves of it are differences, and both are measured in the same run on
+    the same inputs - the token-level pair on identical completion tokens, the
+    answer-key pair on identical questions. That identity is the entire reason
+    `distilled` and `distilled-w4a16` both play; see kd.arena.PLAYERS.
+    """
+    scheme = quant.get("scheme") or aquant.get("scheme") or "W4A16"
+    rows = []
+    headers = ("Measure", "Dense (bf16)", f"Packed ({scheme})", "Change")
+
+    def num(value, spec=".4f"):
+        return (format(value, spec)
+                if isinstance(value, (int, float)) and math.isfinite(value) else "-")
+
+    def signed(value, spec="+.2f", suffix=""):
+        return (format(value, spec) + suffix
+                if isinstance(value, (int, float)) and math.isfinite(value) else "-")
+
+    if quant.get("perplexity") is not None:
+        rows.append(("Perplexity", num(quant.get("dense_perplexity")),
+                     num(quant.get("perplexity")),
+                     signed(quant.get("perplexity_change_pct"), "+.2f", "%")))
+        rows.append(("Negative log-likelihood", num(quant.get("dense_nll")),
+                     num(quant.get("nll")), signed(quant.get("nll_change"), "+.4f")))
+    if quant.get("bytes"):
+        ratio = quant.get("compression")
+        rows.append(("On disk", _gib(quant.get("dense_bytes")), _gib(quant["bytes"]),
+                     f"{ratio:.1f}× smaller" if ratio else "-"))
+    if quant.get("tok_per_s"):
+        rows.append(("Decode throughput (tokens/sec)",
+                     num(quant.get("dense_tok_per_s"), ".2f"),
+                     num(quant.get("tok_per_s"), ".2f"),
+                     signed(quant.get("throughput_change_pct"), "+.1f", "%")))
+
+    # The answer-key half, from the arena. Independent of everything above: a
+    # perplexity that barely moves and an accuracy that drops three points is a
+    # real and common outcome, and reporting only the first would miss it.
+    if aquant:
+        pct = lambda v: (f"{v * 100:.1f}%" if isinstance(v, float) else "-")
+        rows.append(("Accuracy on the answer key",
+                     pct(aquant.get("accuracy_dense")),
+                     pct(aquant.get("accuracy_packed")),
+                     signed((aquant.get("accuracy_delta") or 0) * 100
+                            if aquant.get("accuracy_delta") is not None else None,
+                            "+.1f", " pts")))
+        rows.append(("Questions it committed to",
+                     str(aquant.get("answered_dense", "-")),
+                     str(aquant.get("answered_packed", "-")),
+                     signed(aquant.get("answered_delta"), "+.0f")))
+        rows.append(("Elo", num(aquant.get("elo_dense"), ".0f"),
+                     num(aquant.get("elo_packed"), ".0f"),
+                     signed(aquant.get("elo_delta"), "+.1f")))
+        if aquant.get("changed_answer") is not None:
+            rows.append(("Gave a different letter", "-", "-",
+                         f"{aquant['changed_answer']} of "
+                         f"{aquant.get('questions', arena.get('questions', 0))}"))
+
+    config = []
+    for label, key in (("scheme", "scheme"), ("group size", "group_size"),
+                       ("kept at full width", "ignore"),
+                       ("calibration sequences", "calibration_samples"),
+                       ("format", "format")):
+        value = quant.get(key) if quant.get(key) is not None else aquant.get(key)
+        if value is not None:
+            config.append(f"{label} {value if not isinstance(value, list) else ', '.join(value)}")
+    title = f"What {scheme} cost"
+    if config:
+        title += " — " + " · ".join(config)
+    return (title, rows, headers)
 
 
 def _sections(payload):
@@ -655,44 +815,38 @@ def _report_rows(payload):
              f"(random baseline {arena.get('random_baseline', 0.25) * 100:.0f}%)",
              rows))
 
-    # Hop-wise cosine between the players' EXPLANATIONS. Computed by the arena,
-    # and until now visible only in the terminal - which meant the one table
-    # that says whether the student reasons like its teacher never reached the
-    # file people actually read.
-    #
-    # Shaped to the four-column table like everything else: one row per hop,
-    # the three columns being the three pairs rather than the three players.
-    # The header is overridden below, because "Base student / Distilled /
-    # Teacher" would be a lie about what these numbers compare.
-    asim = arena.get("similarity") or {}
-    if asim.get("pairs"):
-        pairs = asim["pairs"]
-        want = ("base vs teacher", "distilled vs teacher", "base vs distilled")
-        if "teacher-base" in players:
-            want += ("teacher-base vs teacher",)
+        # WHERE THE QUESTIONS WENT. Accuracy counts silence as error, so a model
+        # that reasons past the token ceiling and never commits scores the same
+        # as one that answers confidently and wrongly. Those are completely
+        # different problems, and this is the only table that separates them.
+        commitment = [
+            ("Correct", *each(lambda e: f"{e.get('correct', 0)} / {total}")),
+            ("Answered, but wrong", *each(lambda e: f"{e.get('wrong', 0)} / {total}")),
+            ("Never committed to a letter",
+             *each(lambda e: f"{e.get('unanswered', 0)} / {total}")),
+        ]
+        if any((players[n] or {}).get("unterminated_think") for n in names
+               if n in players):
+            commitment.append(
+                ("...of which ran out of tokens mid-<think>",
+                 *each(lambda e: str(e.get("unterminated_think", 0)))))
+        if any((players[n] or {}).get("mean_think_tokens") for n in names
+               if n in players):
+            commitment.append(
+                ("Mean tokens spent thinking",
+                 *each(lambda e: fmt(e.get("mean_think_tokens"), ".0f"))))
+        if any((players[n] or {}).get("repetition") for n in names if n in players):
+            commitment.append(
+                ("Fell into a repetition loop",
+                 *each(lambda e: f"{e.get('repetition', 0)} / {total}")))
+        sections.append(("Where the questions went", commitment))
 
-        def cell(pair, hop=None):
-            entry = pairs.get(pair) or pairs.get(" vs ".join(reversed(pair.split(" vs "))))
-            if not entry:
-                return "-"
-            value = (entry.get("overall") if hop is None
-                     else (entry.get("by_hop", {}).get(hop) or {}).get("cosine"))
-            return fmt(value, ".3f")
+        sections += _hop_sections(players, names, columns, pct)
 
-        rows = []
-        for hop in asim.get("hops") or []:
-            counted = ((pairs.get(want[0]) or {}).get("by_hop", {}).get(hop) or {})
-            rows.append((f"{hop} hop  ({counted.get('n', 0)} questions)",
-                         *(cell(p, hop) for p in want)))
-        rows.append(("All questions", *(cell(p) for p in want)))
-        titles = {"base vs teacher": "Base vs teacher",
-                  "distilled vs teacher": "Distilled vs teacher",
-                  "base vs distilled": "Base vs distilled",
-                  "teacher-base vs teacher": "Teacher base vs teacher"}
-        sections.append((
-            "How alike are the explanations? (cosine 0-1, by reasoning depth)",
-            rows,
-            ("Reasoning depth",) + tuple(titles[p] for p in want)))
+    quant = payload.get("quantization") or {}
+    aquant = arena.get("quantization") or {}
+    if quant or aquant:
+        sections.append(_quantization_section(quant, aquant, arena))
 
     if not (fid and cap and eff):
         return sections
@@ -703,18 +857,13 @@ def _report_rows(payload):
     tb_agree = fid.get("top1_agreement_teacher_base_pct")
     tb_kl = fid.get("kl_teacher_base")
     tb_ppl = cap.get("perplexity_teacher_base")
-    tb_ret = close.get("perplexity_retention_teacher_base_pct")
+    quant = payload.get("quantization") or {}
     sections += [
         ("How close is it to the teacher, token by token?", [
             ("Prediction agreement", *per_model({
                 "base": fmt(close.get("prediction_agreement_base_pct"), ".2f") + "%",
                 "distilled": fmt(close.get("prediction_agreement_distilled_pct"), ".2f") + "%",
                 "teacher-base": fmt(tb_agree, ".2f") + "%" if tb_agree is not None else "-",
-                "teacher": "100%"})),
-            ("Perplexity retention", *per_model({
-                "base": fmt(close.get("perplexity_retention_base_pct"), ".2f") + "%",
-                "distilled": fmt(close.get("perplexity_retention_distilled_pct"), ".2f") + "%",
-                "teacher-base": fmt(tb_ret, ".2f") + "%" if tb_ret is not None else "-",
                 "teacher": "100%"})),
         ]),
         ("Fidelity - does it predict what the teacher predicts?", [
@@ -723,6 +872,9 @@ def _report_rows(payload):
                 "distilled": fmt(fid["top1_agreement_distilled_pct"], ".2f") + "%",
                 "teacher-base": fmt(tb_agree, ".2f") + "%" if tb_agree is not None else "-",
                 "teacher": "100%"})),
+            ("Top-5 overlap with teacher", *per_model({
+                "distilled": fmt(fid.get("top5_overlap_distilled"), ".4f"),
+                "teacher": "1.0"})),
             ("KL divergence from teacher (lower is better)", *per_model({
                 "base": fmt(fid["kl_base"]), "distilled": fmt(fid["kl_distilled"]),
                 "teacher-base": fmt(tb_kl), "teacher": "0"})),
@@ -731,6 +883,7 @@ def _report_rows(payload):
             ("Held-out perplexity (lower is better)", *per_model({
                 "base": fmt(cap["perplexity_base"], ".3f"),
                 "distilled": fmt(cap["perplexity_distilled"], ".3f"),
+                "distilled-w4a16": fmt(quant.get("perplexity"), ".3f"),
                 "teacher-base": fmt(tb_ppl, ".3f"),
                 "teacher": fmt(cap["perplexity_teacher"], ".3f")})),
         ]),
@@ -740,29 +893,18 @@ def _report_rows(payload):
                 "teacher-base": (f"{eff['teacher_base_params'] / 1e9:.3f}B"
                                  if eff.get("teacher_base_params") else "-"),
                 "teacher": f"{eff['teacher_params'] / 1e9:.3f}B"})),
+            ("On disk", *per_model({
+                "distilled": _gib(quant.get("dense_bytes")),
+                "distilled-w4a16": _gib(quant.get("bytes"))})),
             ("Decode throughput (tokens/sec)", *per_model({
                 "distilled": fmt(eff.get("distilled_tok_per_s"), ".1f"),
+                "distilled-w4a16": fmt(quant.get("tok_per_s"), ".1f"),
                 "teacher": fmt(eff.get("teacher_tok_per_s"), ".1f")})),
             ("Trainable adapter parameters", *per_model({
                 "distilled": f"{eff['adapter_params'] / 1e6:.2f}M"})),
         ]),
     ]
 
-    sim = payload.get("generation_similarity")
-    if sim:
-        rows = []
-        if "bertscore_f1_base" in sim:
-            rows.append(("BERTScore vs teacher (meaning)", *per_model({
-                "base": fmt(sim["bertscore_f1_base"]),
-                "distilled": fmt(sim["bertscore_f1_distilled"]), "teacher": "1.0"})))
-        if "rougeL_base" in sim:
-            rows.append(("ROUGE-L vs teacher (wording)", *per_model({
-                "base": fmt(sim["rougeL_base"]),
-                "distilled": fmt(sim["rougeL_distilled"]), "teacher": "1.0"})))
-        if rows:
-            sections.insert(3, (
-                f"Free-running similarity - both models writing on their own "
-                f"({sim.get('prompts', '?')} prompts)", rows))
     return sections
 
 
@@ -909,14 +1051,9 @@ def _render_html(payload, facts, sections, summary):
     bars = "".join([
         bar("Gives the teacher's answer",
             as_pct(ab.get("same_answer_pct")), as_pct(ad.get("same_answer_pct"))),
-        bar("Explains it the way the teacher does (cosine as %)",
-            as_pct(ab.get("explanation_cosine")), as_pct(ad.get("explanation_cosine"))),
         bar("Predicts the same next word as the teacher",
             close.get("prediction_agreement_base_pct"),
             close.get("prediction_agreement_distilled_pct")),
-        bar("Understands the domain text as well as the teacher",
-            close.get("perplexity_retention_base_pct"),
-            close.get("perplexity_retention_distilled_pct")),
     ])
 
     head = [
@@ -1055,7 +1192,14 @@ def write_report(payload, path):
     if payload.get("profile"):
         facts.append(("Profile", payload["profile"]))
     if payload.get("device"):
-        facts.append(("Hardware", f"{payload['device']} ({payload.get('dtype')})"))
+        hardware = f"{payload['device']} ({payload.get('dtype')})"
+        # Named only when it is not the default. Two arenas generated by
+        # different engines are not comparable token for token, so a report that
+        # used vLLM has to say so; one that used transformers is the baseline
+        # and adding "hf" to every report would be noise.
+        if arena.get("engine") and arena["engine"] != "hf":
+            hardware += f", {arena['engine']}"
+        facts.append(("Hardware", hardware))
     if payload.get("samples") is not None:
         facts.append(("Held-out samples",
                       f"{payload['samples']} "

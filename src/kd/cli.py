@@ -7,6 +7,7 @@
     kd train          --config configs/qwen/finance.yaml
     kd evaluate       --config configs/qwen/finance.yaml
     kd arena          --config configs/enlibra/enlibraQ3-8B.yaml
+    kd quantize       --config configs/enlibra/enlibraQ3-14B.yaml     pack to W4A16
     kd check-teacher  --config configs/qwen/finance.yaml
     kd fix-teacher    --config configs/qwen/finance.yaml
     kd convert-adapter --teacher-adapter <mlx-adapter>
@@ -67,6 +68,7 @@ SUGAR = [
 DELEGATED = {
     "evaluate": "evaluate",
     "arena": "arena",
+    "quantize": "quantize",
     "check-teacher": "teacher",
     "fix-teacher": "teacher_fix",
     "convert-adapter": "adapters",
@@ -406,7 +408,8 @@ def cmd_doctor(args):
         print(f"   {name:14} {found or 'NOT INSTALLED'}")
 
     print("\n optional features")
-    for label, module in [("evaluation extra (--tasks, --gen-similarity)", "lm_eval"),
+    for label, module in [("batched arena generation (engine: vllm)", "vllm"),
+                          ("quantization (kd quantize)", "llmcompressor"),
                           ("S3 (boto3)", "boto3"),
                           ("RunPod", "runpod")]:
         import importlib.util
@@ -580,6 +583,7 @@ def build_parser():
     for name, help_text in [
         ("evaluate", "Measure teacher->student transfer"),
         ("arena", "Accuracy and Elo on a held-out multiple-choice set"),
+        ("quantize", "Pack the distilled student to 4-bit weights for vLLM"),
         ("check-teacher", "Verify a teacher is fit to distil from"),
         ("fix-teacher", "Repair a checkpoint with mislabelled tensors"),
         ("convert-adapter", "Convert an MLX LoRA adapter to PEFT format"),
