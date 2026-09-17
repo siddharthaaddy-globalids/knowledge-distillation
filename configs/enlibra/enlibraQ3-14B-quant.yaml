@@ -1,0 +1,42 @@
+# ===========================================================================
+#  The 14B profile for the PACKING step alone.
+#
+#  Identical to enlibraQ3-14B.yaml everywhere that matters - same student, same
+#  scheme, same group size, same calibration file - with one switch flipped:
+#
+#      evaluation.engine     vllm -> hf
+#
+#  `kd quantize` merges the adapter and packs it to W4A16 through
+#  llm-compressor. It does not import vLLM, and nothing else in this step does
+#  either. But scripts/runpod.sh decides which optional groups to install by
+#  READING THE CONFIG FILE rather than the command, so the full profile's
+#  `engine: vllm` pulls in the `serve` extra for a step that cannot use it -
+#  and vLLM pins its own exact torch, which is most of a fifteen-minute
+#  install.
+#
+#  With engine: hf only the `quantize` group is added: llm-compressor and
+#  compressed-tensors, which install against the torch already on the pod.
+#
+#      ./run.sh --config configs/enlibra/enlibraQ3-14B-quant.yaml quantize \
+#          --adapter /workspace/runs/<run-id>/final_adapter \
+#          --out     /workspace/runs/<run-id>/quantized
+#
+#  THEN SCORE WITH THE FULL PROFILE. That is where vLLM is genuinely needed -
+#  142 questions times five players at 8192 new tokens - and where its install
+#  pays for itself:
+#
+#      ./run.sh --config configs/enlibra/enlibraQ3-14B.yaml eval --skip upload \
+#          --set s3.cache_dir=/workspace/kd-cache \
+#          --adapter /workspace/runs/<run-id>/final_adapter
+#
+#  --out is not optional above. Standalone `kd quantize` defaults to
+#  <merged>-w4a16 (quantize.py:404), while the arena looks for the packed
+#  student at <bundle>/quantized (paths.py:683). Land it where the arena looks,
+#  which is also what the `quantized` upload group ships.
+# ===========================================================================
+extends: enlibraQ3-14B.yaml
+
+evaluation:
+  # Read here ONLY by runpod.sh's extras check. Nothing in this step evaluates
+  # anything; the real scoring uses the parent profile, on vLLM.
+  engine: hf
