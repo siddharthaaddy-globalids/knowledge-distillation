@@ -272,11 +272,25 @@ def run_worker(args):
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    dataset = calibration_rows(args.calibration, tokenizer,
-                               samples=args.samples,
-                               max_length=args.max_seq_length)
-    print(f"  calibration: {len(dataset)} sequences, "
+    rows = calibration_rows(args.calibration, tokenizer,
+                            samples=args.samples,
+                            max_length=args.max_seq_length)
+    print(f"  calibration: {len(rows)} sequences, "
           f"up to {args.max_seq_length} tokens each")
+
+    # A datasets.Dataset, not the plain list calibration_rows returns.
+    # llm-compressor reads the calibration set's `column_names` before it
+    # builds the dataloader (llmcompressor/transformers/data/base.py), which a
+    # list does not have - the failure is an AttributeError deep inside
+    # oneshot, reported by the parent as a dead worker and therefore as an
+    # out-of-memory that never happened. Older releases accepted a sequence;
+    # this keeps working with both.
+    from datasets import Dataset
+
+    dataset = Dataset.from_list([
+        {"input_ids": list(row["input_ids"]),
+         "attention_mask": list(row["attention_mask"])}
+        for row in rows])
 
     recipe = GPTQModifier(
         targets="Linear",
