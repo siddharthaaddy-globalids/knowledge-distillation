@@ -1,0 +1,92 @@
+# ===========================================================================
+#  Score an adapter that is ALREADY IN THE BUCKET.
+#
+#  The training pod is gone; what survives is the bundle it uploaded. This
+#  profile is the second half of that workflow - fetch the LoRA, pack it to
+#  W4A16, score five players against the held-out set, ship the results back
+#  beside the adapter they describe - on a pod that never trains anything.
+#
+#  It changes nothing about the models or the measurement. Everything below is
+#  a PATH: which adapter, where downloads land, where the packed copy goes.
+#
+#  WHAT TO RUN, in order, on a 48 GB card:
+#
+#    1. Pack. --adapter and --out are still typed, because standalone
+#       `kd quantize` reads neither evaluation.adapter nor
+#       quantization.output_dir (quantize.py:368,404) - it is a tool, not a
+#       stage, and takes its instructions from the command line:
+#
+#         ./run.sh --config configs/enlibra/enlibraQ3-14B-score.yaml quantize \
+#             --adapter s3://enlibra/dss/dev/runs/20260818_215840_neuroscience_8f33eb7cf609/outputs/gkd/runs/enlibraQ3-14B-train-2026-09-17-0558/final_adapter \
+#             --out     /workspace/runs/enlibraQ3-14B-train-2026-09-17-0558/quantized
+#
+#    2. Score. No flags at all - the adapter is named below, and the arena
+#       finds the packed copy through quantization.output_dir (arena.py:895):
+#
+#         ./run.sh --config configs/enlibra/enlibraQ3-14B-score.yaml eval --skip upload
+#
+#    3. Ship. The evaluation and the packed model both sit under
+#       runs/<run-id>/, so one upload sends both to the bundle they came from:
+#
+#         ./run.sh --config configs/enlibra/enlibraQ3-14B-score.yaml \
+#             upload enlibraQ3-14B-train-2026-09-17-0558
+#
+#  --skip upload on step 2 is the 15-minute credential, unchanged: the eval's
+#  own upload stage runs hours after preflight and is guaranteed to find an
+#  expired token. Export fresh credentials, then step 3.
+#
+#  WHY THE PATHS BELOW ARE ABSOLUTE
+#  --------------------------------
+#  A fetched adapter lands in the S3 cache, and kd.paths.derived_dir puts a
+#  merge or a packing beside the adapter it came from - which for a cached
+#  adapter means inside the cache, where nobody looks for results and no upload
+#  group covers it. Pinning quantization.output_dir into the runs tree puts the
+#  packed student in the bundle instead, where `kd upload` ships it.
+#
+#  kd.pipeline.evaluation_home already does the same thing for the evaluation
+#  itself: an adapter fetched from the bucket is scored into
+#  runs/<train-run-id>/evaluation/<eval-id>/, mirroring where the upload puts
+#  it. The two therefore agree, and runs/<train-run-id>/ ends up holding
+#  exactly what the training pod could not produce.
+# ===========================================================================
+extends: enlibraQ3-14B.yaml
+
+evaluation:
+  # The adapter the training pod uploaded. Named here rather than on every
+  # command, so there is no chance of scoring one run and reporting another.
+  # kd.paths.localise fetches it into s3.cache_dir on first use and reuses that
+  # copy afterwards - preflight needs a LIVE token for those few hundred MB.
+  adapter: s3://enlibra/dss/dev/runs/20260818_215840_neuroscience_8f33eb7cf609/outputs/gkd/runs/enlibraQ3-14B-train-2026-09-17-0558/final_adapter
+
+  # Leads the evaluation directory name, so the bundle's evaluation/ listing
+  # says what each scoring was for rather than repeating the profile name.
+  name: w4a16
+
+  # engine: vllm and arena_file are inherited. vLLM is what makes five players
+  # over 142 questions at 8192 new tokens finish in hours rather than days.
+
+quantization:
+  # WHERE THE PACKED STUDENT LANDS, and the single most important line here.
+  #
+  # Without it, kd.paths.quantized_dir derives the location from the adapter -
+  # which is in the cache, because it was fetched - and the arena would look
+  # there while `kd upload` shipped a bundle that never held it. Pinned into
+  # the runs tree, the packed model sits beside the evaluation that scored it
+  # and the `quantized` upload group (remote/s3.py:50) covers it.
+  #
+  # Must match the --out passed to `kd quantize`. If they disagree the packing
+  # succeeds and the arena reports `distilled-w4a16 skipped: no packed
+  # checkpoint`, hours later.
+  output_dir: /workspace/runs/enlibraQ3-14B-train-2026-09-17-0558/quantized
+
+s3:
+  # ON THE VOLUME, not the container disk. This is not tidiness.
+  #
+  # The arena cannot hand vLLM a base plus an adapter, so it materialises the
+  # teacher as a dense checkpoint (arena.py:1097) - 29.5 GB of Qwen3-14B. For
+  # an adapter that is not in a run bundle, kd.paths.derived_dir writes that
+  # merge next to the cache directory, and the default cache is under $HOME on
+  # a pod's 40 GB container disk. That run dies three hours in with ENOSPC.
+  #
+  # Moving the cache here moves the merge with it: /workspace/merged.
+  cache_dir: /workspace/kd-cache
