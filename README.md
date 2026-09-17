@@ -206,6 +206,7 @@ Full key-by-key reference: **[docs/CONFIG.md](docs/CONFIG.md)**.
 | `configs/enlibra/enlibraQ3-8B-mac.yaml` | Stand-in models again, but the **full** schedule and the whole evaluation. Hours, free, and it answers whether distillation works on this data. |
 | `configs/enlibra/enlibraQ3-14B.yaml` | The SFT-tuned Qwen3-14B → Qwen3-8B, on the neuroscience curriculum. The largest pair here; needs an 80 GB GPU. |
 | `configs/enlibra/enlibraQ3-14B-smoke.yaml` | The same pair with stand-in models, small enough to prove the plumbing on a laptop. |
+| `configs/enlibra/enlibraQ3-14B-score.yaml` | Pack and score an adapter **already in the bucket**, on a pod that never trains. Names the adapter, pins where the packed copy goes, and keeps the S3 cache on the volume. Driven by `scripts/score-pod.sh`. |
 
 The training profiles end with the adapter in the bucket and do not evaluate;
 the smoke, flow and mac profiles set `evaluation.after_training: true` because
