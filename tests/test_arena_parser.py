@@ -58,6 +58,21 @@ CASES = {
         "about propagating ripples in spacetime...\n\nOptions B and C describe "
         "phenomena involving neutrinos and charged particles...",
         "D", "labelled"),
+    # --- the fourth one, from the 8B run: a teacher that answers in LaTeX -----
+    # Verbatim shapes from that run's transcript. Every one of these was read as
+    # the last option the model REJECTED, or as no answer at all.
+    "boxed after prose that reviews the rejected options": (
+        "Option B describes ascending spinothalamic tract neurons, which carry "
+        "sensory information. Option D describes proprioceptive afferents, not the "
+        "ventral horn motor neurons receiving corticospinal input. Therefore, the "
+        "cells destroyed by the toxin are the alpha motor neurons of the ventral "
+        "horn.\n\n$$\n\\boxed{C}\n$$",
+        "C", "boxed"),
+    "boxed wrapped in text": (
+        "Therefore, the neuropeptide is **orexin/hypocretin**.\n\n$$\n"
+        "\\boxed{\\text{A}}\n$$",
+        "A", "boxed"),
+    "boxed inline": ("Thus the answer is \\boxed{B}.", "B", "boxed"),
     # --- the curriculum's own shape, and it beats everything ----------------
     "tagged": ("<Explanation>\nBecause.\n</Explanation>\n<Answer>:\nB\n</Answer>",
                "B", "tagged"),
@@ -65,6 +80,9 @@ CASES = {
         "Option A is tempting but wrong. <Answer>: C", "C", "tagged"),
     # --- shapes that already worked -----------------------------------------
     "answer is bold": ("So the answer is **B**.", "B", "labelled"),
+    "the label itself is bold": (
+        "Thus the construct is **working memory**.\n\n**Answer:** D. Working memory",
+        "D", "labelled"),
     "answer colon": ("Answer: D", "D", "labelled"),
     "answer equals": ("answer = (A)", "A", "labelled"),
     "option named": ("I would go with option B here.", "B", "named"),

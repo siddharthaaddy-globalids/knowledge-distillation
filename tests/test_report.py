@@ -142,7 +142,7 @@ def test_arena_alone_renders_html():
 def test_arena_alone_renders_markdown():
     text = render(ARENA_ONLY, ".md", scratch())
     assert "## Summary" in text
-    assert "| Metric | Base student | Distilled | Teacher |" in text
+    assert "| Metric | Base student | Teacher | Distilled |" in text
 
 
 def test_arena_alone_omits_the_sections_it_cannot_fill():
@@ -206,6 +206,30 @@ def test_quantization_appears_only_when_measured():
 def test_the_packed_column_appears_only_when_it_was_played():
     assert "Distilled W4A16" not in _sections(FULL)[0][2]
     assert "Distilled W4A16" in _sections(PACKED)[0][2]
+
+
+def test_a_player_the_pipeline_never_produced_gets_its_own_column():
+    """An API or served model added to the transcript afterwards is a column too.
+
+    It prints under its own key, and BEFORE the teacher: the cells are coloured
+    by position - first where the student started, last the target - so a column
+    appended after the teacher would take the target's colour.
+    """
+    arena = dict(ARENA, players=dict(
+        ARENA["players"], **{"openai-gpt-5": player(100, 0.66, 0.66, 0, 1580.0),
+                             "modal-w4a16": player(99, 0.57, 0.576, 96, 1515.0)}))
+    headers = _sections(dict(ARENA_ONLY, arena=arena))[0][2]
+    assert headers == ("Metric", "Base student", "Teacher", "Distilled",
+                       "openai-gpt-5", "modal-w4a16"), headers
+
+
+def test_a_column_is_dropped_when_that_player_did_not_play():
+    """A report rebuilt for a subset does not invent the players it lacks."""
+    arena = dict(ARENA, players={k: v for k, v in ARENA["players"].items()
+                                 if k != "base"})
+    headers = _sections(dict(ARENA_ONLY, arena=arena))[0][2]
+    assert "Base student" not in headers, headers
+    assert headers == ("Metric", "Teacher", "Distilled"), headers
 
 
 def test_every_row_matches_its_headers():
@@ -431,10 +455,13 @@ def test_the_teachers_base_is_a_column_only_when_it_played():
         for row in rows:
             assert len(row) == len(headers), (title, headers, row)
     headers = sections[0][2]
-    assert headers == ("Metric", "Base student", "Distilled", "Teacher base", "Teacher"), headers
+    assert headers == ("Metric", "Teacher base", "Base student", "Teacher",
+                       "Distilled"), headers
     closeness = dict((r[0], r) for r in sections[0][1])
-    assert closeness["Gave the teacher's answer"][3] == "2 / 4  (50.0%)", closeness
-    assert closeness["Gave the teacher's answer"][4] == "4 / 4  (100.0%)", closeness
+    # Columns are Teacher base, Base student, Teacher, Distilled - so index 1 is
+    # the teacher's own base, and index 3 the teacher, which agrees with itself.
+    assert closeness["Gave the teacher's answer"][1] == "2 / 4  (50.0%)", closeness
+    assert closeness["Gave the teacher's answer"][3] == "4 / 4  (100.0%)", closeness
     summary = " ".join(plain_summary({"arena": arena}))
     assert "fine-tune took it from 50.0%" in summary, summary
 
@@ -442,7 +469,8 @@ def test_the_teachers_base_is_a_column_only_when_it_played():
     del arena["players"]["teacher-base"]
     del arena["agreement"]["teacher vs teacher-base"]
     sections = _sections({"arena": arena, "student": "s", "teacher": "t"})
-    assert sections[0][2] == ("Metric", "Base student", "Distilled", "Teacher"), sections[0][2]
+    assert sections[0][2] == ("Metric", "Base student", "Teacher",
+                              "Distilled"), sections[0][2]
     assert "Teacher base" not in render({"arena": arena, "student": "s", "teacher": "t"},
                                         ".html", scratch())
 
@@ -467,14 +495,15 @@ def test_evaluate_payload_with_a_teacher_base_column():
     }
     sections = _sections(payload)
     for title, rows, headers in sections:
-        assert headers == ("Metric", "Base student", "Distilled", "Teacher base", "Teacher"), \
-            (title, headers)
+        assert headers == ("Metric", "Teacher base", "Base student", "Teacher",
+                           "Distilled"), (title, headers)
         for row in rows:
             assert len(row) == 5, (title, row)
     fidelity = {r[0]: r for s in sections for r in s[1]}
-    assert fidelity["Top-1 agreement with teacher"][3] == "48.00%", fidelity
-    assert fidelity["Held-out perplexity (lower is better)"][3] == "2.500", fidelity
-    assert fidelity["Parameters"][3] == "3.000B", fidelity
+    # Index 1 is the Teacher base column - see the header assertion above.
+    assert fidelity["Top-1 agreement with teacher"][1] == "48.00%", fidelity
+    assert fidelity["Held-out perplexity (lower is better)"][1] == "2.500", fidelity
+    assert fidelity["Parameters"][1] == "3.000B", fidelity
     text = render(payload, ".md", scratch())
     assert "| Teacher base |" in text and "| 48.00% |" in text, text
 

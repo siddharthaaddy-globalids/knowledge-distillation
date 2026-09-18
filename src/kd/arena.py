@@ -83,12 +83,24 @@ ANSWER_PATTERNS = [
     # Tried first, so a tagged answer always beats whatever the explanation
     # above it happened to mention.
     ("tagged", re.compile(rf"<Answer>\s*:?\s*\n?\s*([{OPTIONS}])\b", re.I)),
+    # LaTeX's own "this is my final answer": "$$\n\boxed{D}\n$$", and the
+    # \boxed{\text{A}} spelling of it. A reasoning model that was never taught
+    # the curriculum's tag reaches for this one instead, and it puts it LAST,
+    # after the prose - which is why it has to be tried before the prose
+    # patterns below. Without it the fall-through lands on `named`, and `named`
+    # reads the last "Option C is incorrect because..." as the answer: 18 of the
+    # teacher's 142 answers in the first 8B run were misread that way, 10 as no
+    # answer at all and 8 as a letter it had explicitly rejected.
+    ("boxed", re.compile(
+        rf"\\boxed\{{\s*(?:\\text\{{)?\s*\(?([{OPTIONS}])[.)\s}}]")),
     # "the answer is C", "Answer: D", "answer is **B**", and - the shape that
     # cost a run all three columns on a question - "The correct answer is:\n\nD."
-    # The optional colon after "is" and the \s* that spans the blank line are
-    # both load-bearing.
+    # The optional colon after "is" and the [\s*]* that spans the blank line are
+    # both load-bearing. That class is whitespace and asterisks INTERLEAVED, not
+    # one then the other: markdown bolds the label as well as the letter, and
+    # "**Answer:** D" puts the stars before the space.
     ("labelled", re.compile(
-        rf"\banswers?\s*(?:is\s*:?|:|=)\s*\**\(?([{OPTIONS}])\)?\b", re.I)),
+        rf"\banswers?\s*(?:is\s*:?|:|=)[\s*]*\(?([{OPTIONS}])\)?\b", re.I)),
     # A line that is nothing but the letter: "C", "**C**", "(C)", "D."
     # Anchored to the whole line, so "A star forms..." cannot match.
     ("bare", re.compile(

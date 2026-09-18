@@ -550,10 +550,18 @@ def loss_note(beta, ce_alpha=0.0):
 # The teacher's stock base is a column only when it was scored - a merged
 # teacher checkpoint cannot say what it was built from, and a report that
 # printed a column of dashes for it would look like a measurement that failed.
-COLUMNS = (("base", "Base student"), ("distilled", "Distilled"),
-           ("distilled-w4a16", "Distilled W4A16"),
-           ("teacher-base", "Teacher base"), ("teacher", "Teacher"))
-DEFAULT_HEADERS = ("Metric", "Base student", "Distilled", "Teacher")
+COLUMNS = (("teacher-base", "Teacher base"), ("base", "Base student"),
+           ("teacher", "Teacher"), ("distilled", "Distilled"),
+           ("distilled-w4a16", "Distilled W4A16"))
+DEFAULT_HEADERS = ("Teacher base", "Base student", "Teacher", "Distilled")
+
+# What each column IS, which is what colours it. By name rather than by
+# position, because the order above is a reading order and not a ranking: the
+# two stock checkpoints first, then the teacher they produced, then the students
+# distilled from it, then anything external. Colour by position would call
+# whatever happens to sit last "the target".
+ROLES = {"teacher-base": "c-b", "base": "c-b", "teacher": "c-t",
+         "distilled": "c-d", "distilled-w4a16": "c-d"}
 
 
 def _columns(payload):
@@ -563,8 +571,13 @@ def _columns(payload):
     clearest case: most runs never quantise anything, and an always-present
     W4A16 column full of dashes would suggest a measurement that failed rather
     than one that was never asked for.
+
+    A player the pipeline does not produce - an API model, or one served over
+    HTTP, added to the transcript afterwards - gets a column too, under its own
+    key, after all of them: the pipeline's own columns tell one story in order,
+    and an outside reference is not part of it.
     """
-    players = set((payload.get("arena") or {}).get("players") or {})
+    players = (payload.get("arena") or {}).get("players") or {}
     fid = payload.get("fidelity") or {}
     cap = payload.get("capability") or {}
     has_teacher_base = ("teacher-base" in players
@@ -572,8 +585,19 @@ def _columns(payload):
                         or "perplexity_teacher_base" in cap)
     has_packed = ("distilled-w4a16" in players or bool(payload.get("quantization")))
     optional = {"teacher-base": has_teacher_base, "distilled-w4a16": has_packed}
-    return [(name, header) for name, header in COLUMNS
-            if optional.get(name, True)]
+    # When the arena says who played, that list is the authority: a report
+    # rebuilt from a transcript may be about four of the players, or about ones
+    # the pipeline never heard of, and a column nobody measured is worse than a
+    # missing one. Without an arena the token-level sections still carry the
+    # pipeline's own four, so the shape below is the fallback.
+    if players:
+        optional = {name: name in players for name, _header in COLUMNS}
+        optional["teacher-base"] = has_teacher_base or "teacher-base" in players
+    columns = [(name, header) for name, header in COLUMNS
+               if optional.get(name, True)]
+
+    known = {name for name, _header in COLUMNS}
+    return columns + [(name, name) for name in players if name not in known]
 
 
 def _headers(payload):
@@ -1093,21 +1117,27 @@ def _render_html(payload, facts, sections, summary):
     if bars:
         body.append(f'<section><h2>How close it got</h2>{bars}</section>')
 
-    # Colour by position rather than by name: the first cell is where the
-    # student started, the second where it moved to, the last the target it
-    # moved toward, and anything between (the teacher's base) is context.
-    def styled(cells):
-        classes = ["c-x"] * len(cells)
-        if cells:
-            classes[0], classes[-1] = "c-b", "c-t"
-        if len(cells) > 1:
-            classes[1] = "c-d"
+    # Colour by what each column IS (see ROLES): stock checkpoints muted, the
+    # distilled students in the accent, the teacher as the target, anything
+    # external neutral. A table whose columns are not the models - the W4A16
+    # comparison, with its own headers - falls back to position, where the first
+    # cell is the before and the last the after.
+    model_headers = tuple(header for _name, header in _columns(payload))
+    model_classes = [ROLES.get(name, "c-x") for name, _header in _columns(payload)]
+
+    def styled(cells, headers):
+        if tuple(headers[1:]) == model_headers and len(cells) == len(model_classes):
+            classes = model_classes
+        else:
+            classes = ["c-x"] * len(cells)
+            if cells:
+                classes[0], classes[-1] = "c-b", "c-t"
         return "".join(f'<td class="{cls}">{esc(text)}</td>'
                        for cls, text in zip(classes, cells))
 
     for title, rows, headers in sections:
         cells = "".join(
-            f'<tr><td>{esc(label)}</td>{styled(values)}</tr>'
+            f'<tr><td>{esc(label)}</td>{styled(values, headers)}</tr>'
             for label, *values in rows)
         head_cells = "".join(f"<th>{esc(h)}</th>" for h in headers)
         body.append(
