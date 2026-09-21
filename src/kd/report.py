@@ -955,7 +955,7 @@ _REPORT_CSS = """
 body{margin:0;background:var(--paper);color:var(--ink);
   font:400 16px/1.65 "IBM Plex Sans","Segoe UI",system-ui,sans-serif;
   -webkit-font-smoothing:antialiased}
-.wrap{max-width:50rem;margin:0 auto;padding:3.5rem 1.5rem 4rem;
+.wrap{max-width:78rem;margin:0 auto;padding:3.5rem 1.5rem 4rem;
   display:flex;flex-direction:column;gap:2.75rem}
 .eyebrow{font:500 .72rem/1 "IBM Plex Mono",ui-monospace,monospace;
   letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 .9rem}
@@ -963,7 +963,38 @@ h1{font:600 2.5rem/1.1 Newsreader,Georgia,serif;margin:0;text-wrap:balance;
   letter-spacing:-.01em}
 .lede{color:var(--muted);margin:.5rem 0 0;font-size:1.02rem}
 h2{font:600 1.15rem/1.3 Newsreader,Georgia,serif;margin:0 0 1rem;text-wrap:balance}
-header{border-bottom:1px solid var(--rule);padding-bottom:2rem}
+header{border-bottom:1px solid var(--rule);padding-bottom:2rem;position:relative}
+.theme{position:absolute;top:0;right:0;appearance:none;cursor:pointer;
+  background:var(--card);color:var(--muted);border:1px solid var(--rule);
+  border-radius:999px;padding:.35rem .9rem;
+  font:500 .72rem/1 "IBM Plex Mono",ui-monospace,monospace;letter-spacing:.08em;
+  text-transform:uppercase}
+.theme:hover{color:var(--ink);border-color:var(--ink)}
+/* Who scored what, ranked. The first thing on the page, and the one block that
+   has to read at a glance: name, how far along the track, the number. */
+.board{background:var(--card);border-radius:12px;padding:1.5rem 1.6rem 1.7rem}
+.board h2{margin:0 0 .35rem}
+.board-sub{margin:0 0 1.35rem;color:var(--muted);font-size:.87rem}
+.board-grid{display:grid;gap:.85rem;
+  grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr))}
+.card{position:relative;background:var(--paper);border:1px solid var(--rule);
+  border-radius:10px;padding:1rem .95rem .85rem}
+.card .rank{position:absolute;top:.6rem;right:.75rem;color:var(--muted);
+  font:500 .68rem/1 "IBM Plex Mono",ui-monospace,monospace}
+.card .v{font:600 1.85rem/1 "IBM Plex Mono",ui-monospace,monospace;
+  font-variant-numeric:tabular-nums;color:var(--ink)}
+.card .v small{font-size:.9rem;font-weight:500;color:var(--muted);margin-left:.08rem}
+.card .n{margin:.45rem 0 .7rem;font-size:.8rem;line-height:1.3;color:var(--muted);
+  overflow-wrap:anywhere}
+.card .t{height:.3rem;background:var(--rule);border-radius:999px;overflow:hidden}
+.card .f{height:100%;background:var(--muted);border-radius:999px}
+.card .c{margin-top:.5rem;color:var(--muted);
+  font:400 .7rem/1 "IBM Plex Mono",ui-monospace,monospace}
+.card.ours{border-color:var(--accent);background:var(--card)}
+.card.ours .v{color:var(--accent)}
+.card.ours .n{color:var(--ink);font-weight:600}
+.card.ours .f{background:var(--accent)}
+.card.best .rank{color:var(--ink);font-weight:600}
 
 .verdict{display:grid;grid-template-columns:minmax(8.5rem,auto) 1fr;gap:2rem;
   align-items:start;background:var(--card);border-radius:10px;padding:1.6rem 1.7rem}
@@ -1067,6 +1098,59 @@ def _render_html(payload, facts, sections, summary):
             f'<span class="tick d" style="left:{hi:.2f}%">distilled</span>'
             f'<span class="tick t">teacher</span></div></div>')
 
+    def scoreboard(payload):
+        """Who got the most right, ranked, as the first thing on the page.
+
+        Everything else here answers "how close is the student to the teacher",
+        which is the question the pipeline exists to answer. This answers the
+        question everyone asks first - who scored best - and it should not take
+        scrolling and a table to find out. Ranked rather than in column order,
+        because a ranking is read in one pass and a row of percentages is not.
+        """
+        arena = payload.get("arena") or {}
+        players = arena.get("players") or {}
+        total = arena.get("questions") or 0
+        rows = [(name, header, players.get(name) or {})
+                for name, header in _columns(payload) if name in players]
+        rows = [(n, h, s) for n, h, s in rows
+                if isinstance(s.get("accuracy"), (int, float))]
+        if not rows or not total:
+            return ""
+        rows.sort(key=lambda r: -r[2]["accuracy"])
+        best = rows[0][2]["accuracy"]
+        baseline = arena.get("random_baseline") or 0.25
+
+        out = []
+        for rank, (name, header, stats) in enumerate(rows, start=1):
+            share = stats["accuracy"]
+            correct = stats.get("correct", round(share * total))
+            # The accent marks what this pipeline BUILT - the distilled student
+            # and its packed copy - wherever they land, because they are what
+            # the reader came for. Whoever scored highest is already obvious
+            # from the ranking; colouring that too would say the accent means
+            # "best", and then a run where the student is not best would read
+            # as a run where the accent moved.
+            cls = " ours" if ROLES.get(name) == "c-d" else ""
+            cls += " best" if share >= best else ""
+            # The track runs from the random baseline, not from zero. Every
+            # model here is far above guessing, so a zero-based bar draws seven
+            # near-identical blocks and says nothing; measured from the point
+            # where a coin would sit, the differences are the shape.
+            fill = max(0.0, min((share - baseline) / (1 - baseline), 1.0)) * 100
+            out.append(
+                f'<div class="card{cls}">'
+                f'<div class="rank">{rank}</div>'
+                f'<div class="v">{share * 100:.1f}<small>%</small></div>'
+                f'<div class="n">{esc(header)}</div>'
+                f'<div class="t"><div class="f" style="width:{fill:.2f}%"></div></div>'
+                f'<div class="c">{correct} of {total}</div></div>')
+        return (
+            '<section class="board"><h2>Correct on the answer key</h2>'
+            f'<p class="board-sub">{total} held-out questions, one answer key, every '
+            f'model asked the same way. Bars run from {baseline * 100:.0f}% '
+            '(guessing) to 100%.</p>'
+            f'<div class="board-grid">{"".join(out)}</div></section>')
+
     # The closeness bars lead, because they are the main score; the token-level
     # pair from kd.evaluate follow when the evaluation ran.
     answer = _closeness(payload.get("arena") or {})
@@ -1094,6 +1178,12 @@ def _render_html(payload, facts, sections, summary):
     student = str(payload.get("student") or "the student").rstrip("/").split("/")[-1]
     teacher = str(payload.get("teacher") or "").rstrip("/").split("/")[-1]
     body = ['<div class="wrap"><header>',
+            # The page follows the reader's system theme until they say
+            # otherwise; the button is for when the room disagrees with the
+            # laptop. The choice is remembered per browser, and the stylesheet
+            # already keys off data-theme, so this only has to set it.
+            '<button id="theme" class="theme" type="button" '
+            'aria-label="Switch between light and dark">Light</button>',
             '<p class="eyebrow">Knowledge distillation &middot; evaluation</p>',
             f'<h1>{esc(student)}</h1>',
             (f'<p class="lede">Distilled from <strong>{esc(teacher)}</strong>, '
@@ -1102,6 +1192,9 @@ def _render_html(payload, facts, sections, summary):
              '<p class="lede">Measured against its own untrained self on a '
              'held-out answer key.</p>'),
             '</header>']
+
+    # Who scored what, first. Then the headline the pipeline cares about.
+    body.append(scoreboard(payload))
 
     # The headline number is how close the distilled student is to the teacher.
     # The caption says which measurement is on the page, because the answer-
@@ -1195,10 +1288,30 @@ def _render_html(payload, facts, sections, summary):
                 'worked&rdquo; from &ldquo;the small model could already do this&rdquo;. '
                 'Read the change, not the absolute value.</footer></div>')
 
+    # Applied before the body renders, so a reader who chose light does not get
+    # a flash of dark first. Everything it touches is one attribute, and both
+    # the read and the write are guarded: a file:// page with site data blocked
+    # throws on localStorage, and a report that will not open is worse than one
+    # that forgets a preference.
+    script = (
+        "<script>(function(){var r=document.documentElement,k='kd-theme';"
+        "function paint(t){if(t){r.dataset.theme=t}else{delete r.dataset.theme}"
+        "var b=document.getElementById('theme');if(b){var dark=t?t==='dark':"
+        "window.matchMedia('(prefers-color-scheme: dark)').matches;"
+        "b.textContent=dark?'Light':'Dark'}}"
+        "var saved=null;try{saved=localStorage.getItem(k)}catch(e){}paint(saved);"
+        "document.addEventListener('DOMContentLoaded',function(){paint(saved);"
+        "var b=document.getElementById('theme');if(!b)return;"
+        "b.addEventListener('click',function(){var dark=r.dataset.theme?"
+        "r.dataset.theme==='dark':window.matchMedia('(prefers-color-scheme: dark)')"
+        ".matches;var next=dark?'light':'dark';saved=next;"
+        "try{localStorage.setItem(k,next)}catch(e){}paint(next)})})})();</script>")
+
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<title>Distillation evaluation</title>"
-            + "".join(head) + "</head><body>" + "".join(body) + "</body></html>")
+            + "".join(head) + script + "</head><body>" + "".join(body)
+            + "</body></html>")
 
 
 def write_report(payload, path):
