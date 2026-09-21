@@ -73,6 +73,34 @@ CASES = {
         "\\boxed{\\text{A}}\n$$",
         "A", "boxed"),
     "boxed inline": ("Thus the answer is \\boxed{B}.", "B", "boxed"),
+    # --- the fifth one, from a model served over HTTP: the letter comes FIRST --
+    # It concludes "Therefore, C is the correct answer" about a third of the
+    # time. Read by the last rule instead, that is the last option it RULED OUT.
+    "concludes with the letter before the phrase": (
+        "Option D is incorrect because the Golgi packages neurotransmitters, but the "
+        "problem is with axonal elongation. Therefore, A is the correct answer.",
+        "A", "labelled"),
+    "letter first, bold, no comma": (
+        "Nociception is pain, which is not related here. **C** is the correct answer.",
+        "C", "labelled"),
+    "letter first, superlative": (
+        "Weighing them up, B is the best answer.", "B", "labelled"),
+    "the last conclusion wins across both word orders": (
+        "At first the answer is A. On reflection, D is the correct answer.",
+        "D", "labelled"),
+    "restated inline after the subject": (
+        "Therefore, the most directly implicated syndrome is B. Sudden infant death "
+        "syndrome.", "B", "restated"),
+    "restated inline with a colon": (
+        "Therefore, the best explanation for the new symptoms is D: Blockade of D2 "
+        "receptors in the nigrostriatal pathway.", "D", "restated"),
+    "an article is not an option letter": (
+        "The observed result is a. Nothing here names a choice.", None, None),
+    "an option ruled out is not an answer": (
+        "Option C is incorrect because the amygdala is involved in emotional memory. "
+        "Therefore, the hippocampal formation is the correct answer.", None, None),
+    "an option ruled in still counts": (
+        "Working through them, option B is correct here.", "B", "named"),
     # --- the curriculum's own shape, and it beats everything ----------------
     "tagged": ("<Explanation>\nBecause.\n</Explanation>\n<Answer>:\nB\n</Answer>",
                "B", "tagged"),

@@ -93,14 +93,25 @@ ANSWER_PATTERNS = [
     # answer at all and 8 as a letter it had explicitly rejected.
     ("boxed", re.compile(
         rf"\\boxed\{{\s*(?:\\text\{{)?\s*\(?([{OPTIONS}])[.)\s}}]")),
-    # "the answer is C", "Answer: D", "answer is **B**", and - the shape that
-    # cost a run all three columns on a question - "The correct answer is:\n\nD."
-    # The optional colon after "is" and the [\s*]* that spans the blank line are
-    # both load-bearing. That class is whitespace and asterisks INTERLEAVED, not
-    # one then the other: markdown bolds the label as well as the letter, and
-    # "**Answer:** D" puts the stars before the space.
+    # A labelled answer, in either word order.
+    #
+    # Forwards: "the answer is C", "Answer: D", "answer is **B**", and - the
+    # shape that cost a run all three columns on a question - "The correct
+    # answer is:\n\nD." The optional colon after "is" and the [\s*]* that spans
+    # the blank line are both load-bearing. That class is whitespace and
+    # asterisks INTERLEAVED, not one then the other: markdown bolds the label as
+    # well as the letter, and "**Answer:** D" puts the stars before the space.
+    #
+    # Backwards: "Therefore, C is the correct answer." A model that reasons
+    # through the options and then concludes writes it this way about a third of
+    # the time, and it is the LAST thing it writes. Both orders live in one
+    # pattern rather than two so that "last match wins" still decides between
+    # them - a completion that opens "the answer is C" and closes "D is the
+    # correct answer" means D, and pattern precedence would have said C.
     ("labelled", re.compile(
-        rf"\banswers?\s*(?:is\s*:?|:|=)[\s*]*\(?([{OPTIONS}])\)?\b", re.I)),
+        rf"\banswers?\s*(?:is\s*:?|:|=)[\s*]*\(?([{OPTIONS}])\)?\b"
+        rf"|\b\(?([{OPTIONS}])\)?\**\s+is\s+the\s+"
+        rf"(?:correct|right|best|final|most\s+\w+)\s+answer\b", re.I)),
     # A line that is nothing but the letter: "C", "**C**", "(C)", "D."
     # Anchored to the whole line, so "A star forms..." cannot match.
     ("bare", re.compile(
@@ -116,14 +127,30 @@ ANSWER_PATTERNS = [
     # than as the one line following "is:" - and when it does introduce that
     # list with a colon, the conclusion that follows it is the LAST match, which
     # is the one that wins.
+    #
+    # The same conclusion inline: "...the most directly implicated syndrome is
+    # B. Sudden infant death syndrome." The letter is there, immediately after
+    # "is", but the word before it is the subject rather than "answer", so the
+    # labelled pattern cannot see it. What identifies it is the shape after the
+    # letter - a full stop or colon, then the option's own words, capitalised.
+    # The letter is matched case-SENSITIVELY here, so that ordinary prose like
+    # "the result is a. Something" cannot be read as option A.
     ("restated", re.compile(
-        rf":[ \t]*\n\s*\**\(?([{OPTIONS}])\)?[.:)](?=\s)", re.I)),
+        rf":[ \t]*\n\s*\**\(?([{OPTIONS}])\)?[.:)](?=\s)"
+        rf"|\bis\s+\**\(?(?-i:([{OPTIONS}]))\)?\**\s*[.:]\s+(?=[A-Z])", re.I)),
     # "option C", "choice B". Last, because it is the weakest: a model that
     # gives its answer and then reviews the ones it rejected - "Option A talks
     # about..." - names a rejected letter LAST, and this pattern would pick it.
     # Every shape above catches the actual answer before it gets the chance.
+    # An option the model has just RULED OUT is never its answer, however late
+    # in the text it appears. Without this the rule reads "Option C is incorrect
+    # because..." as a vote for C, which is the exact opposite of what was
+    # written - and since this is the last rule, nothing catches it afterwards.
+    # Leaving such a completion unparsed is the better failure: an unanswered
+    # question is visible in the report, a confidently wrong letter is not.
     ("named", re.compile(
-        rf"\b(?:option|choice)\s+\**\(?([{OPTIONS}])\)?\b", re.I)),
+        rf"\b(?:option|choice)\s+\**\(?([{OPTIONS}])\)?\**\b"
+        rf"(?!\s+is\s+(?:incorrect|wrong|not\b))", re.I)),
 ]
 
 # How many unanswered completions to keep per player, and how much of each.
@@ -153,7 +180,15 @@ def extract_answer_detail(text):
     if not text:
         return None, None
     for how, pattern in ANSWER_PATTERNS:
-        found = pattern.findall(text)
+        # A pattern may hold more than one alternative - the same shape written
+        # two ways - and only one of its groups matches. Take whichever did, so
+        # the alternatives compete on position within the pattern instead of
+        # being ranked against each other by the order they were written in.
+        found = [
+            next((g for g in match.groups() if g), None)
+            for match in pattern.finditer(text)
+        ]
+        found = [letter for letter in found if letter]
         if found:
             return found[-1].upper(), how
     return None, None

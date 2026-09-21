@@ -37,6 +37,7 @@ import json
 import os
 import random
 import re
+import ssl
 import sys
 import time
 import urllib.error
@@ -63,12 +64,38 @@ section, tbl = oa.section, oa.tbl
 # hand it the answer-format instruction openai_arena.py uses instead.
 DEFAULT_SYSTEM = ""
 
-CORE_PLAYERS = ("base", "distilled")
+# Everything the pipeline itself can produce. Anything else in a transcript was
+# put there by a script like this one, and is what "an earlier pass" means.
+CORE_PLAYERS = ("base", "distilled", "distilled-w4a16", "teacher-base")
 
 
 # --------------------------------------------------------------------------------------
 # the endpoint
 # --------------------------------------------------------------------------------------
+
+
+def build_ssl_context(ca_bundle=None):
+    """(context, what it trusts).
+
+    Windows builds its trust from the OS certificate store, and that store goes
+    stale: a root expires, nobody notices, and every https call fails with
+    "certificate has expired" pointing at a server whose own certificate is
+    perfectly valid. certifi ships a current bundle and is already in this
+    project's environment, so it is preferred when present - the same thing
+    requests has always done. --ca-bundle overrides both, for a corporate root.
+    """
+    explicit = ca_bundle or os.environ.get("SSL_CERT_FILE")
+    if explicit:
+        if not os.path.exists(explicit):
+            raise SystemExit(f"--ca-bundle {explicit} does not exist")
+        return ssl.create_default_context(cafile=explicit), explicit
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where()), \
+            f"certifi {certifi.__version__}"
+    except ImportError:
+        return ssl.create_default_context(), "the system certificate store"
 
 
 def parse_header(raw):
@@ -101,10 +128,19 @@ class ModalClient(oa.OpenAIClient):
     answer parser and the truncation checks see what they saw for the local players.
     """
 
-    def __init__(self, headers, seed=None, top_p=None, extra_body=None, **kw):
+    def __init__(self, headers, seed=None, top_p=None, extra_body=None,
+                 ssl_context=None, **kw):
         kw.setdefault("api_key", "")
         super().__init__(**kw)
         self.headers = headers
+        self.ssl_context = ssl_context
+        # An authentication failure is the same on question 1 and question 142.
+        # After a few of them the run is over, and the only thing left to decide
+        # is how many pointless requests to send first. The answer is none: the
+        # rest return the stored error without touching the network, so the run
+        # ends in seconds with every row marked and the reason printed once.
+        self._auth_halt = None
+        self._auth_failures = 0
         self.seed = seed
         self.top_p = top_p
         self.extra_body = extra_body or {}
@@ -122,7 +158,16 @@ class ModalClient(oa.OpenAIClient):
         body.update(self.extra_body)
         return body
 
+    def _halted(self):
+        return {
+            "completion": "", "finish_reason": "error", "latency_s": None,
+            "prompt_tokens": None, "completion_tokens": None,
+            "reasoning_tokens": None, "model": self.model, "error": self._auth_halt,
+        }
+
     def complete(self, prompt, system):
+        if self._auth_halt:
+            return self._halted()
         url = f"{self.base_url}/chat/completions"
         delay, last_err = 1.5, None
         for attempt in range(self.max_retries + 1):
@@ -132,7 +177,8 @@ class ModalClient(oa.OpenAIClient):
             )
             started = time.time()
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=self.timeout,
+                                            context=self.ssl_context) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 elapsed = time.time() - started
                 choice = (data.get("choices") or [{}])[0]
@@ -166,6 +212,13 @@ class ModalClient(oa.OpenAIClient):
                     continue
                 if exc.code in (401, 403):
                     last_err += "  (check --api-key / --modal-key / --modal-secret)"
+                    with self._lock:
+                        self._auth_failures += 1
+                        if self._auth_failures >= 3 and not self._auth_halt:
+                            self._auth_halt = last_err
+                            print(f"\n  !! giving up on the rest: the endpoint refuses these "
+                                  f"credentials for {self.model}\n     {last_err}\n",
+                                  file=sys.stderr, flush=True)
                     break
                 if exc.code == 404:
                     last_err += "  (is --base-url the /v1 root of the Modal endpoint?)"
@@ -189,18 +242,30 @@ class ModalClient(oa.OpenAIClient):
         }
 
 
-def list_models(base_url, headers, timeout=60.0):
-    """Ask the endpoint what it is serving. Returns (ids, error)."""
+def list_models(base_url, headers, timeout=60.0, context=None):
+    """Ask the endpoint what it is serving. Returns (records, error).
+
+    The whole record, not just the id: a served model may describe itself with
+    fields OpenAI never defined - who owns it, what domain it was trained for,
+    what card it is on - and those belong in the report, because "which model
+    was this column" is the first thing anyone asks six months later.
+    """
     req = urllib.request.Request(f"{base_url.rstrip('/')}/models", headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return [m.get("id") for m in (data.get("data") or []) if m.get("id")], None
+        return [m for m in (data.get("data") or []) if m.get("id")], None
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")[:200]
         return [], f"HTTP {exc.code}: {body}"
     except Exception as exc:
         return [], f"{type(exc).__name__}: {exc}"
+
+
+# Fields worth printing when the endpoint volunteers them, and what to call them.
+MODEL_FIELDS = (("owned_by", "owner"), ("domain", "domain"), ("gpu", "gpu"),
+                ("created", "created"), ("max_model_len", "context"),
+                ("quantization", "quantization"))
 
 
 def run_modal(records, client, system, cache, cache_path, workers, limit):
@@ -376,9 +441,15 @@ def serving_cost(st, meta, rate_per_hour):
 
 
 def new_sections(records, st, player, label, elo, teacher, others, system,
-                 base_url, meta, rate_per_hour):
+                 base_url, meta, rate_per_hour, parity_with=None, model_info=None):
     n = st["n"]
     parts = []
+    # The player this column is a second copy of, when it is one. An endpoint
+    # may be serving the very model in another column - the same weights, packed
+    # and served, where the gap between the two is what SERVING cost - or it may
+    # be a different model altogether, which is a contender and not a control.
+    # Only the person running it knows which, so only --parity-with says so.
+    twin = player_stats(records, parity_with, teacher) if parity_with else None
     dist = player_stats(records, "distilled", teacher)
     tea = player_stats(records, teacher, teacher)
 
@@ -389,33 +460,40 @@ def new_sections(records, st, player, label, elo, teacher, others, system,
         f"on the answer key and gives the teacher's answer {pct(st['agree_teacher_pct'])} of "
         "the time.</p>"
     ]
-    if dist:
-        delta = st["acc_all"] - dist["acc_all"]
+    if twin:
+        delta = st["acc_all"] - twin["acc_all"]
         verdict = "ahead of" if delta > 0.005 else ("behind" if delta < -0.005 else "level with")
+        aw, bw, both, neither = oa.head_to_head(records, player, parity_with)
+        same, total = oa.agreement(records, player, parity_with)
         lines.append(
-            f"<p>That is {verdict} the locally scored distilled student "
-            f"({pct(dist['acc_all'])}) by {abs(delta) * 100:.1f} points"
-            + (f", and {'ahead of' if st['acc_all'] > tea['acc_all'] else 'behind'} the teacher "
-               f"({pct(tea['acc_all'])})" if tea else "")
-            + ".</p>"
-        )
-        aw, bw, both, neither = oa.head_to_head(records, player, "distilled")
-        same, total = oa.agreement(records, player, "distilled")
-        lines.append(
-            f"<p>Question by question against that local run: both right on {both}, both wrong "
-            f"on {neither}, the served copy alone right on {aw}, the local copy alone right on "
-            f"{bw}. The two committed to the same letter on {same} of {total} "
+            f"<p>That is {verdict} the locally scored <code>{html_mod.escape(parity_with)}</code> "
+            f"({pct(twin['acc_all'])}) by {abs(delta) * 100:.1f} points. Question by question: "
+            f"both right on {both}, both wrong on {neither}, the served copy alone right on "
+            f"{aw}, the local copy alone right on {bw}, the same letter on {same} of {total} "
             f"({pct(same / total) if total else DASH}).</p>"
         )
         lines.append(
-            "<p>If this endpoint is serving that same student, the gap between the two columns "
-            "is what serving cost it - quantisation, a different kernel, a different sampler - "
+            "<p>These are meant to be the same weights, so the gap between the two columns is "
+            "what serving cost them - quantisation, a different kernel, a different sampler - "
             "and not what training bought.</p>"
         )
     else:
+        if dist:
+            delta = st["acc_all"] - dist["acc_all"]
+            verdict = ("ahead of" if delta > 0.005
+                       else ("behind" if delta < -0.005 else "level with"))
+            lines.append(
+                f"<p>That is {verdict} the distilled student ({pct(dist['acc_all'])}) by "
+                f"{abs(delta) * 100:.1f} points"
+                + (f", and {'ahead of' if st['acc_all'] > tea['acc_all'] else 'behind'} the "
+                   f"teacher ({pct(tea['acc_all'])})" if tea else "")
+                + ".</p>"
+            )
         lines.append(
-            "<p>This column is an external reference point measured on your own hardware; "
-            "nothing here was trained on it.</p>"
+            "<p>This is a separate model measured on the same answer key, not a copy of "
+            "anything else in this table: it was not distilled from this teacher and nothing "
+            "here was trained on it. It is a contender, not a control - the tables below say "
+            "where it agrees and where it differs, not what any gap cost.</p>"
         )
     parts.append(
         '<section class="verdict"><div><div class="big big-m">'
@@ -473,13 +551,16 @@ def new_sections(records, st, player, label, elo, teacher, others, system,
     ))
 
     # --- serving parity ------------------------------------------------------------------
-    if dist:
-        aw, bw, both, neither = oa.head_to_head(records, player, "distilled")
-        same, total = oa.agreement(records, player, "distilled")
+    # Only when the caller says the two are the same weights. Against a model
+    # trained some other way this table would be measuring a difference it then
+    # mislabels as a serving cost.
+    if twin:
+        aw, bw, both, neither = oa.head_to_head(records, player, parity_with)
+        same, total = oa.agreement(records, player, parity_with)
         drift = [
             r for r in records
             if r.get("players", {}).get(player, {}).get("answer")
-            != r.get("players", {}).get("distilled", {}).get("answer")
+            != r.get("players", {}).get(parity_with, {}).get("answer")
         ]
         rows = [
             [("Questions compared", ""), (total, "c-x")],
@@ -490,12 +571,12 @@ def new_sections(records, st, player, label, elo, teacher, others, system,
             [("Local copy only", ""), (bw, "c-d")],
             [("Both wrong", ""), (neither, "c-x")],
             [("Accuracy, served", ""), (pct(st["acc_all"]), "c-m")],
-            [("Accuracy, local", ""), (pct(dist["acc_all"]), "c-d")],
+            [("Accuracy, local", ""), (pct(twin["acc_all"]), "c-d")],
             [("Difference", ""),
-             (f"{(st['acc_all'] - dist['acc_all']) * 100:+.1f} points", "c-m")],
+             (f"{(st['acc_all'] - twin['acc_all']) * 100:+.1f} points", "c-m")],
         ]
         parts.append(section(
-            "Serving parity with the local distilled student",
+            f"Serving parity with the local {parity_with}",
             tbl("The same weights scored two ways will not always agree: a 4-bit pack, a "
                 "different attention kernel and a different sampler each move individual "
                 "answers. This is how far they moved here.",
@@ -556,6 +637,19 @@ def new_sections(records, st, player, label, elo, teacher, others, system,
         (r["players"][player].get("model") for r in records
          if r.get("players", {}).get(player, {}).get("model")), label
     )
+    # Whatever the endpoint said about itself, so "which model was this column"
+    # has an answer in the document rather than in someone's memory.
+    described = ""
+    for key, title in MODEL_FIELDS:
+        value = (model_info or {}).get(key)
+        if value in (None, ""):
+            continue
+        if key == "created":
+            try:
+                value = datetime.fromtimestamp(int(value)).strftime("%Y-%m-%d")
+            except (TypeError, ValueError, OSError):
+                pass
+        described += f"{title:<10}{html_mod.escape(str(value))}\n"
     parts.append(section(
         "How the Modal endpoint was asked",
         "<p>The user message is byte-for-byte the <code>prompt</code> field already in the "
@@ -563,6 +657,7 @@ def new_sections(records, st, player, label, elo, teacher, others, system,
         "to an OpenAI-compatible <code>/chat/completions</code> endpoint:</p>"
         f'<pre class="cmd">endpoint  {html_mod.escape(str(served_by))}\n'
         f"model     {html_mod.escape(str(model_id))}\n"
+        f"{described}"
         f'system    {html_mod.escape(system or "(none - the bare prompt, as the local players were asked)")}</pre>'
     ))
     return "".join(parts)
@@ -578,7 +673,8 @@ STANDALONE_EXTRA_CSS = (
 
 
 def standalone_report(records, st, player, label, elo, teacher, others, system,
-                      base_url, meta, rate_per_hour):
+                      base_url, meta, rate_per_hour, parity_with=None,
+                      model_info=None):
     """Used when no existing report.html was supplied: everything the transcript can prove."""
     pool = others + [player]
     cls_of = {"base": "c-b", "distilled": "c-d", teacher: "c-t", player: "c-m"}
@@ -621,7 +717,7 @@ def standalone_report(records, st, player, label, elo, teacher, others, system,
         + section("Accuracy by reasoning depth",
                   tbl("Correct out of everything asked.", ["Reasoning depth"] + pool, hop_rows))
         + new_sections(records, st, player, label, elo, teacher, others, system,
-                       base_url, meta, rate_per_hour)
+                       base_url, meta, rate_per_hour, parity_with, model_info)
     )
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -641,7 +737,8 @@ def standalone_report(records, st, player, label, elo, teacher, others, system,
 
 
 def rebuild_report(report_html, report_path, records, player, label, out_path,
-                   system, teacher, base_url, meta, rate_per_hour):
+                   system, teacher, base_url, meta, rate_per_hour,
+                   parity_with=None, model_info=None):
     st = player_stats(records, player, teacher)
     if not st:
         raise SystemExit(f"no player named {player!r} in the transcript")
@@ -657,7 +754,7 @@ def rebuild_report(report_html, report_path, records, player, label, out_path,
             )
         html, touched = inject_column(report_html, st, records, label, teacher)
         extra = new_sections(records, st, player, label, elo, teacher, others, system,
-                             base_url, meta, rate_per_hour)
+                             base_url, meta, rate_per_hour, parity_with, model_info)
         for anchor in ('<section><h2>How it was trained</h2>', "<footer"):
             if anchor in html:
                 html = html.replace(anchor, extra + anchor, 1)
@@ -677,7 +774,7 @@ def rebuild_report(report_html, report_path, records, player, label, out_path,
         if report_path:
             print(f"  ! {report_path} not found, writing a standalone report instead")
         html = standalone_report(records, st, player, label, elo, teacher, others, system,
-                                 base_url, meta, rate_per_hour)
+                                 base_url, meta, rate_per_hour, parity_with, model_info)
         touched = 0
 
     with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
@@ -727,8 +824,13 @@ def build_parser():
                     help="Modal proxy-auth secret, sent as Modal-Secret (default: $MODAL_SECRET)")
     ap.add_argument("--header", action="append", default=[], metavar="'Name: value'",
                     help="extra request header; repeatable")
-    ap.add_argument("--model", default=None,
-                    help="served model id (default: whatever /v1/models reports first)")
+    ap.add_argument("--ca-bundle", default=None, metavar="PEM",
+                    help="certificate authorities to verify the endpoint against "
+                         "(default: $SSL_CERT_FILE, else certifi, else the system store)")
+    ap.add_argument("--model", required=True,
+                    help="served model id. Required: an endpoint can serve several, "
+                         "and which one a column was measured on is not a detail to "
+                         "leave to whatever /v1/models happens to list first")
     ap.add_argument("--player-name", default=None,
                     help="key for the new player in the transcript (default: modal-<model>)")
     ap.add_argument("--label", default=None,
@@ -761,6 +863,11 @@ def build_parser():
                     help="verify the inputs and the endpoint, print the plan, write nothing")
     ap.add_argument("--gpu-cost-per-hour", type=float, default=None,
                     help="USD/hour for the Modal GPU, to show a cost line")
+    ap.add_argument("--parity-with", default=None, metavar="PLAYER",
+                    help="the player this endpoint is serving a copy of, e.g. "
+                         "'distilled-w4a16'. Adds a serving-parity section reading the "
+                         "gap between the two as what serving cost. Leave unset for a "
+                         "model trained some other way - it is a contender, not a control")
     ap.add_argument("--teacher", default="teacher", help="player key used as the teacher")
     ap.add_argument("--verbose", action="store_true")
     return ap
@@ -785,33 +892,56 @@ def main(argv=None):
         args.modal_secret or os.environ.get("MODAL_SECRET"),
         dict(parse_header(h) for h in args.header),
     )
-    model, served, endpoint_note = args.model, [], None
+    ssl_context, trust = build_ssl_context(args.ca_bundle)
+    model, served, endpoint_note, model_info = args.model, [], None, None
     if not args.report_only:
         if not base_url:
             raise SystemExit(
                 "no endpoint: pass --base-url or set MODAL_BASE_URL to the /v1 root of the "
                 "Modal web endpoint (or use --report-only to skip the endpoint)"
             )
-        served, err = list_models(base_url, headers, min(args.timeout, 120.0))
+        served, err = list_models(base_url, headers, min(args.timeout, 120.0),
+                                  ssl_context)
         if err:
             endpoint_note = f"could not list models: {err}"
             if not model:
-                raise SystemExit(
-                    f"{base_url}/models did not answer ({err}).\n"
-                    "Pass --model to skip discovery if the endpoint is up but does not serve "
-                    "/v1/models, or check the URL and the credentials."
-                )
+                hint = ("Pass --model to skip discovery if the endpoint is up but does not "
+                        "serve /v1/models, or check the URL and the credentials.")
+                if "CERTIFICATE_VERIFY_FAILED" in err:
+                    hint = (
+                        f"This run verified against {trust}. A stale OS certificate store is "
+                        "the usual cause on Windows - the server's own certificate is often "
+                        "fine.\n"
+                        "  Try:  python -m pip install --upgrade certifi\n"
+                        "  or:   --ca-bundle <path to a current .pem>  (a corporate root "
+                        "belongs here too)")
+                elif "HTTP 401" in err or "HTTP 403" in err:
+                    hint = (
+                        "The endpoint answered, but rejected the credentials. Set the ones "
+                        "your deployment uses:\n"
+                        "  proxy auth:   $env:MODAL_KEY / $env:MODAL_SECRET\n"
+                        "  bearer token: $env:MODAL_API_KEY\n"
+                        "  anything else: --header 'Name: value'")
+                raise SystemExit(f"{base_url}/models did not answer ({err}).\n  {hint}")
         else:
-            endpoint_note = "reachable, serving: " + (", ".join(served) or "(nothing listed)")
-            if not model:
-                if not served:
-                    raise SystemExit(f"{base_url}/models listed no models; pass --model")
-                model = served[0]
-            elif served and model not in served:
-                endpoint_note += f"  ! --model {model} is not among them"
-    if not model:
-        model = "modal"
-
+            ids = [m.get("id") for m in served]
+            endpoint_note = "reachable, serving: " + (", ".join(ids) or "(nothing listed)")
+            # /v1/models answered, so its list is authoritative: a model that is
+            # not on it will fail on every question, and failing now costs one
+            # request instead of a sweep. (When the listing itself fails we do
+            # not second-guess the caller - see the branch above.)
+            if ids and model not in ids:
+                raise SystemExit(
+                    f"{base_url} does not serve {model!r}.\n"
+                    f"  It serves: {', '.join(ids)}\n"
+                    "  Run scripts/probe_modal.py to see which of those your "
+                    "credentials can actually call.")
+            model_info = next((m for m in served if m.get("id") == model), None)
+            described = ", ".join(
+                f"{title} {model_info[key]}" for key, title in MODEL_FIELDS
+                if (model_info or {}).get(key) not in (None, "") and key != "created")
+            if described:
+                endpoint_note += f"\n                    {described}"
     player = args.player_name or f"modal-{slug(model)}"
     label = args.label or str(model)
 
@@ -825,9 +955,39 @@ def main(argv=None):
     out_report = args.out_report or (
         report_path if (args.in_place and report_path) else f"{rbase}.modal{rext or '.html'}"
     )
+    # Adding a SECOND served model chains onto the first one's output, and the
+    # default name for that output is the name it already has - so the run would
+    # write over the file it was given without being asked to. Both readings are
+    # reasonable (accumulate in place, or keep each model's file), so neither is
+    # assumed: the run stops and the caller says which.
+    def same_file(a, b):
+        return a and b and os.path.abspath(a) == os.path.abspath(b)
+
+    if not args.in_place:
+        if same_file(out_transcript, transcript_path) and not args.out_transcript:
+            raise SystemExit(
+                f"the default output is the input itself ({transcript_path}).\n"
+                "  That happens when you chain onto a transcript this script already "
+                "wrote - adding a second served model, say.\n"
+                "  --in-place                     accumulate every column in that one file\n"
+                f"  --out-transcript <name>.jsonl  keep this model's answers separately")
+        if same_file(out_report, report_path) and not args.out_report:
+            raise SystemExit(
+                f"the default report output is the input report ({report_path}).\n"
+                "  Pass --out-report <name>.html, or --in-place to overwrite it.")
+
     cache_path = args.cache or f"{os.path.splitext(out_transcript)[0]}.cache.json"
     cache = oa.load_cache(cache_path)
-    cached = sum(1 for k in cache if k != "__meta__")
+    # Answers held FOR THIS MODEL AND THIS SYSTEM MESSAGE, not entries in the
+    # file: the key is a hash of all three, so a cache shared with an earlier
+    # model holds nothing this run can use, and saying otherwise would promise a
+    # cheap run that is about to be a full one.
+    scope_records = records[: args.limit or len(records)]
+    cached = sum(
+        1 for rec in scope_records
+        if not (cache.get(oa.cache_key(model, args.system, rec["prompt"])) or
+                {"error": 1}).get("error")
+    )
 
     # --- the plan, always printed before anything is written -------------------------------
     scope = args.limit or len(records)
@@ -848,6 +1008,16 @@ def main(argv=None):
           + ("  [has the OpenAI column]" if report_html and 'class="h-o"' in report_html
              else ("  [not found, a standalone report will be written]"
                    if not report_html else "")))
+    if args.parity_with:
+        if args.parity_with not in present:
+            raise SystemExit(
+                f"--parity-with {args.parity_with!r} is not in the transcript. "
+                f"It has: {', '.join(present)}")
+        print(f"  parity with       {args.parity_with} - the gap between the two columns "
+              "will be read as what serving cost")
+    else:
+        print("  parity with       nothing - scored as an independent model, not as a "
+              "served copy of another column")
     if player in present:
         print(f"  this player       {player!r} is ALREADY in the transcript and will be "
               "refreshed from the cache/endpoint")
@@ -855,6 +1025,7 @@ def main(argv=None):
         print(f"  this player       {player!r} is new")
     if not args.report_only:
         print(f"  endpoint          {base_url}")
+        print(f"                    verifying against {trust}")
         print(f"                    {endpoint_note}")
         print(f"  model             {model}")
         print(f"  cache             {cache_path}  ({cached} answer(s) held, "
@@ -880,6 +1051,7 @@ def main(argv=None):
         extra_body = json.loads(args.extra_body) if args.extra_body else {}
         client = ModalClient(
             headers=headers, seed=args.seed, top_p=args.top_p, extra_body=extra_body,
+            ssl_context=ssl_context,
             api_key="", model=model, base_url=base_url, max_tokens=args.max_tokens,
             temperature=args.temperature, reasoning_effort=args.reasoning_effort,
             timeout=args.timeout, max_retries=args.max_retries, verbose=args.verbose,
@@ -899,6 +1071,7 @@ def main(argv=None):
     st, touched = rebuild_report(
         report_html, report_path, scored, player, label, out_report, args.system,
         args.teacher, base_url, cache.get("__meta__"), args.gpu_cost_per_hour,
+        args.parity_with, model_info,
     )
     print(f"wrote {out_report}  ({touched} existing tables extended)")
     print(
