@@ -291,6 +291,58 @@ reads from `evaluation.adapter`, and `--yes` removes the pause before each
 billable step — **don't**, unless you are certain the credentials in this shell
 are fresh, because the pauses are where you re-export them.
 
+### Optional: score only the distilled and packed students
+
+The full eval scores five players, and most of its hours go to the two
+teachers: the 14B is fetched, merged to a dense 29.5 GB checkpoint for vLLM,
+and then generates 142 answers at up to 8192 tokens each, twice over. When the
+question is narrower — *what did packing cost?* — none of that is needed, and
+`--players` on the `eval` step leaves it out:
+
+```bash
+./scripts/score-pod.sh eval --players distilled,distilled-w4a16    # fresh token
+./scripts/score-pod.sh upload                                     # fresh token
+```
+
+Any comma-separated subset of `base,distilled,distilled-w4a16,teacher-base,teacher`
+is accepted, validated before anything installs, and passed through as
+`--set 'evaluation.players=[...]'`. The arena honours it fully: players not
+named never load, and the teacher is not even fetched unless a player needs it
+(`src/kd/pipeline.py:762-765`).
+
+**What the script does on its own when no teacher is named.** The fidelity
+stage — KL, top-1 agreement, perplexity — is a measurement *against the
+teacher*, and it loads the 14B unconditionally (`src/kd/evaluate.py:503`),
+whatever the arena was told. A player list without the teacher would therefore
+have loaded it anyway and saved nothing. So the script adds `--skip evaluate`
+whenever neither `teacher` nor `teacher-base` is in the list, and says so at
+the prompt. What runs is `preflight → arena → report`; the report handles the
+absence of a fidelity pass explicitly ("reporting on the answer key alone",
+`src/kd/pipeline.py:846-858`).
+
+| | Five players, full eval | `--players distilled,distilled-w4a16` |
+| --- | --- | --- |
+| Teacher fetched and merged for vLLM | yes — 29.5 GB written | **no** |
+| Fidelity vs the teacher | yes | no |
+| Arena accuracy and Elo | 5 players | 2 players |
+| "What W4A16 cost" table | yes | **yes** — it is exactly the difference between these two |
+| Wall clock | hours | well under one |
+
+**What you give up.** Two players with no `base` or `teacher` column says what
+packing cost and nothing about whether distillation worked — there is no anchor.
+It is the right run for checking a packed checkpoint before shipping it; it is
+not the run that compares the 4B student to the 8B one. And each scoring lands
+in its own directory under `evaluation/`, so a two-player run and a five-player
+run sit side by side — but their Elo ratings are not comparable across runs.
+Elo is relative to who was in the pool.
+
+`--players base,distilled,distilled-w4a16` is the cheap middle: still no
+teacher, still under an hour, and the `base` column restores the anchor that
+says whether the adapter did anything at all.
+
+This flag is meaningful only to `eval` and `all`; the script refuses it
+elsewhere.
+
 ### Check the banner before walking away
 
 ```

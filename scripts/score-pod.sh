@@ -69,6 +69,20 @@
 #      --config PATH   required; the scoring profile
 #      --run ID        default: read from the config's evaluation.adapter
 #      --yes           do not pause between billable steps
+#      --players LIST  eval only. Comma-separated subset of
+#                      base,distilled,distilled-w4a16,teacher-base,teacher
+#                      to score in the arena, instead of the profile's five.
+#
+#                      When the list names neither teacher nor teacher-base,
+#                      the fidelity stage is skipped as well: that stage IS a
+#                      measurement against the teacher (KL, agreement -
+#                      evaluate.py:503) and would load the 14B whatever the
+#                      arena was told, which is the one thing a short list is
+#                      meant to avoid. What remains is arena + report - and
+#                      the report without a base or teacher column says what
+#                      packing cost, not whether distillation worked.
+#
+#                          --players distilled,distilled-w4a16
 # ===========================================================================
 set -euo pipefail
 
@@ -86,6 +100,7 @@ CONFIG="${KD_CONFIG:-}"
 RUN=""
 ASSUME_YES=0
 COMMAND=""
+PLAYERS=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -94,6 +109,8 @@ while [ $# -gt 0 ]; do
     --config=*) CONFIG="${1#*=}"; shift ;;
     --run)      [ $# -ge 2 ] || die "--run needs an id"; RUN="$2"; shift 2 ;;
     --run=*)    RUN="${1#*=}"; shift ;;
+    --players)  [ $# -ge 2 ] || die "--players needs a list"; PLAYERS="$2"; shift 2 ;;
+    --players=*) PLAYERS="${1#*=}"; shift ;;
     --yes|-y)   ASSUME_YES=1; shift ;;
     -h|--help)  sed -n '2,/^# ====/p' "$0" | sed 's/^#\{1,\} \{0,1\}//; s/^=\{3,\}.*//'; exit 0 ;;
     *)          die "unknown argument: $1  (try --help)" ;;
@@ -104,6 +121,27 @@ done
     ./scripts/score-pod.sh all --config configs/enlibra/enlibraQ3-14B-score.yaml"
 [ -n "$CONFIG" ] || die "--config is required and this script never picks one."
 [ -f "$CONFIG" ] || die "no such config: $CONFIG"
+
+# --players is validated HERE, before any install or download, for the same
+# reason kd's own preflight validates evaluation.players: a misspelt name
+# found after vLLM has been installed and the adapter fetched has cost real
+# money. The list is normalised to no spaces, which is what --set's list
+# syntax wants.
+PLAYERS="${PLAYERS//[[:space:]]/}"
+if [ -n "$PLAYERS" ]; then
+  [ "$COMMAND" = "eval" ] || [ "$COMMAND" = "all" ] \
+    || die "--players only means something to eval (or all); not to $COMMAND"
+  IFS=',' read -r -a _players <<< "$PLAYERS"
+  [ "${#_players[@]}" -gt 0 ] || die "--players is empty"
+  for _p in "${_players[@]}"; do
+    case "$_p" in
+      base|distilled|distilled-w4a16|teacher-base|teacher) ;;
+      "") die "--players has an empty entry: '$PLAYERS'" ;;
+      *)  die "--players: unknown player '$_p'
+    valid: base, distilled, distilled-w4a16, teacher-base, teacher" ;;
+    esac
+  done
+fi
 
 PY="${KD_PYTHON:-python3}"
 command -v "$PY" >/dev/null 2>&1 || PY=python
@@ -351,8 +389,28 @@ do_eval() {
   # --skip upload, always. The eval's own upload stage runs hours after
   # preflight fetched the teacher, by which time the token is long dead. The
   # upload is its own command, run with fresh credentials.
-  confirm "Five players over the held-out set. Hours, and the pod bills throughout."
-  PYTHONPATH="$ROOT/src" "$PY" -m kd eval --config "$CONFIG" --skip upload
+  EVAL_ARGS=(--skip upload)
+  if [ -n "$PLAYERS" ]; then
+    EVAL_ARGS+=(--set "evaluation.players=[$PLAYERS]")
+    # The arena honours the list (arena.py:958, pipeline.py:762) and fetches
+    # the teacher only when a player needs it. The fidelity stage does not: it
+    # loads the teacher unconditionally (evaluate.py:503), because KL and
+    # agreement are distances FROM the teacher and there is nothing to measure
+    # without it. So a list with no teacher in it drops that stage too -
+    # otherwise the 14B would load anyway and the short list bought nothing.
+    case ",$PLAYERS," in
+      *,teacher,*|*,teacher-base,*) ;;
+      *) EVAL_ARGS+=(--skip evaluate)
+         note "players : $PLAYERS"
+         note "no teacher among them: skipping the fidelity stage, which"
+         note "  would load the 14B regardless. Arena + report only." ;;
+    esac
+    IFS=',' read -r -a _players <<< "$PLAYERS"
+    confirm "${#_players[@]} player(s) over the held-out set. The pod bills throughout."
+  else
+    confirm "Five players over the held-out set. Hours, and the pod bills throughout."
+  fi
+  PYTHONPATH="$ROOT/src" "$PY" -m kd eval --config "$CONFIG" "${EVAL_ARGS[@]}"
 }
 
 
