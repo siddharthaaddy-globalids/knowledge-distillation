@@ -48,6 +48,20 @@ UPLOAD_GROUPS = {
     # minutes of GPU and a checkpoint that is only bit-identical if the
     # calibration sample came out the same way.
     "quantized": ["quantized/**"],
+    # The GGUF builds - the artifact that runs on a phone, as `quantized` is the
+    # one that runs on a server. Not in the default list because most runs never
+    # build one: llama.cpp is a different target from vLLM and wanting it is a
+    # deployment decision, not something training can know.
+    #
+    # Two groups, not one, and that is the point of them. A GGUF is built in two
+    # passes - convert to f16, then quantize - and the f16 is worth shipping on
+    # its own: it is the expensive half (it needs the merge, so torch,
+    # transformers and peft) while `llama-quantize` is CPU-only and needs none
+    # of them. Upload the f16 from the GPU pod, destroy the pod, and quantize it
+    # afterwards on anything. Uploading them together would mean holding the
+    # card for a step that never touches it.
+    "gguf-f16": ["gguf-f16/**"],
+    "gguf": ["gguf/**"],
     # The dense bf16 merge the packing was made from. NOT in the default list:
     # it is the largest thing here - 15 GiB against the packed 5.7 - and unlike
     # the packed copy it is fully regenerable from the adapter and the base in a

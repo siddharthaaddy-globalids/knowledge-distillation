@@ -120,12 +120,14 @@ def unavailable_reason():
             "--extra-index-url https://pypi.org/simple llmcompressor")
 
 
-def calibration_rows(path, tokenizer, samples=128, max_length=2048, seed=42):
-    """Calibration sequences, from the rows the student was trained on.
+def calibration_texts(path, tokenizer, samples=128, seed=42):
+    """The calibration set as rendered strings, before anything tokenises it.
 
-    Rendered through the SAME chat template training used and tokenised here, so
-    what GPTQ measures its rounding against is the distribution the model will
-    actually be asked to produce. See the header for why that matters.
+    Split out from `calibration_rows` because GPTQ and llama.cpp's importance
+    matrix want the same sample of the same rows through the same chat template
+    and disagree only on the last step: GPTQ needs tensors, `llama-imatrix`
+    reads a text file. One definition of "what we calibrate on", so a GGUF build
+    and a W4A16 packing cannot quietly end up tuned against different data.
 
     Sampled deterministically from across the file rather than taken from the
     front, because a curriculum is usually ordered - by hop depth here - and the
@@ -151,8 +153,19 @@ def calibration_rows(path, tokenizer, samples=128, max_length=2048, seed=42):
         if not messages:
             continue
         texts.append(tokenizer.apply_chat_template(messages, tokenize=False))
+    return texts
+
+
+def calibration_rows(path, tokenizer, samples=128, max_length=2048, seed=42):
+    """Calibration sequences, from the rows the student was trained on.
+
+    Rendered through the SAME chat template training used and tokenised here, so
+    what GPTQ measures its rounding against is the distribution the model will
+    actually be asked to produce. See the header for why that matters, and
+    `calibration_texts` for which rows get picked.
+    """
     return [tokenizer(text, truncation=True, max_length=int(max_length))
-            for text in texts]
+            for text in calibration_texts(path, tokenizer, samples, seed)]
 
 
 # --------------------------------------------------------------------------- #

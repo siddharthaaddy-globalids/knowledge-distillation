@@ -51,6 +51,37 @@ BASE_CONFIG = os.path.join(CONFIG_DIR, "_base.yaml")
 # something typed on the command line always beats something inherited from the
 # shell.
 # --------------------------------------------------------------------------- #
+def boolean(raw):
+    """A shell-shaped boolean. `export KD_GGUF_IMATRIX=false` means false.
+
+    Not `bool`, which is the trap this exists to avoid: bool("false") is True,
+    so the obvious caster turns every attempt to switch something OFF into
+    switching it on, silently and in the direction nobody would check.
+    """
+    value = str(raw).strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{raw!r} is not true/false")
+
+
+def comma_list(raw):
+    """`Q4_K_M,Q6_K` or `[Q4_K_M, Q6_K]` - both are what someone would type.
+
+    The bracketed form is what --set takes, so a value copied from one to the
+    other keeps working; the bare form is what a shell export looks like when
+    nobody is thinking about YAML.
+    """
+    text = str(raw).strip()
+    if text.startswith("["):
+        parsed = yaml.safe_load(text)
+        if not isinstance(parsed, list):
+            raise ValueError(f"{raw!r} is not a list")
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
 ENV_OVERRIDES = {
     "KD_STUDENT_MODEL": ("models.student", str),
     "KD_TEACHER_MODEL": ("models.teacher", str),
@@ -80,6 +111,32 @@ ENV_OVERRIDES = {
     "KD_EVAL_NAME": ("evaluation.name", str),
     "KD_MAX_RUNTIME_MINUTES": ("limits.max_runtime_minutes", int),
     "KD_MAX_COST_USD": ("limits.max_cost_usd", float),
+    # GGUF. More of the block is exposed here than for any other section, and
+    # deliberately: a GGUF build is the one workflow that runs on a machine
+    # nobody keeps - a CPU pod rented for forty minutes - where editing a YAML
+    # file in a fresh clone is friction with no payoff. Every path it needs can
+    # come from the shell instead.
+    #
+    # KD_EVAL_ADAPTER above already covers the adapter, which is the long
+    # run-specific value, so a build can be retargeted without touching a file.
+    "KD_GGUF_ENABLED": ("gguf.enabled", boolean),
+    "KD_GGUF_QUANTS": ("gguf.quants", comma_list),
+    "KD_GGUF_IMATRIX": ("gguf.imatrix", boolean),
+    "KD_GGUF_CALIBRATION": ("gguf.calibration_file", str),
+    "KD_GGUF_LLAMA_CPP": ("gguf.llama_cpp", str),
+    "KD_GGUF_F16_DIR": ("gguf.f16_dir", str),
+    "KD_GGUF_OUTPUT_DIR": ("gguf.output_dir", str),
+    "KD_GGUF_KEEP_F16": ("gguf.keep_f16", boolean),
+    # The three s3 keys a run cannot be retargeted without. Credentials are NOT
+    # among them and never will be: those come from AWS_* or an instance role,
+    # because this table is also what a committed runner script sets.
+    #
+    # cache_dir matters most on a pod. The default is under $HOME, which is the
+    # container disk, and the base weights a merge downloads land there - the
+    # ENOSPC both pod scripts warn about. One export moves it to the volume.
+    "KD_S3_BUCKET": ("s3.bucket", str),
+    "KD_S3_PREFIX": ("s3.prefix", str),
+    "KD_S3_CACHE_DIR": ("s3.cache_dir", str),
 }
 
 

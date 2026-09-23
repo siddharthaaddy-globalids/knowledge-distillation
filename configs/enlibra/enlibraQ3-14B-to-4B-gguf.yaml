@@ -1,0 +1,121 @@
+# ===========================================================================
+#  Build a GGUF of a 14B -> 4B adapter that is ALREADY IN THE BUCKET.
+#
+#  The third sibling of enlibraQ3-14B-to-4B{,-score}.yaml. The first trains the
+#  adapter; the second packs it to W4A16 and scores it on a 48 GB card; this one
+#  packs the same adapter for llama.cpp, which is a DIFFERENT TARGET and not a
+#  step on the way to either of the others.
+#
+#      quantized/   compressed-tensors W4A16   vLLM, CUDA, a server
+#      gguf/        Q4_K_M                     llama.cpp, a laptop or a phone
+#
+#  Both are built from the dense merge and neither is built from the other. A
+#  GGUF made by requantizing the W4A16 checkpoint would carry GPTQ's rounding
+#  error AND llama.cpp's, for the same final size - see the header of
+#  scripts/export_gguf.py for why that only makes sense when the dense weights
+#  no longer exist, which here they do.
+#
+#  IT NEEDS NO 48 GB CARD. The teacher never loads - nothing here is scored -
+#  and the biggest thing in memory is the 4B student being merged. A 16-24 GB
+#  card is comfortable, and the conversion itself is CPU and disk bound. What it
+#  does need is DISK: the merge is ~8 GB and the f16 GGUF is another ~8 GB, and
+#  they exist at the same time.
+#
+#  POINT IT AT THE RUN YOU TRAINED - once, here, in evaluation.adapter. Unlike
+#  the score profile there is no second place for the run id to drift from: the
+#  output directories below are null, which derives them from the run.
+#
+#      ./scripts/gguf-pod.sh all \
+#          --config configs/enlibra/enlibraQ3-14B-to-4B-gguf.yaml
+#
+#  which runs setup -> convert -> upload-f16 -> imatrix -> quantize -> upload,
+#  pausing before each billable step and idempotent after a failure. Re-export
+#  AWS credentials immediately before each step that reaches the bucket; they
+#  last fifteen minutes here and `convert` fetches the adapter in its first
+#  seconds.
+#
+#  THE SPLIT IS THE POINT. `convert` needs torch, transformers and peft because
+#  it merges the adapter; `quantize` is CPU-only and needs none of them. Ship
+#  the f16 after the first, and the second can run days later on a laptop:
+#
+#      ./scripts/gguf-pod.sh convert    --config ...   # on the pod
+#      ./scripts/gguf-pod.sh upload-f16 --config ...   # then destroy the pod
+#      ./scripts/gguf-pod.sh quantize   --config ...   # anywhere, no GPU
+#      ./scripts/gguf-pod.sh upload     --config ...
+#
+#  WHAT THIS DOES NOT DO IS SCORE THE RESULT. Q4_K_M is llama.cpp's algorithm,
+#  not GPTQ's - a different model from the `distilled-w4a16` player the arena
+#  measured, and the report's numbers do not describe it. Scoring it means
+#  entering it in the arena as its own player, which is a separate run.
+# ===========================================================================
+extends: enlibraQ3-14B-to-4B-score.yaml
+
+evaluation:
+  # THE ONE LINE TO CHANGE. The adapter the training pod uploaded, and the only
+  # place this profile names a run: gguf.f16_dir and gguf.output_dir are null
+  # below, which derives both from it, so there is no second copy to drift.
+  adapter: s3://enlibra/dss/dev/runs/20260818_215840_neuroscience_8f33eb7cf609/outputs/gkd/runs/enlibraQ3-14B-to-4B-2026-09-22-1209/final_adapter
+
+  # Leads the evaluation directory name in the score profile. Nothing here
+  # scores anything, but it also names the build, and "gguf" beside "w4a16" in
+  # a bundle listing says which packing produced which artifact.
+  name: gguf
+
+quantization:
+  # OFF. The score profile turns this on to build quantized/ for the arena; this
+  # profile builds a GGUF and the two are independent. Leaving it on would pack
+  # the same adapter to W4A16 first - twenty minutes of GPU and 2.5 GB - for an
+  # artifact nothing in this flow reads.
+  #
+  # The calibration settings below it are still inherited and still used: the
+  # imatrix reads quantization.calibration_file, deliberately, so that a GGUF
+  # and a W4A16 packing of the same adapter are measured against the same rows.
+  enabled: false
+
+gguf:
+  enabled: true
+
+  # Q4_K_M alone, because the target is a phone. ~2.4 GB at 4B, which with a 4k
+  # KV cache and compute buffers is ~3.3 GB resident - a flagship, not a
+  # midrange device. If that does not fit, the fix is a SMALLER STUDENT and not
+  # a tighter quant: IQ3 at 4B loses more than the file saves.
+  #
+  # Add Q6_K to also ship a desktop build. It costs one more pass over an f16
+  # that already exists, so the marginal cost is minutes and no extra download.
+  quants: [Q4_K_M]
+
+  # On, and at Q4 that is not optional in spirit even though it is in software.
+  # Built from quantization.calibration_file - inherited from the training
+  # profile, ./data/enlibra-neuroscience/sft-1to3hop.jsonl - through the same
+  # sampler GPTQ uses, so the two packings of this adapter see the same rows.
+  imatrix: true
+  calibration_samples: 128
+  imatrix_chunks: 128
+
+  # Null derives <run>/gguf-f16 and <run>/gguf inside the run directory, which
+  # is what the gguf-f16 and gguf upload groups below expect. Name them only if
+  # the run directory is not where ~16 GB should be written.
+  f16_dir: null
+  output_dir: null
+
+  # On the volume. scripts/gguf-pod.sh clones and builds it here if it is
+  # missing - the converter ships with the checkout but llama-quantize and
+  # llama-imatrix are compiled, and a pod template has neither.
+  llama_cpp: /workspace/llama.cpp
+
+  # KEPT, and this is the one setting worth thinking about. The f16 is ~8 GB of
+  # intermediate, and false would delete it after the quantize pass - right when
+  # the pod is about to be destroyed and rebuilding it would mean re-merging on
+  # a card you no longer have. True lets `quantize` rerun for another quant
+  # without touching the adapter, and lets it run somewhere else entirely.
+  keep_f16: true
+
+s3:
+  # Both gguf groups, because this profile's two upload steps select between
+  # them with --set. Listing them here is what makes `gguf-pod.sh upload` with
+  # no --set ship everything the build produced.
+  #
+  # adapter and quantized are NOT here: they are already in the bucket, this run
+  # did not produce them, and re-uploading several gigabytes of unchanged
+  # weights is a bill and a chance to overwrite something with a partial copy.
+  upload: [gguf-f16, gguf, logs, metrics]

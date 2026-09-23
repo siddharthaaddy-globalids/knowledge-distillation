@@ -392,6 +392,80 @@ quantization:
   # loads with plain transformers and no 4-bit kernel.
   keep_merged: false
 
+# ---------------------------------------------------------------------------
+#  GGUF. The OTHER packing, for the other target.
+#
+#  `quantization` above produces compressed-tensors W4A16, which vLLM loads on
+#  CUDA and nothing else does. This produces GGUF, which llama.cpp loads on a
+#  laptop, a phone, a Mac or a CPU. Neither is made from the other and neither
+#  replaces the other: both are made from the dense merge, and which one a run
+#  needs is a question about where the model is going.
+#
+#  Off by default because most runs are not going anywhere but a server, and a
+#  GGUF costs a llama.cpp checkout that has to be compiled.
+#
+#  TWO PASSES, and the reason the pod script has separate commands for them:
+#  `convert_hf_to_gguf.py` rewrites bf16 into GGUF's container WITHOUT
+#  quantizing - the file comes out bigger than the safetensors it read - and
+#  `llama-quantize` then reads that and writes the 4-bit one. The first pass
+#  needs the merge, so torch and transformers and a card worth having; the
+#  second is CPU-only. Splitting them means the expensive half can finish, ship
+#  its result, and let the pod die.
+# ---------------------------------------------------------------------------
+gguf:
+  enabled: false
+
+  # WHICH QUANTS, in llama.cpp's naming: Q<bits>_K_<S|M|L>, or IQ<bits>_<XS|S|M>.
+  #
+  # Q4_K_M is the default everywhere for a reason - it is where the size/quality
+  # curve bends. Above it you pay a lot of megabytes for very little; below it
+  # quality falls faster than the file shrinks. "4 bits" is nominal: the
+  # per-sub-block scales cost about 0.85 bits more, so Q4_K_M is ~4.85 bits per
+  # weight in practice.
+  #
+  # Several can be built at once and the marginal cost is small - they all read
+  # the same f16, so a second entry is one more quantize pass and not one more
+  # conversion.
+  quants: [Q4_K_M]
+
+  # THE IMPORTANCE MATRIX. llama.cpp's counterpart to the GPTQ calibration set:
+  # it measures which weights carry the activations so `llama-quantize` can
+  # spend its error budget on the ones that do not. At Q4 and below that is the
+  # difference between a usable model and a lobotomised one, and it is REQUIRED
+  # for the IQ quants rather than merely helpful.
+  #
+  # Worth most for a narrow student. One curriculum means the activations this
+  # model actually sees are nothing like generic web text, and tuning the
+  # rounding for text it will never meet is the same mistake quantization's
+  # calibration note describes.
+  imatrix: true
+
+  # What to build it from. Null uses quantization.calibration_file, which is the
+  # right answer and the reason this is null: the imatrix and the W4A16 packing
+  # should measure the same sample of the same rows through the same chat
+  # template, or the two artifacts are not comparable and nothing says so.
+  calibration_file: null
+  calibration_samples: 128
+  imatrix_chunks: 128
+
+  # WHERE THE TWO PASSES LAND, inside the run bundle beside the adapter, so the
+  # `gguf-f16` and `gguf` upload groups cover them and a listing of the bundle
+  # shows every artifact built from that adapter. Null derives both from the
+  # run directory; name them when the run directory is not where you want tens
+  # of gigabytes written.
+  f16_dir: null            # default: <run>/gguf-f16
+  output_dir: null         # default: <run>/gguf
+
+  # Where llama.cpp is checked out and built. Null falls back to $LLAMA_CPP,
+  # then ./llama.cpp and ../llama.cpp. The converter is a script that ships with
+  # the checkout; llama-quantize and llama-imatrix are compiled and do not.
+  llama_cpp: null
+
+  # The f16 is an intermediate - bigger than the merge it came from, and
+  # rebuildable from it in minutes. Keep it while trying several quants of one
+  # model, or when the quantize pass will run somewhere else later.
+  keep_f16: false
+
 benchmark_prompts:
   - List three states of matter. Use a numbered list.
   - "Solve for x: 3x + 12 = 27."
